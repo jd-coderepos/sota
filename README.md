@@ -1,1 +1,200 @@
-# nfdi4ds-shared-task-3
+<!--## SOTA? Tracking the State-of-the-Art Empirical Artificial Intelligence Research
+
+The central activity around empirical AI research includes automated tasks defined via a task dataset for which machine learning models are developed whose performance can be evaluated by a standard set of evaluation metrics. Pushing the state-of-the-art boundaries in empirical AI research means optimizing the models developed for the tasks in terms of speed, accuracy, or storage. As such researchers in this domain often seem to ask the central question “What’s the state-of-the-art result for task XYZ right now?” 
+
+
+Instead of seeking out the answer buried in the ranked list of documents via a search query made on traditional search engines, researchers instead look for the answer on community-curated leaderboards such as https://paperswithcode.com/ or https://orkg.org/benchmarks. These leaderboards are websites specifically designed to showcase the performance of all introduced machine learning models on a machine learning task dataset. As such researchers seeking to find out the best model performance on a task dataset can easily obtain this information on these websites via their performance trendline overviews showcasing various model performances over a task dataset over time.
+
+
+In this Shared Task, we hope to go beyond the community curation of leaderboards and instead  realize the vision of obtaining the most efficient machine learning model capable of automatically detecting leaderboards. The efficiency of the submitted machine learning models as a solution to the shared task will be tested based on speed, model parameters, and leaderboard detection F1 measure.-->
+
+
+### What this repository contains?
+ 
+The repository is organized as follows:
+
+```
+[annotated-data-split]/	
+     |--- [train]/
+	     |--- [article-counter-folder]/
+		 |    |--- [article-id].tei.xml
+		 |    |--- annotations.txt
+		 |    |--- code-link.txt	  # optional	
+	     |___ ...
+     |--- [test]/
+	     |--- [article-counter-folder]/
+		 |    |--- [article-id].tei.xml
+		 |    |--- annotations.txt
+		 |    |--- code-link.txt	   # optional	
+	     |___ ...
+[zero-shot-data]/				
+     |--- [article-counter-folder]/
+	 |    |--- [article-id].tei.xml
+	 |    |--- annotations.txt
+	 |    |--- code-link.txt		   # optional	 
+	 |___ ...
+```
+The `code-linkt.txt` file is optional and if a code link was found in the paper, this annotation file is created; if not, it is not part of the folder.
+
+The dataset dump originates from [paperswithcode.com](https://paperswithcode.com/).
+
+Each folder in the respective dump corresponds to a scholarly article
+originally downloaded in `pdf` format from arXiv, whose contents were then
+scrapped as `txt` data encoded in the [TEI](https://en.wikipedia.org/wiki/Text_Encoding_Initiative) XML format.
+
+Of the 5214 papers in the train set, only 626 papers reported their code links as a mention within the paper's text. Similarly, of the 2235 papers in the test set, only 214 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
+
+### Dataset statistics
+
+| Parameter | Train (counts) | Test (counts) |
+| --- | --- | --- |
+| Unique Tasks | 826 | 436 |
+| Unique Datasets | 2,986 | 1,150 |
+| Unique Metrics | 1,482 | 779 |
+| Unique (Task, Dataset, Metric) triples | 6,638 | 2,497|
+| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.01 | 3.71 |
+
+Ten most common Tasks, Datasets, and Metrics in the **Train set**:
+
+<table>
+  <tr>
+    <td> <b>#</b> </td>
+    <td colspan="2"><b>Most Common Tasks</b></td>
+    <td colspan="2"><b>Most Common Datasets</b></td>
+    <td colspan="2"><b>Most Common Metrics</b></td>
+  </tr>
+  <tr>
+    <td>  </td>
+    <td><b>Task Name</b></td>
+    <td><b>Counts</b></td>
+    <td><b>Dataset Name</b></td>
+    <td><b>Counts</b></td>
+    <td><b>Metric Name</b></td>
+    <td><b>Counts</b></td>
+  </tr>
+  <tr>
+		<td>1</td>
+		<td>Atari Games</td>
+		<td>2122</td>
+		<td>ImageNet</td>
+		<td>1303</td>
+		<td>Accuracy</td>
+		<td>3736</td>
+	</tr>
+	<tr>
+		<td>2</td>
+		<td>Image Classification</td>
+		<td>2015</td>
+		<td>COCO test-dev</td>
+		<td>1274</td>
+		<td>Score</td>
+		<td>2181</td>
+	</tr>
+	<tr>
+		<td>3</td>
+		<td>Object Detection</td>
+		<td>1574</td>
+		<td>COCO minival</td>
+		<td>630</td>
+		<td>F1</td>
+		<td>1057</td>
+	</tr>
+	<tr>
+		<td>4</td>
+		<td>Image Super-Resolution</td>
+		<td>961</td>
+		<td>CIFAR-10</td>
+		<td>567</td>
+		<td>PSNR</td>
+		<td>910</td>
+	</tr>
+	<tr>
+		<td>5</td>
+		<td>Link Prediction</td>
+		<td>880</td>
+		<td>DAVIS 2016</td>
+		<td>257</td>
+		<td>Top 1 Accuracy</td>
+		<td>665</td>
+	</tr>
+	<tr>
+		<td>6</td>
+		<td>Question Answering</td>
+		<td>708</td>
+		<td>FB15k-237</td>
+		<td>223</td>
+		<td>SSIM</td>
+		<td>583</td>
+	</tr>
+	<tr>
+		<td>7</td>
+		<td>Semantic Segmentation</td>
+		<td>676</td>
+		<td>DAVIS 2017 (val)</td>
+		<td>219</td>
+		<td>mIoU</td>
+		<td>453</td>
+	</tr>
+	<tr>
+		<td>8</td>
+		<td>Neural Architecture Search</td>
+		<td>652</td>
+		<td>CIFAR-100</td>
+		<td>218</td>
+		<td>Percentage correct</td>
+		<td>437</td>
+	</tr>
+	<tr>
+		<td>9</td>
+		<td>Few-Shot Image Classification</td>
+		<td>641</td>
+		<td>Human3.6M</td>
+		<td>213</td>
+		<td>FID</td>
+		<td>429</td>
+	</tr>
+	<tr>
+		<td>10</td>
+		<td>Node Classification</td>
+		<td>641</td>
+		<td>Cityscapes test</td>
+		<td>202</td>
+		<td>MAP</td>
+		<td>408</td>
+	</tr>
+</table>
+
+Ten most common (Task, Dataset, Metric) triples in Train Set:
+
+| (Task, Dataset, Metric) | Count |
+| --- | --- |
+| (Image Classification, ImageNet, Top 1 Accuracy) | 425 |
+| (Image Classification, ImageNet, Number of params) | 243 |
+| (Image Classification, ImageNet, Top 5 Accuracy) | 200 |
+| (Object Detection, COCO test-dev, box AP) | 178 |
+| (Image Classification, CIFAR-10, Percentage correct) | 166 |
+| (Object Detection, COCO test-dev, AP50) | 137 |
+| (Image Classification, CIFAR-100, Percentage correct) | 137 |
+| (Object Detection, COCO test-dev, AP75) | 134 |
+| (Object Detection, COCO test-dev, APM) | 134 |
+| (Object Detection, COCO test-dev, APS) | 133 |
+
+
+### Rough Timeline:
+
+January 15, 2023 - first version training dataset public release and test dataset private release
+
+February 15, 2023 - second version dataset release incorporating any changes suggested for the first version
+
+### License
+
+Shield: [![CC BY-SA 4.0][cc-by-sa-shield]][cc-by-sa]
+
+This work is licensed under a
+[Creative Commons Attribution-ShareAlike 4.0 International License][cc-by-sa].
+
+[![CC BY-SA 4.0][cc-by-sa-image]][cc-by-sa]
+
+[cc-by-sa]: http://creativecommons.org/licenses/by-sa/4.0/
+[cc-by-sa-image]: https://licensebuttons.net/l/by-sa/4.0/88x31.png
+[cc-by-sa-shield]: https://img.shields.io/badge/License-CC%20BY--SA%204.0-lightgrey.svg
