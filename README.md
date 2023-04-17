@@ -14,7 +14,7 @@ In this Shared Task, we hope to go beyond the community curation of leaderboards
 The repository is organized as follows:
 
 ```
-[annotated-data-split]/	
+[subtask-1]/	
      |--- [train]/
 	     |--- [article-counter-folder]/
 		 |    |--- [article-id].tei.xml
@@ -42,125 +42,124 @@ Each folder in the respective dump corresponds to a scholarly article
 originally downloaded in `pdf` format from arXiv, whose contents were then
 scrapped as `txt` data encoded in the [TEI](https://en.wikipedia.org/wiki/Text_Encoding_Initiative) XML format.
 
-Of the 5214 papers in the train set, only 626 papers reported their code links as a mention within the paper's text. Similarly, of the 2235 papers in the test set, only 214 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
+Of the 5207 papers in the train set, only 625 papers reported their code links as a mention within the paper's text. Similarly, of the 2242 papers in the test set, only 215 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
 
 ### Dataset statistics
 
 | Parameter | Train (counts) | Test (counts) |
 | --- | --- | --- |
-| Unique Tasks | 826 | 436 |
-| Unique Datasets | 2,986 | 1,150 |
-| Unique Metrics | 1,482 | 779 |
-| Unique (Task, Dataset, Metric) triples | 6,638 | 2,497|
-| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.01 | 3.71 |
+| Unique Tasks | 826 | 390 |
+| Unique Datasets | 2,986 | 1,046 |
+| Unique Metrics | 1,482 | 627 |
+| Unique (Task, Dataset, Metric) triples | 6,805 | 1,907|
+| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.58 | 2.37 |
 
 Ten most common Tasks, Datasets, and Metrics in the **Train set**:
-
 <table>
   <tr>
     <td> <b>#</b> </td>
     <td colspan="2"><b>Most Common Tasks</b></td>
-    <td colspan="2"><b>Most Common Datasets</b></td>
-    <td colspan="2"><b>Most Common Metrics</b></td>
+    <td colspan="2"><b>Most Common Dataset</b></td>
+    <td colspan="2"><b>Most Common Metric</b></td>
   </tr>
   <tr>
     <td>  </td>
-    <td><b>Task Name</b></td>
-    <td><b>Counts</b></td>
-    <td><b>Dataset Name</b></td>
-    <td><b>Counts</b></td>
-    <td><b>Metric Name</b></td>
-    <td><b>Counts</b></td>
+    <td><b>Task</b></td>
+    <td><b>Frequency</b></td>
+    <td><b>Dataset</b></td>
+    <td><b>Frequency</b></td>
+    <td><b>Metric</b></td>
+    <td><b>Frequency</b></td>
   </tr>
   <tr>
 		<td>1</td>
 		<td>Atari Games</td>
-		<td>2122</td>
-		<td>ImageNet</td>
-		<td>1303</td>
+		<td>2089</td>
+		<td>COCO test-dev</td>
+		<td>1408</td>
 		<td>Accuracy</td>
-		<td>3736</td>
+		<td>3771</td>
 	</tr>
 	<tr>
 		<td>2</td>
 		<td>Image Classification</td>
-		<td>2015</td>
-		<td>COCO test-dev</td>
-		<td>1274</td>
+		<td>1813</td>
+		<td>ImageNet</td>
+		<td>1264</td>
 		<td>Score</td>
-		<td>2181</td>
+		<td>2146</td>
 	</tr>
 	<tr>
 		<td>3</td>
 		<td>Object Detection</td>
-		<td>1574</td>
+		<td>1550</td>
 		<td>COCO minival</td>
-		<td>630</td>
+		<td>641</td>
 		<td>F1</td>
-		<td>1057</td>
+		<td>1055</td>
 	</tr>
 	<tr>
 		<td>4</td>
 		<td>Image Super-Resolution</td>
-		<td>961</td>
+		<td>924</td>
 		<td>CIFAR-10</td>
-		<td>567</td>
+		<td>561</td>
 		<td>PSNR</td>
-		<td>910</td>
+		<td>981</td>
 	</tr>
 	<tr>
 		<td>5</td>
 		<td>Link Prediction</td>
-		<td>880</td>
-		<td>DAVIS 2016</td>
-		<td>257</td>
+		<td>840</td>
+		<td>Human3.6M</td>
+		<td>333</td>
 		<td>Top 1 Accuracy</td>
-		<td>665</td>
+		<td>655</td>
 	</tr>
 	<tr>
 		<td>6</td>
-		<td>Question Answering</td>
-		<td>708</td>
-		<td>FB15k-237</td>
-		<td>223</td>
+		<td>Node Classification</td>
+		<td>567</td>
+		<td>DAVIS 2016</td>
+		<td>305</td>
 		<td>SSIM</td>
-		<td>583</td>
+		<td>629</td>
 	</tr>
 	<tr>
 		<td>7</td>
-		<td>Semantic Segmentation</td>
-		<td>676</td>
-		<td>DAVIS 2017 (val)</td>
-		<td>219</td>
-		<td>mIoU</td>
-		<td>453</td>
+		<td>Few-Shot Image Classification</td>
+		<td>562</td>
+		<td>CIFAR-100</td>
+		<td>246</td>
+		<td>AP</td>
+		<td>474</td>
 	</tr>
 	<tr>
 		<td>8</td>
 		<td>Neural Architecture Search</td>
-		<td>652</td>
-		<td>CIFAR-100</td>
-		<td>218</td>
-		<td>Percentage correct</td>
-		<td>437</td>
+		<td>562</td>
+		<td>FB15k-237</td>
+		<td>220</td>
+		<td>FID</td>
+		<td>413</td>
 	</tr>
 	<tr>
 		<td>9</td>
-		<td>Few-Shot Image Classification</td>
-		<td>641</td>
-		<td>Human3.6M</td>
-		<td>213</td>
-		<td>FID</td>
-		<td>429</td>
+		<td>Question Answering</td>
+		<td>562</td>
+		<td>DAVIS 2017 (val)</td>
+		<td>219</td>
+		<td>MAP</td>
+		<td>402</td>
 	</tr>
 	<tr>
 		<td>10</td>
-		<td>Node Classification</td>
-		<td>641</td>
-		<td>Cityscapes test</td>
-		<td>202</td>
-		<td>MAP</td>
-		<td>408</td>
+		<td>Semi-Supervised Video Object Segmentation</td>
+		<td>556</td>
+		<td>WN18RR</td>
+		<td>204</td>
+		<td>mIoU</td>
+		<td>401</td>
 	</tr>
 </table>
 
