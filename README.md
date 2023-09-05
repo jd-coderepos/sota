@@ -14,25 +14,25 @@ In this Shared Task, we hope to go beyond the community curation of leaderboards
 The repository is organized as follows:
 
 ```
-[subtask-1]/	
+[dataset]/	
      |--- [train]/
 	     |--- [article-counter-folder]/
 		 |    |--- [article-id].tei.xml
 		 |    |--- annotations.txt
 		 |    |--- code-link.txt	  # optional	
 	     |___ ...
-     |--- [test]/
+     |--- [test1-few-shot]/		# hidden
 	     |--- [article-counter-folder]/
 		 |    |--- [article-id].tei.xml
-		 |    |--- annotations.txt
+		 |    |--- annotations.txt		# hidden
 		 |    |--- code-link.txt	   # optional	
 	     |___ ...
-[zero-shot-data]/				
-     |--- [article-counter-folder]/
-	 |    |--- [article-id].tei.xml
-	 |    |--- annotations.txt
-	 |    |--- code-link.txt		   # optional	 
-	 |___ ...
+     |--- [test2-zero-shot]/		# hidden			
+			 |--- [article-counter-folder]/
+			 |    |--- [article-id].tei.xml
+			 |    |--- annotations.txt		# hidden
+			 |    |--- code-link.txt		   # optional	 
+			 |___ ...
 ```
 The `code-linkt.txt` file is optional and if a code link was found in the paper, this annotation file is created; if not, it is not part of the folder.
 
