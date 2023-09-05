@@ -181,9 +181,7 @@ Ten most common (Task, Dataset, Metric) triples in Train Set:
 
 ### Rough Timeline:
 
-January 15, 2023 - first version training dataset public release and test dataset private release
-
-February 15, 2023 - second version dataset release incorporating any changes suggested for the first version
+September 5, 2023 - first version training dataset public release and test dataset private release
 
 ### License
 
