@@ -20,7 +20,8 @@ The repository is organized as follows:
 		 |    |--- [article-id].tei.xml
 		 |    |--- annotations.txt
 		 |    |--- code-link.txt	  # optional	
-	     |___ ...```
+	     |___ ...
+```
 <!--     |--- [test1-few-shot]/		# hidden
 	     |--- [article-counter-folder]/
 		 |    |--- [article-id].tei.xml
