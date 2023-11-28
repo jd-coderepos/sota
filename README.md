@@ -35,7 +35,7 @@ The repository is organized as follows:
 			 |    |--- code-link.txt		   # optional	 
 			 |___ ...-->
 
-The `code-linkt.txt` file is optional and if a code link was found in the paper, this annotation file is created; if not, it is not part of the folder.
+The `code-link.txt` file is optional and if a code link was found in the paper, this annotation file is created; if not, it is not part of the folder. The SOTA shared task does not use the code link annotations in its evaluations.
 
 The dataset dump originates from [paperswithcode.com](https://paperswithcode.com/).
 
