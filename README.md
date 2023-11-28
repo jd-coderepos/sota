@@ -188,7 +188,7 @@ Since each paper is accompanied with an annotations file, this section concludes
 - for Tasks, 75.86% of the annotation labels can be found in the accompanying paper full-text.
 - for Datasets, 44.52% of the annotation labels can be found in the accompanying paper full-text.
 - for Metrics, 47.8% of the annotation labels can be found in the accompanying paper full-text.
-- for Score, 49.51% of the annotations can be found in the accompanying paper full-text.
+- for Scores, 49.51% of the annotations can be found in the accompanying paper full-text.
 
 ### Rough Timeline:
 
