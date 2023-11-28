@@ -20,8 +20,8 @@ The repository is organized as follows:
 		 |    |--- [article-id].tei.xml
 		 |    |--- annotations.txt
 		 |    |--- code-link.txt	  # optional	
-	     |___ ...
-     |--- [test1-few-shot]/		# hidden
+	     |___ ...```
+<!--     |--- [test1-few-shot]/		# hidden
 	     |--- [article-counter-folder]/
 		 |    |--- [article-id].tei.xml
 		 |    |--- annotations.txt		# hidden
@@ -32,8 +32,8 @@ The repository is organized as follows:
 			 |    |--- [article-id].tei.xml
 			 |    |--- annotations.txt		# hidden
 			 |    |--- code-link.txt		   # optional	 
-			 |___ ...
-```
+			 |___ ...-->
+
 The `code-linkt.txt` file is optional and if a code link was found in the paper, this annotation file is created; if not, it is not part of the folder.
 
 The dataset dump originates from [paperswithcode.com](https://paperswithcode.com/).
