@@ -183,7 +183,7 @@ Ten most common (Task, Dataset, Metric) triples in Train Set:
 | (Object Detection, COCO test-dev, APM) | 134 |
 | (Object Detection, COCO test-dev, APS) | 133 |
 
-Since each paper is accompanied with an annotations file, this section concludes by discussing for which proportion of the papers can the annotations actually be found in the paper full-text.
+Since each paper is accompanied with an annotations file, this section concludes with statistics for each of the four types in the tuple, what proportion of those can actually be found in the accompanying full-text.
 
 - for Tasks, 75.86% of the annotation labels can be found in the accompanying paper full-text.
 - for Datasets, 44.52% of the annotation labels can be found in the accompanying paper full-text.
