@@ -42,9 +42,9 @@ Each folder in the respective dump corresponds to a scholarly article
 originally downloaded in `pdf` format from arXiv, whose contents were then
 scrapped as `txt` data encoded in the [TEI](https://en.wikipedia.org/wiki/Text_Encoding_Initiative) XML format.
 
-```
+<!--
 Of the 5207 papers in the train set, only 625 papers reported their code links as a mention within the paper's text. Similarly, of the 2242 papers in the test set, only 215 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
-```
+-->
 
 There are 5,207 papers with leaderboard annotations in the train set.
 
