@@ -42,17 +42,21 @@ Each folder in the respective dump corresponds to a scholarly article
 originally downloaded in `pdf` format from arXiv, whose contents were then
 scrapped as `txt` data encoded in the [TEI](https://en.wikipedia.org/wiki/Text_Encoding_Initiative) XML format.
 
+```
 Of the 5207 papers in the train set, only 625 papers reported their code links as a mention within the paper's text. Similarly, of the 2242 papers in the test set, only 215 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
+```
+
+There are 5,207 papers with leaderboard annotations in the train set.
 
 ### Dataset statistics
 
-| Parameter | Train (counts) | Test (counts) |
-| --- | --- | --- |
-| Unique Tasks | 826 | 390 |
-| Unique Datasets | 2,986 | 1,046 |
-| Unique Metrics | 1,482 | 627 |
-| Unique (Task, Dataset, Metric) triples | 6,805 | 1,907|
-| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.58 | 2.37 |
+| Parameter | Train (counts) |
+| --- | --- |
+| Unique Tasks | 825 |
+| Unique Datasets | 2,979 |
+| Unique Metrics | 1,434 |
+| Unique (Task, Dataset, Metric) triples | 6,805 |
+| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.59 |
 
 Ten most common Tasks, Datasets, and Metrics in the **Train set**:
 <table>
