@@ -190,9 +190,11 @@ Since each paper is accompanied with an annotations file, this section concludes
 - for Metrics, 47.8% of the annotation labels can be found in the accompanying paper full-text.
 - for Scores, 49.51% of the annotations can be found in the accompanying paper full-text.
 
+<!--
 ### Rough Timeline:
 
 September 5, 2023 - first version training dataset public release and test dataset private release
+-->
 
 ### License
 
