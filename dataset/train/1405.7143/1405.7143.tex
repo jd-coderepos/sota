@@ -1,0 +1,600 @@
+\cam{We start our discussion using examples of dataplane tasks that can be implemented
+using TPPs, showcasing the utility of exposing network
+state to end-hosts directly in the dataplane.  Each of
+these tasks typically requires new task-specific hardware changes;
+however, we show how each task can be refactored such that the network only implements
+TPPs, while delegating
+complex task-specific functionality to end-hosts.  We will
+discuss the following tasks: (i) micro-burst detection, (ii) a
+rate-based congestion control
+algorithm, (iii) a network troubleshooting platform, (iv) a congestion
+aware, distributed, network load balancer}\extended{, and (v)
+a low-overhead network measurement platform}.
+
+\begin{figure*}[htb]
+\centering
+\begin{subfigure}[b]{0.40\textwidth}
+\includegraphics[width=\textwidth]{images/example-queue-size-dumbell.pdf}
+\caption{Visualizing the execution of a TPP as it is
+  routed through the network.}\label{fig:tpp-qsize-example-topo}
+\end{subfigure}\quad
+\begin{subfigure}[b]{0.40\textwidth}
+\includegraphics[width=\textwidth]{plots/qsize-ts-2.pdf}
+\caption{CDF and time series of queue occupancy on 6 queues in
+  the network, obtained from \emph{every} packet arriving at one
+  host.}\label{fig:tpp-qsize-example-queues}
+\end{subfigure}
+\caption{TPPs enable end-hosts to measure queue occupancy evolution at
+  a packet granularity allowing them to detect micro-bursts, which are
+  the spikes in the time series of queue occupancy (bottom of Figure~\ref{fig:tpp-qsize-example-queues}).
+  Notice from the CDF (top) that one of the queues is empty for 80\% of the time instants when
+  packet arrives to the queue; a sampling method is likely to miss the bursts.}
+\label{fig:tpp-qsize-example}
+\end{figure*}
+
+
+
+
+\smallsec{What is a TPP?}  A TPP is any Ethernet packet with a
+uniquely identifiable header that contains instructions, some
+additional space (packet memory), and an optional encapsulated
+Ethernet payload (e.g.\ IP packet).  The TPP exclusively owns its
+packet memory, but also has access to shared memory on the switch (its
+SRAM and internal registers) through addresses.  TPPs execute directly
+in the dataplane \cam{at every hop}, and are forwarded just like other
+packets.  TPPs use a very minimal instruction set listed in
+Table~\ref{tab:instructions}, and we refer the reader to
+Section~\ref{sec:design} \cam{to understand the space overheads.
+We abuse terminology, and use TPPs to refer both to the
+programs and the packets that carry them}.
+
+We write TPPs in a pseudo-assembly-language with a segmented address
+space naming various registers, switch RAM, and packet memory.
+We write addresses
+using human-readable labels, such as \texttt{[Namespace:Statistic]}
+or \texttt{[Queue:QueueOccupancy]}.  \cam{We posit that these addresses
+be known upfront at compile time.}  For example, the mnemonic {\tt [Queue:QueueOccupancy]}
+could be refer to an address \texttt{0xb000} that
+stores the occupancy of a packet's output queue at each switch.
+
+
+
+
+
+\subsection{Micro-burst Detection}
+Consider the problem of monitoring link queue occupancy within the
+network to diagnose short-lived congestion events (or
+``micro-bursts''), which directly quantifies the impact of incast.  In
+low-latency networks such as datacenters, queue occupancy changes
+rapidly at timescales of a few RTTs.  Thus, observing and controlling
+such bursty traffic requires visibility at timescales orders of
+magnitude faster than the mechanisms such as SNMP or embedded web
+servers that we have today, which operate at tens of seconds at best.
+Moreover, even if the monitoring mechanism is fast, it is not clear
+which queues to monitor, as (i) the underlying routing could change,
+and (ii) switch hash functions that affect multipath routing are often
+proprietary and unknown.
+
+TPPs can provide fine-grained per-RTT, or even per-packet visibility
+into queue evolution inside the network.  Today, switches
+already track per-port, per-queue occupancy for memory management.  The
+instruction {\tt PUSH [Queue:QueueOccupancy]} could be used to copy the queue
+register onto the packet.  As the packet traverses each hop, the
+packet memory has snapshots of queue sizes at each hop.  The queue
+sizes are useful in diagnosing micro-bursts, as they are not an
+average value.  They are recorded when the packet traverses the
+switch.  Figure~\ref{fig:tpp-qsize-example-topo} shows the state of a
+sample packet as it traverses a network.  In the figure, {\tt SP} is
+the stack pointer which points to the next offset inside the packet
+memory where new values may be pushed.  Since the maximum number of
+hops is small within a datacenter (typically 5--7), the end-host
+preallocates enough packet memory to store queue sizes.  Moreover, the
+end-host knows exactly how to interpret values in the packet to obtain
+a detailed breakdown of queueing latencies on all network hops.
+
+This example illustrates how a low-latency,
+programmatic interface to access dataplane state can be used by
+software at end-hosts to measure dataplane behavior that is hard to
+observe in the control plane.  Figure~\ref{fig:tpp-qsize-example-topo}
+shows a six-node dumbell topology on
+Mininet~\cite{handigol2012reproducible}, in which each node sends a
+small 10kB message to every other node in the topology.  The total
+application-level offered load is 30\% of the hosts' network capacity
+(100Mb/s).  We instrumented every packet with a TPP, and collected
+fully executed TPPs carrying network state at one host.
+Figure~\ref{fig:tpp-qsize-example-queues} shows the queue evolution of
+6 queues inside the network obtained from every packet received at
+that host.
+
+\smallsec{Overheads}:  The actual TPP consists of three instructions,
+one each to read the switch ID, the port number, and the queue size,
+each a 16 bit integer.  If the diameter of the network is
+5~hops, then each TPP adds only a 54 byte overhead to each
+packet: 12 bytes for the TPP header~(see \S\ref{subsec:tppformat}),
+12~bytes for instructions, and $6\times{}5$~bytes to collect statistics
+at each hop.
+
+\subsection{Rate-based Congestion Control}\label{subsec:rcp}
+While the previous example shows how TPPs can help observe latency
+spikes, we now show how such visibility can be used to {\em control}
+network congestion.  Congestion control is arguably a dataplane task,
+and the literature has a number of ideas on designing better
+algorithms, many of which require switch support.  However, TCP and
+its variants still remain the dominant congestion control algorithms.
+Many congestion control algorithms, such as
+XCP~\cite{katabi2002congestion}, FCP~\cite{han2013fcp},
+RCP~\cite{dukkipati2006flow}, etc.\ work by monitoring state that
+indicates congestion and adjusting flow rates every few RTTs.
+
+We now show how end-hosts can use TPPs to deploy a new congestion control
+algorithm that enjoys many benefits of in-network algorithms, such as Rate Control Protocol
+(RCP\@)~\cite{dukkipati2006flow}.  RCP is a congestion control algorithm
+that rapidly allocates link capacity to help flows finish quickly.  An
+RCP router maintains one fair-share rate $R(t)$ per link (of capacity
+$C$, regardless of the number of flows), computed periodically (every
+$T$ seconds) as follows:
+
+\begin{equation}\label{eq:rcp}
+R(t+T) = R(t)\left(1 - \frac{T}{d}\times\frac{a\;(y(t) - C) + b\;\frac{q(t)}{d}}{C}\right)
+\end{equation}
+
+Here, $y(t)$ is the average ingress link utilization, $q(t)$ is the
+average queue size, $d$ is the average round-trip time of flows
+traversing the link, and $a$ and $b$ are configurable parameters.
+Each router checks if its estimate of $R(t)$ is smaller than the
+flow's fair-share (indicated on each packet's header); if so, it
+replaces the flow's fair share header value with $R(t)$.
+
+We now describe RCP*, an end-host implementation of RCP\@.  The
+implementation consists of a rate limiter and a rate controller at
+end-hosts for every flow (since RCP operates at a per-flow
+granularity).  The network control plane allocates two memory
+addresses per link ({\tt Link:AppSpecific\_0} and {\tt
+Link:AppSpecific\_1}) to store fair rates.  Each flow's rate
+controller periodically (using the flow's packets, or using additional
+probe packets) queries and modifies network state in three phases.
+
+\smallsec{Phase 1: Collect.}  Using the following TPP, the rate
+controller queries the network for the switch ID on each hop, queue
+sizes, link utilization, and the link's fair share rate (and its
+version number), for all links along the path.  The receiver simply
+echos a fully executed TPP back to the sender.  \cam{The network
+updates link utilization counters every millisecond.  If needed,
+end-hosts can measure them faster by querying for {\tt
+[Link:RX-Bytes]}.}
+
+\begin{verbatim}
+PUSH [Switch:SwitchID]
+PUSH [Link:QueueSize]
+PUSH [Link:RX-Utilization]
+PUSH [Link:AppSpecific_0] # Version number
+PUSH [Link:AppSpecific_1] # Rfair
+\end{verbatim}
+\smallsec{Phase 2: Compute.}  In the second phase, each sender
+computes a fair share rate $R_{\rm link}$ for each link: Using the
+samples collected in phase 1, the rate controller computes the average
+queue sizes on each link along the path.  Then, it computes a per-link
+rate $R_{\rm link}$ using the RCP control equation.
+
+\smallsec{Phase 3: Update.}  In the last phase, the
+rate-controller of each flow asynchronously sends the following TPP to
+update the fair rates on all links.  To ensure correctness due to
+concurrent updates, we use the {\tt CSTORE} instruction:
+
+\begin{verbatim}
+  CSTORE [Link:AppSpecific_0], \
+            [Packet:Hop[0]], [Packet:Hop[1]]
+  STORE [Link:AppSpecific_1], [Packet:Hop[2]]
+PacketMemory:
+  Hop1: V_1, V_1+1, R_new_1, (* 16 bits each*)
+  Hop2: V_2, V_2+1, R_new_2, ...
+\end{verbatim}
+
+\noindent where $V_i$ is the version number in the {\tt AppSpecific\_0} that
+the end-host used to derive an updated $R_{{\rm new},i}$ for hop $i$,
+thus ensuring consistency.  ({\tt CSTORE dst,old,new} updates {\tt
+dst} with {\tt new} only if {\tt dst} was {\tt old}, ignoring the rest
+of the TPP otherwise.)  Note that in the TPP, the version numbers
+and fair rates are read from packet memory at every hop.
+
+
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.5\textwidth]{plots/tpp-rcp-annotated-2.pdf}
+\caption{Allocations by max-min and proportional fairness variant of RCP
+on the traffic pattern shown inset on the right plot; each link has
+100Mb/s capacity and all flows start at 1Mb/s at time~0.}
+\label{fig:rcp-new}\vspace{-1.2em}
+\end{figure}
+
+\smallsec{Other allocations}: Although RCP was originally designed to
+allocate bandwidth in a max-min fair manner among competing flows,
+Kelly et al.~\cite{kelly2008stability} showed how to tweak RCP to
+allocate bandwidth for a spectrum of fairness
+criteria---$\alpha$-fairness parameterized by a real number
+$\alpha \geq 0$.  $\alpha$-fairness is achieved as follows: if $R_{i}$
+is the fair rate computed at the $i$-th link traversed by the flow (as
+per the RCP control equation~\ref{eq:rcp}), the flow sets its rate as
+\begin{equation}\label{eq:aggregate}
+R = \left(\sum\limits_i R_i^{-\alpha}\right)^{-1/\alpha}
+\end{equation}
+
+The value $\alpha=1$ corresponds to proportional fairness, and we can
+see that in the limit as $\alpha\rightarrow\infty$, $R = \min_i R_i$,
+which is consistent with the notion of max-min fairness.  Observe that
+if the ASIC hardware had been designed for max-min version of RCP, it
+would have been difficult for end-hosts to achieve other useful
+notions of fairness.  However, TPPs help defer the choice of fairness
+to deployment time, as the end-hosts can aggregate the per-link $R_i$
+according to equation~\ref{eq:aggregate} based on \emph{one} chosen
+$\alpha$. (We do not recommend flows with different $\alpha$
+sharing the same links due to reasons in~\cite{tang2007equilibrium}.)
+
+Figure~\ref{fig:rcp-new} shows the throughput of three flows for both
+max-min~RCP* and proportional-fair~RCP* in Mininet: Flow~`a' shares
+one link each with flows `b' and `c' (shown inset in the right plot).
+Flows are basically rate-limited UDP streams, where rates are
+determined using the control algorithm: Max-min fairness should
+allocate rates equally across flows, whereas proportional fairness
+should allocate
+\sfrac{1}{3} of the link to the flow that traverses two links, and
+\sfrac{2}{3} to the flows that traverse only one link.
+
+\cam{\smallsec{Overheads}:  For the experiment in Figure~\ref{fig:rcp-new}, the
+bandwidth overhead imposed by TPP control packets was about 1.0--6.0\% of
+the flows' rate as we varied the number of long lived flows from
+3 to 30 to 99 (averaged over 3 runs).  In the same experiment,
+TCP had slightly lower overheads: 0.8--2.4\%.  The RCP* overhead
+is in the same range as TCP because each flow sends control packets roughly
+once every RTT.
+As the number of flows $n$ increases, the average per-flow rate decreases
+as $1/n$, which causes the RTT of each flow to increase (as the RTT is inversely
+proportional to flow rate).  Therefore, the total overhead does not blow up.
+
+\smallsec{Are writes absolutely necessary?}  RCP* is one of the few TPP
+applications that \emph{writes} to network state.  It is
+worth asking if this is absolutely necessary.  We believe it is necessary
+for fast convergence since RCP relies on flows traversing a single bottleneck
+link agreeing on \emph{one} shared rate, which is explicitly enforced in RCP.
+Alternatively, if rapid convergence
+isn't critical, flows can converge to their fair rates in an AIMD fashion
+\emph{without} writing to network state.  In fact, XCP implements this AIMD approach, but
+experiments in~\cite{dukkipati2006flow} show that XCP converges more
+slowly than RCP.}
+
+\subsection{Network Troubleshooting Framework}\label{subsec:netsight}
+There has been recent interest in designing programmatic tools for
+troubleshooting networks; without doubt, dataplane visibility is
+central to a troubleshooter.  For example, consider the task of
+verifying that network forwarding rules match the intent specified by
+the administrator~\cite{kazemian2013real,khurshid2012veriflow}.  This
+task is hard as forwarding rules change constantly, and a
+network-wide `consistent' update is not a trivial
+task~\cite{reitblatt2012abstractions}.  Verification is further complicated by
+the fact that there can be a mismatch between the control plane's view
+of routing state and the actual forwarding state in hardware (and such
+problems have shown up in a cloud provider's production
+network~\cite{chakim-personal}).  Thus, verifying whether packets have
+been correctly forwarded requires help from the dataplane.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.40\textwidth]{images/netsight.pdf}
+\caption{TPPs enable end-hosts to efficiently collect
+  packet histories, which can then be used to implement four
+  different troubleshooting applications described in~\cite{netsight}.}\vspace{-1em}
+\label{fig:netsight}
+\end{figure}
+
+Recently, researchers have proposed a platform called
+NetSight~\cite{netsight}.  NetSight introduced the notion of a `packet
+history,' which is a record of the packet's path through the
+network and the switch forwarding state applied to the packet.  Using
+this construct, the authors show how to build four different network
+troubleshooting applications.
+
+We first show how to efficiently capture packet histories that are
+central to the NetSight platform.  NetSight works by interposing on
+the control channel between the controller and the network, stamping
+each flow entry with a unique version number, and modifying flow
+entries to create truncated copies of packet headers tagged with the
+version number (without affecting a packet's normal forwarding) and
+additional metadata (e.g., the packet's input/output ports).  These
+truncated packet copies are reassembled by servers to reconstruct the
+packet history.
+
+We can refactor the task of collecting packet histories by having a
+trusted agent at every end-host (\S\ref{sec:endhost}) insert the TPP
+shown below on all (or a subset of) its packets.  On receiving a TPP
+that has finished executing on all hops, the end-host gets an accurate
+view of the network forwarding state that affected the packet's
+forwarding, without requiring the network to create additional packet
+copies.
+\begin{verbatim}
+PUSH [Switch:ID]
+PUSH [PacketMetadata:MatchedEntryID]
+PUSH [PacketMetadata:InputPort]
+\end{verbatim}
+
+Once the end-host constructs a packet history, it is forwarded to
+collectors where they can be used in many ways.  For instance, if the
+end-host stores the histories, we get the same functionality as {\tt
+netshark}---a network-wide {\tt tcpdump} distributed across servers.  From
+the stored traces, an administrator can use any query language
+(e.g., SQL) to extract relevant packet histories, which gives the same
+functionality as the interactive network debugger {\tt ndb}.  Another
+application, {\tt netwatch} simply uses the packet histories to verify
+whether network forwarding trace conforms to a policy specified by the
+control plane (e.g., isolation between tenants).
+
+\smallsec{Overheads}: The instruction overhead is 12 bytes/packet and
+6 bytes of per-hop data.  With a
+TPP header and space for 10 hops, this is 84 bytes/packet.  If
+the average packet size is 1000 bytes, this is a 8.4\% bandwidth
+overhead if we insert the TPP on every packet.  If we enable it only
+for a subset of packets, the overhead will be correspondingly lower.
+
+\smallsec{Caveats}: Despite its benefits, there are drawbacks to using only TPPs,
+especially if the network transforms packets in erroneous or non-invertible ways.
+We can overcome dropped packets by sending packets that will be
+dropped to a collector (we describe how in~\S\ref{subsec:otherposs}).
+Some of these assumptions (trusting the dataplane to function
+correctly) are also made by NetSight, and we
+believe the advantages of TPPs outweigh its drawbacks.  For instance,
+TPPs can collect more statistics, such as link utilization and queue
+occupancy, along with a packet's forwarding history.
+
+
+\begin{ecam}
+\subsection{Distributed Load Balancing}\label{subsec:conga}
+We now show how end-hosts can use
+TPPs to probe for network congestion, and use this detailed visibility to load
+balance traffic in a distributed fashion.  We demonstrate a simplified
+version of CONGA~\cite{conga}, which is an in-network scheme for
+traffic load balancing.  CONGA strives to
+maximize network throughput and minimize the maximum network link
+utilization in a distributed fashion
+by having network switches maintain a table of path-level congestion
+metrics (e.g., quantized link utilization).  Using this information,
+switches route small bursts of flows (``flowlets'') selfishly
+on the least loaded path.  CONGA is optimized for datacenter
+network topologies; we refer the curious reader to~\cite{conga}
+for more details.
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.45\textwidth]{images/conga.pdf}
+\caption{An example showing the benefits of congestion-aware load balancing:
+ECMP splits flow from L1 to L2
+equally across the two paths resulting in suboptimal network utilization.
+CONGA*, an end-host refactoring of CONGA~\cite{conga} is able to detect
+and reroute flows, achieving optimum in this example.}
+\label{fig:conga}\vspace{-1em}
+\end{figure}
+
+CONGA's design highlights two benefits relevant to our discussion.
+First, it uses explicit visibility by having switches stamp quantized
+congestion information on packet headers.  Second, load balancing decisions
+are made at round-trip timescales to rapidly detect and react to network
+congestion.  Since TPPs also offer similar benefits, we show how we
+can refactor the load balancing task between end-hosts and the network,
+without requiring custom hardware (except, of course, to support TPPs).
+
+First, we require the network to install multipath routes that
+end-hosts can select based on packet header values.  This can be done in
+the slow-path by the control plane by programming a `group table' available
+in many switches today for multipath routing~\cite[\S5.6.1]{of1.4}, which
+selects an output port by hashing on header fields (e.g., the VLAN tag).
+This allows end-hosts to select network paths simply by changing the VLAN ID.
+
+Second, we need end-hosts to query for link utilization across various paths,
+by inserting the following TPP on a subset of packets destined to hosts
+within the datacenter:
+\begin{verbatim}
+PUSH [Link:ID]
+PUSH [Link:TX-Utilization]
+PUSH [Link:TX-Bytes]
+\end{verbatim}
+
+We query for {\tt Link:TX-Bytes} to measure small
+congestion events if the link utilization isn't updated.  The receiver echoes
+fully executed TPPs back to the
+sender to communicate the congestion.  Note that the header of the echoed TPP
+also contains the path ID along with the link utilization on each link in the path.
+
+Third, using information in the fully executed TPPs, end-hosts can build a
+table mapping `Path~$i\rightarrow$ Congestion~Metric ($m_i$),' where $m_i$
+is either the maximum or sum of link utilization on each switch--switch
+network hop on path $i$.  The authors of CONGA note that `sum' is closer to
+optimal than `max' in the worst-case scenario (adversarial);
+however CONGA used `max' as it does not cause overflows when switches aggregate
+path-congestion.  With TPPs, this is not an issue, and the choice can be deferred
+to deploy time.
+
+And finally, end-hosts have full context about flows and flowlets, and
+therefore each end-host can select a flowlet's path by setting the
+path tag appropriately on the flowlet's packets.
+
+\smallsec{Overheads}:  We implemented a proof-of-concept prototype (CONGA*) in software using UDP flows;
+Figure~\ref{fig:conga} reproduces an example from CONGA~\cite[Figure~4]{conga}.
+We configured switches S0 and S1 to select paths based on destination UDP
+port.  The flow from L0 to L2 uses only one path, whereas the
+flow from L1 to L2 has two paths.  The UDP agents at L0 and L1 query
+for link utilization and aggregate congestion metrics every millisecond
+for the two paths.  With CONGA*, end-hosts can maximize network
+throughput meeting the demands for both flows, while simultaneously minimizing
+the maximum link utilization.  In this example, the overhead introduced by
+TPP packets was minimal ($< 1\%$ of the total traffic).
+
+\smallsec{Remark}: Note that the functionality is \emph{refactored}
+between the network and end-hosts; not all functionality resides completely
+ at the end-hosts.  The network implements TPP and multipath
+routing.  The end-hosts merely select paths based on congestion completely
+in software.
+\end{ecam}
+
+\begin{eext}
+\subsection{Low-overhead Measurement}\label{subsec:sketch}
+Since TPPs can read network state, it is straightforward to use them
+to monitor the network.  However, we show how to implement non-trivial
+measurement tasks.  In particular, OpenSketch~\cite{yu2013software} is
+a recently published measurement framework that makes the
+observation that many measurement tasks can be approximated accurately
+using probabilistic summary algorithms called ``sketches,'' which can in turn be compiled down to a three-stage
+pipeline where packets are hashed, filtered, and counted.  The authors
+show how to combine these primitives to answer questions such as: (i)
+what is the number of unique IP addresses communicating across links?
+(ii) what is the flow size distribution across switches?
+
+An example of a sketch is the bitmap sketch, which can count the
+number of unique elements in a stream as follows: hash the element
+(e.g.\ source IP address) to one of $b$ bits and set it to 1.  The
+estimate of the cardinality of the set is $b\times\ln(b/z)$, where $z$
+is the number of unset bits~\cite{estan2003bitmap}.
+
+Many sketches require multiple hash functions in hardware operating at
+line-rate.  This introduces a new ASIC functionality that is specific
+to sketches; thus, it is worth asking if the task can be refactored
+using the visibility offered by TPPs.  Since end-hosts can readily
+implement many hash functions cheaply in software, the only piece of
+information they are missing is the packet's routing context, which
+can be obtained by the following TPP:
+\begin{verbatim}
+PUSH [Switch:ID]
+PUSH [PacketMetadata:OutputPort]
+\end{verbatim}
+
+As example, consider a task where one wants to measure the number of
+unique destination IP addresses traversing the core switches in the
+network, and update these values every few (say 10) seconds.  Each
+end-host in the network participates in this task by inserting the
+above TPP into its packets.  Note that this TPP need not be inserted
+into all packets, but it should be inserted at least once for every
+destination IP address the host communicates with.  The receiving
+end-host parses the fully executed TPP to retrieve the (switch,link)
+IDs from the packet and implements the sketch as follows:
+
+\begin{verbatim}
+index = hash(packet.ip.dest)
+foreach (switch,link) in tpp:
+  bitmask[switch][index] = 1
+\end{verbatim}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.45\textwidth]{images/opensketch.pdf}
+\caption{Refactoring the bitmap sketch~\cite{estan2003bitmap} to estimate set cardinality.}
+\label{fig:opensketch}
+\end{figure}
+
+The sketch data-structures are distributed across the end-hosts in the
+network, but we can take advantage of the fact that the sketch
+operation (`bit-set') is commutative.  Every 10~seconds, the end-hosts push
+those summary data structures that have changed since the last
+interval to a central, load-balanced, link monitoring service.  The
+link monitoring service aggregates the bit-vectors to obtain the
+sketch data-structure for every link, obtaining the same result as one
+would obtain using OpenSketch.  This refactoring allow end-hosts to
+retain flexibility in implementing other kinds of sketches.
+
+\smallsec{Overheads}: To implement the count-cardinality sketch, we
+only need one TPP per unique destination IP address.  If we sample one
+out of every 10 packets to insert the measurement TPPs, we will incur
+less than 1\% bandwidth overhead due to extra headers in packets.  If
+we assume a $k=64$~FatTree datacenter network, there are 65536 core
+links, and 65536~servers.  The sketch data-structure's accuracy depends
+on the number of bits and the probability of
+collision~\cite{estan2003bitmap}.  If we use 1kbit memory per link,
+the total memory usage for all 65536 links is about 8MB/server.
+\end{eext}
+
+\subsection{Other possibilities}\label{subsec:otherposs}
+The above examples illustrate how a single TPP interface
+enables end-hosts to achieve many tasks.  \cam{
+There are more tasks that we couldn't cover in detail.  In the interest
+of space, we refer the reader to the extended version of this paper
+for more details on some of the tasks below~\cite{tpp-extended}.}
+
+\cam{\smallsec{Measurement}: Since TPPs can read network state, they
+can be used in a straightforward fashion for measuring any network
+statistic at rapid timescales.  As TPPs operate in the dataplane,
+they are in a unique position to expose path characteristics
+experienced by a specific packet that an end-host cares about.}
+
+\ignore{\smallsec{Source routing and load balancing}: Other simple examples include
+source-routing, which enables packets to control routes to the
+destination.  This is achieved if the TPP overwrites the {\tt
+PacketMetadata:OutputPort} register.  Moreover, control over routes
+also enables randomized load balancing, where end-hosts can use TPPs
+to probe the link utilization on alternate packet routes to the
+destination to effectively distribute load across multiple network
+links~\cite{mitzenmacher2001power}.  Other load balancing proposals
+such as Hedera~\cite{al2010hedera}, Dahu~\cite{radhakrishnan2013dahu},
+LocalFlow~\cite{senscalable}, etc.\ share a common
+monitor-control-modify workflow, which can be efficiently implemented
+with TPPs, without being limited by the control plane's slow response
+time.}
+
+
+
+\smallsec{Network verification}:  TPPs also help in verifying whether
+network devices meet certain requirements.  For example, the path
+visibility offered by TPPs help accurately verify that route
+convergence times are within an acceptable value.  This task can be
+challenging today, if we rely on end-to-end reachability as a way to
+measure convergence, because backup paths can still maintain
+end-to-end connectivity when routes change.  Also, the explicit
+visibility eases fault localization~\cite{zeng2012automatic}.
+
+\smallsec{Fast network updates}:  By allowing secure applications to write
+to a switch's forwarding tables, network updates can be made very
+fast.  This can reduce the time window of a transient state when
+network forwarding state hasn't converged.  For example, it is
+possible to add a new route to all switches along a path in half a
+round-trip time, as updating an IP forwarding table requires only
+64~bits of information per-hop: 32~bit address and a 32~bit netmask
+per hop, tiny enough to fit inside a packet.
+
+\smallsec{Wireless Networks}:  TPPs can also be used in wireless
+networks where access points can annotate end-host packets with
+rapidly changing state such as channel SNR\@.  Low-latency access to
+such rapidly changing state is useful for network diagnosis, allows
+end-hosts to distinguish between congestive losses and losses due to
+poor channel quality, and query the bitrate that an AP selected for a
+particular packet.
+
+
+
+
+\begin{comment}
+\smallsec{Other possibilities.}  The above examples illustrate how simple
+primitives at ASICs can enable end-hosts to coordinate and achieve a
+certain behavior.  There are other possibilities; end-hosts can
+implement bloom filters by hashing packets using any number of hash
+functions, and increment counters inside switch memory.  Bloom
+filters are useful as they form the basis of a number of measurement
+tasks such as counting the number of unique IP addresses seen at a
+network hop.  TPPs can also be used in wireless networks where
+end-hosts can query access points for channel SNR, the number of users
+contending for the channel, etc.  Having discussed examples, we now
+look at the design of a TPP-enabled ASIC.
+\end{comment}
+
+\begin{comment}
+\subsection{Sketch based measurement framework}
+OpenSketch is a recent proposal that shares similar goals, in that the
+the authors demonstrate how measurement tasks (such as measuring flow
+size distribution, heavy hitters identification, etc.) can be
+implemented using a combination of: (a) hashing, (b) TCAM filtering,
+and (c) counting.  For example, to measure the flow size distribution
+at a coarse granularity, the TCAM filter selects packets whose length
+falls into the bin $[2^i, 2^{i+1})$ and increments the $i$'th counter.
+  However, OpenSketch relies on a number of independent hash functions
+  in hardware.  One possible way to implement OpenSketch is to do
+  hashing and filtering in software (freeing TCAM space), and include
+  a TPP with the instruction {\tt INC [SwitchMemory:HashOffset]} for
+  counting.  The advantage of software is that it one can flexibly
+  implement any kind of hashing algorithm and can be easily
+  parallelized across flows.
+\end{comment}

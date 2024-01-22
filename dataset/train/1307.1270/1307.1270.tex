@@ -1,0 +1,2526 @@
+\section{Experimental HW Platform Integration and Test}
+\label{sec:quong}
+
+
+During the 2012 the HPC platform integration and test activity
+provided the massive production of the \apenetp boards, their
+integration to the full \quong~\cite{ammendola2011quong} tower and the
+validation of the system through synthetic benchmarks.
+
+In this year we implemented architectural improvement of \apenetp with
+the aim of achieving the best performances and usability for the
+hardware platform (sections \ref{sub:TxAcceleration}, \ref{sec:eventq} and
+\ref{sec:link_bw_lat}).  Furthermore, we developed the VHDL coding of
+the DNP Fault Manager required to interface to the \apenetp's sensors
+and to transfer the information to the DNP status registers
+(section \ref{sec:sensor}).
+
+The software development consisted in the implementation of the
+necessary support to the hardware innovations as well as a continuous
+tuning to reduce the latency due to the driver itself
+(section \ref{sec:swstack}).  Besides the fundamental middleware needed to
+implement a working API for communication with the board, a large
+number of small test codes (mostly in C supplemented by scripts in
+Bash/TCSH) were written (section \ref{sec:testsuite}).
+
+
+\subsection{\apenetp}
+
+The \apenetp network
+architecture~\cite{rossetti2011apenet+,ammendola2011apenet+,ammendola2012apenet+}
+has, at its core, the Distributed Network Processor
+(DNP)~\cite{DNP2012}.
+This acts as an off-loading network engine for the computing node,
+performing inter-node data transfers.  The DNP hardware blocks
+structure, depicted in figure \ref{fig:architecture}, is split into a
+Network interface (the packet injection/processing logic comprising
+host interface, TX/RX logic and Microcontroller), a Router component
+and six Torus Links.
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=60mm 25mm 60mm 30mm,clip,width=0.75\textwidth]{internals.pdf}
+  \caption{Overview of APEnet+. The DNP is the core of the
+architecture - composed by the Torus Links, Router and Network
+Interface macro blocks - implemented on the FPGA. The system interfaces
+to the host CPU through the PCIe bus.}
+  \label{fig:architecture}
+\end{figure}
+
+The network interface block has basically two main tasks: on the
+transmit data path, it gathers data coming in from the PCIe port -
+either from host or GPU memory - and forwards them to the relevant
+destination ports; on the receiving side, it provides hardware support
+for the Remote Direct Memory Access (RDMA) protocol, allowing remote
+data transfer over the network without involvement of the CPU of the
+remote node.
+
+The router establishes dynamic links among the ports of the DNP,
+managing conflicts on shared resources.
+
+The torus link block manages the data flow and allows point-to-point,
+full-duplex connection of each node with its 6 neighbours with
+coordinates both increasing and decreasing along the X, Y and Z axes,
+forming a 3D torus.
+
+\subsubsection{Architectural Improvements}
+ \label{subsec:arch_impr}
+
+
+
+\subsubsubsection{Link Bandwidth and Latency}
+   \label{sec:link_bw_lat}
+In this section we show the performance achieved with the current
+implementation of the \hw{TORUS LINK} and we will argue the results of
+the tests, analyzing the limits being reached and providing a set of
+possible changes to overcome them.
+
+
+Referring to the Open Systems Interconnection (OSI) model, the
+\hw{TORUS LINK} plays the dual role of the Physical Layer and Data
+Link Layer.
+
+
+The Physical Layer is constituted by Altera transceivers of the
+Stratix IV, able to reach 8.5 Gbps per line (each link is formed by 4
+lines for a total of 34 Gbps).
+Dynamic reconfiguration of Physical Medium Attachment's analog
+settings are guaranteed by \hw{Reconfig Block}.
+We have performed various trials to increase the operating frequency
+of transceivers, minimizing the noise level of the channel. At present
+transceivers operate at a frequency of 350 MHz (28 Gbsp) to maximize
+the reliability of data transmissions.
+The Altera transceiver ensures DC-balancing on the serial data
+transmitted exploiting the 8B10B encoder. In addition it implements a
+\hw{Word Aligner Block} to restore the word boundary lost during the
+operation of serialization and deserialization and a \hw{Byte Ordering
+Block}.
+Finally the bonding of four independent lanes on a single a channel is
+gained with four \hw{DESKEW FIFO}s.
+
+
+The Data Link Layer is constituted by \hw{LINK CTRL}. It manages the
+data flow by encapsulating packets into a light, low-level,
+word-stuffing protocol able to detect transmission errors via CRC.
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=0mm 40mm 0mm 40mm,clip,width=\textwidth]{link.pdf}
+  \caption{\hw{TORUS LINK} Overview. $L_{R}$ and $L_{L}$ are the
+  latency observed during a data-transaction between two neighbour
+  nodes.}
+  \label{fig:link}
+\end{figure}
+
+
+As shown in figure \ref{fig:link_bw}, measurements of bandwidth were
+taken by varying the frequency of the transceivers to evaluate the
+performance of the existing implementation of the \hw{LINK CTRL}.
+ 
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=0mm 20mm 0mm 20mm,clip,width=\textwidth]{apenet_6link_link_bw_A40.pdf}
+  \caption{\apenetp Link Bandwidth. The curves were obtained by
+    setting the frequency of transceivers respectively at 425 MHz
+    (34Gbps), 350 MHz (28 Gbps), 300 MHz (24 Gbps) and 250 MHz (20
+    Gbps). The Link Bandwidth $BW_{L}$ overlaps the Host Read
+    Bandwidth $BW_{H}^{READ}$ until message size of 8KB-32KB,
+    depending of the operating frequency of the transceivers.}
+  \label{fig:link_bw}
+\end{figure}
+
+
+In order to have a thorough evaluation of the present deployment of
+\hw{LINK CTRL}, it must be taken into account that 8B10B encoder
+causes a loss of 20\% for bandwidth. Then the maximum achievable link
+bandwidth ($BW_{L}^{MAX}$) at the four different operating frequency
+is 3.4 GB/s, 2.8 GB/s, 2.4 GB/s and 2.0 GB/s.
+Our plots show an Efficiency Factor $E_{TOT}$ of approximately 60\% of
+the theoretical maximum bandwidth, due to the implemented protocol
+regardless of the set frequency.
+
+
+A deeper analysis of the adopted transmission protocol can help to
+understand the reasons for the performance degradation. The typical
+\apenetp data packet is formed by 1 \header, 1 \footer (two 16-byte
+words) and a \payload of maximum size equal to 4096 bytes.
+The \hw{LINK CTRL} adds two additional 16-byte words (\magic and
+\start) to initiate a new data transaction. Then 64 bytes of protocol
+($P$) are necessary for each data packet. By focusing on maximum data
+packet size ($S_{MAX}$) we can define a Efficiency Factor $E_{1}$
+equal to:
+
+$$E_{1}=\frac{S_{MAX}}{P+S_{MAX}}=\frac{4096}{64+4096}=0.985$$
+
+
+The \hw{LINK CTRL} is responsible for managing the data flow between
+two neighboring nodes preventing the FIFO overflow. The \hw{LINK CTRL}
+keeps track of how many 16-byte data words have been sent. When it
+reaches the values set in a programmable threshold ($T_{RED}$) the
+data transmission is interrupted.
+The \hw{LINK CTRL} ensures that the receiving FIFOs (\hw{RX LINK FIFO})
+have been emptied at least up to value $T_{YELLOW}$, yet programmable
+and with the constraint $T_{YELLOW} < T_{RED}$.
+The information about the status of \hw{RX LINK FIFO} (how many words
+are placed into the receiving FIFOs) is contained in 16-byte word
+called \credit.
+Referring to figure \ref{fig:link_bw} it is possible to estimate the
+data-interruption cycles. \hw{LINK CTRL} is able to measure the flight
+time of a 16-byte word over the Physical Layer (Remote Latency):
+
+$$L_{R}=35\ cycles$$   
+
+
+The \hw{LINK CTRL} has to wait for the flight time of the last sent
+data and of \credit containing the actual status of \hw{RX LINK FIFO}
+before resuming data transmission.
+Furthermore, we must consider the time needed to transfer the
+occupancy information from the \hw{RX LINK FIFO} to the \hw{LINK CTRL}
+of the receiving node and from the \hw{RX CTRL} to the \hw{TX CTRL} of
+the transmitting node. The receiving side of a \hw{LINK CTRL} clock is
+reconstructed from the incoming data (Clock Data Recovery) while on
+the transmitting side the clock is locally generated by PLLs. A
+synchronization is essential to exchange data between receiving and
+transmitting side (Local Latency):
+
+$$L_{L}=20\ cycles$$   
+
+
+Then the Total Latency of the updated status of FIFOs is:
+
+$$L_{T}=2 \times L_{R}+2 \times L_{L}=110\ cycles$$ 
+
+
+Unfortunately waiting for $L_{T}$ cycles is not enough. Indeed, the
+\hw{TX CTRL} of the receiving node might be busy in transferring data
+packets. Since the maximum packet size is 4096 bytes and for each
+cycle a 16-byte word will be transmitted, the transmitter could be
+committed over 256 cycles. To avoid this latency addiction \hw{TX
+CTRL} sends a \credit every $C$ cycles.
+The transmission protocol requires the submission of a 16-byte word
+(\magic) every time that a \credit is submitted, to distinguish it
+from the \payload (Word-Stuffing Protocol). Therefore, this mechanism
+introduces a new factor of efficiency :
+
+$$E_{2}=\frac{C}{C+2}$$
+
+
+At this point we can define the ${W}$ cycles of transmission
+interruption to get a \credit containing the updated status of the
+\hw{RX LINK FIFO}.  In the worst case the receiving node takes $C$
+cycles to submit the proper \credit so the interruption at the
+transmitting node is:
+
+$$W=L_{T} + C$$
+
+
+When the value contained in the \credit is less than $T_{YELLOW}$ the
+\hw{TX CTRL} resumes data transmission.
+
+In case of normal data traffic (in a test this means just one
+transmitting node and one receiving node, with data coming from a
+single channel and the other channels in idle) writing and reading
+speed of the \hw{RX LINK FIFO} are basically equal. Thus the first
+\credit that arrives to the transmitter should contain a value below
+the $T_{YELLOW}$, and with good approximation we can say that the
+\hw{RX LINK FIFO} are empty and the transmitting node can resume data
+transmission.
+Summarizing, the transmitting node is able to send words for $T_{RED}$
+cycles continuously and stops for $W$ cycles waiting for the \credit
+before resuming the transmission and so on, with an additional
+Efficiency Factor:
+
+$$E_{3}=\frac{T_{RED}}{T_{RED}+W}$$
+
+
+We can then define the Total Efficiency Factor:
+
+$$E_{T}=E_{1} \times E_{2} \times E_{3}$$
+
+
+$T_{RED}$ is set to 506 (to maintain a margin of safety in writing
+\hw{RX LINK FIFO}) and thus we define $E_{T}$ as a function of the only
+variable $C$:
+
+$$E_{T}=0.985 \times \frac{C}{C+2} \times \frac{506}{616+C}$$
+
+
+Maximizing this function for $C$ in the range $C\in[0;55]$, we obtain:
+
+$$C=35.1$$
+
+
+Then setting $C$ = 35 and substituting in formulas for $E_{2}$,
+$E_{3}$, $E_{T}$
+
+$$E_{2}=\frac{C}{C+2}=0.946$$
+
+
+$$E_{3}=\frac{T_{RED}}{T_{RED}+W}=0.777$$
+
+
+$$E_{T}=E_{1} \times E_{2} \times E_{3} = 0.724$$
+
+
+Therefore with the current settings, we expect a bandwidth equal to
+72.4\% of the theoretical maximum and instead we observe a plateau at
+60\% regardless of the set frequency.
+This additional loss is due to the routing algorithm adopted. We must
+take into account that no transaction starts if the receiving module
+does not have sufficient space to accommodate the entire message.
+The information contained in the \credit is available for the
+\hw{ROUTER}. The \hw{ROUTER} does not instantiates a new transaction
+if there is not enough space in the \hw{RX LINK FIFO} to accommodate
+the whole data-packet. Once that the sending of a data packet is
+complete the \hw{FLOW CTRL} underestimates the space available in the
+remote FIFO until receiving a \credit:
+
+$$SPACE\ IN\ FIFO=T_{RED}-S_{MAX}=250<256$$
+
+
+Then the \hw{ROUTER} does not allow sending a packet with payload of
+4KB before the arrival of a \credit that updates the status of the
+\hw{RX LINK FIFO}.
+This changes the efficiency factor $E_{3}$. After sending every
+packet, \hw{TX CTRL} waits for $W$ cycles:
+
+$$E_{3}=\frac{S_{MAX}}{S_{MAX}+W}=0.638$$
+
+
+With this correction the Total Efficiency Factor is in line with the
+observed data:
+
+$$E_{T} = 0.595$$
+
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=0mm 20mm 0mm 20mm,clip,width=\textwidth]{link_realVSexpected.pdf}
+  \caption{A comparison between the results obtained in a
+  point-to-point bandwidth test and the theoretical bandwidth
+  calculated considering the Total Efficiency Factor $E_{T}$.}
+  \label{fig:link_theory}
+\end{figure}
+
+
+Observing figure \ref{fig:link_bw} we note that if the host read
+bandwidth ($BW_{H}$) is less than the link maximum bandwidth
+$BW_{L}^{MAX}$ then the $BW_{L}=BW_{H}$.
+With this arrangement it is possible to estimate the bandwidth as a
+function of message size with good results, as shown in figure
+\ref{fig:link_theory}.
+
+
+It is straight-forward that to improve the \hw{LINK CTRL} performance
+you need to increase the Total Efficiency Factor $E_{T}$.
+
+$E_{1}$ and $E_{2}$ are closely related to the transmission protocol
+and the hardware implementation of the transceiver. Modifying these
+factors leads to a major re-write of the hardware code. The factor
+$E_{1}$ could benefit from a different choice for the transmission
+protocol but would involve a re-write of the \hw{LINK CTRL} state
+machine. $E_{2}$ is related to the latency of transceivers due to
+DC-balancing, alignment and bonding of the channels. In addition, the
+current values are acceptable considering that together they result in
+a loss of 7\% of performance.
+
+
+As mentioned earlier, $E_{3}$ is related to the latency of the channel
+and to the programmable threshold $T_{RED}$. With currently set value
+(506) is not possible to allocate two packets of maximum size (4KB) at
+the same time inside the receiving FIFOs. The only condition that
+would make it possible is to set the programmable threshold equal to
+the depth of \hw{RX LINK FIFO} ($T_{RED}={FIFO\_DEPTH}$). This choice
+is not safe in case of transfers between remote nodes. A minimum
+misalignment (due to jitter, noise, synchronization of signal at
+different clock frequency) could result in the overflow of the
+receiving FIFOs with consequent loss of transmitted data.
+Thus the most straight way to increase $T_{RED}$ is to increase the
+depth of the \hw{RX LINK FIFO}, then change $E_{3}$, resulting in
+improved performance, without any major changes to the hardware code.
+Table \ref{tab:efficiency} and figure \ref{fig:link_expectation} show
+the benefits that would be obtained by changing the depth of the
+FIFOs, at the attained clock frequency 350MHz (28Gbps) and at 425MHz
+(34Gbps), which is the maximum frequency that can be achieved by
+Altera Stratix IV GX transceivers.
+
+\begin{table}[!hbt]
+\centering
+\setlength\extrarowheight{2pt}
+\begin{tabular}{|l|cccc|}
+\hline
+\hline
+FIFO DEPTH & $E_{3}$ & $E_{T}$ & $BW_{L}^{MAX}$@28Gbps & $BW_{L}^{MAX}$@34Gbps  \\
+\hline
+512        & 0.638   & 0.595   & 1666 MB/s  & 2023 MB/s     \\
+1024       & 0.841   & 0.784   & 2195 MB/s  & 2665 MB/s     \\
+2048       & 0.925   & 0.862   & 2414 MB/s  & 2931 MB/s     \\
+4096       & 0.964   & 0.898   & 2514 MB/s  & 3060 MB/s     \\
+\hline
+\hline
+\end{tabular}
+\caption{Efficiency Factor at varying the \hw{RX LINK FIFO} depth.}
+\label{tab:efficiency}
+\end{table} 
+
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=0mm 20mm 0mm 20mm,clip,width=\textwidth]{bw_link_expectation.pdf}
+  \caption{Expected Bandwidth at varying \hw{RX LINK FIFO} depth}
+  \label{fig:link_expectation}
+\end{figure}
+
+
+Observing the values that could be obtained at 425 MHz can be taken as
+immediate the choice to quadruple (or even make 8 times greater) the
+\hw{RX LINK FIFO}. In this way the maximum link bandwidth becomes
+larger than host read bandwidth and the transmission protocol does not
+slow down the data transfer.
+Unfortunately we have to deal with the resources available on the
+Stratix~IV.  Increasing 4 (8) times the depth of the FIFOs implies
+that each FIFO occupies 32~KB (64~KB) compared to the current 8KB. It
+should also be noted that each of the 6 channels is equipped with two
+receiving data FIFOs to ensure a deadlock free routing
+(virtual-channel) for a total of 384~KB (768~KB). Whereas the
+Stratix~IV provides (1.74~MB) of embedded memory it is necessary to
+limit the amount of memory to allocate for data transfer.
+For this reason, we have scheduled a new revision of the \hw{LINK
+CTRL} in the near future with receiving data FIFOs 2 times larger
+(16~KB).  This option seems to be the right balance between used
+resources and expected performance improvement.
+
+Indeed, with these conditions it will be possible to achieve a maximum
+link bandwidth of 2650~MB/s, with a loss of \texttildelow5\% compared
+to the host read bandwidth.
+This result can be achieved only setting the maximum operating
+frequency for the links (425~MHz). Currently the transceivers are
+considered stable at a frequency of 350~MHz. In the future we will try
+to optimize the operating frequency changing Equalization, 
+Pre-Emphasis and DC Gain. However because of
+the noise of the cables, the coupling between connector and cable and
+especially the delicate coupling between daughter-card and board, it
+could not be possible to achieve the maximum frequency for all
+channels.  This could lead to a further loss of performance (for
+example at 350~MHz the maximum achievable bandwidth is 2200~GB/s).
+Obviously, this obstacle can be easily circumvented by doubling the
+size of the FIFOs further (32~KB). During the next year, very
+demanding memory optimizations will be completed (RX processing
+accelerator) and we can assess more precisely the amount of available
+memory.
+Nevertheless, a further analysis factor $E_{3}$ leads to focus on
+another limitation that affects performance negatively. The \hw{LINK
+CTRL} is forced to interrupt the data transmission waiting for an
+update on the status of the remote FIFO to avoid overflow them.
+At a later stage it may be interesting to evaluate the possibility of
+modifying the \hw{LINK CTRL} to avoid the interruption of data
+transmission.  This change would result in a re-write of only a
+portion of the link code hardware: the one responsible of the data
+flow \hw{FLOW CTRL}.
+
+
+
+\subsubsubsection{Tx Acceleration} \label{sub:TxAcceleration}
+On the transmit data path the DNP handles transfers from CPU/GPU
+through the \PCIe port, forwarding the data stream to the TX FIFOs
+(figure \ref{fig:TX_datapath}).
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=0.9\textwidth]{GPU_P2P_Cpu_Interface_TX.pdf}
+  \caption{\apenetp's PCI read (TX) flow.}
+  \label{fig:TX_datapath}
+\end{figure}
+
+Referring to figure \ref{fig:TX_datapath}, PCI read transactions (TX)
+are issued by command-packets, each one composed by four 128bit-words:
+\header, \footer, \hw{CMD0} and \hw{CMD1}. The first two are the
+\header and the \footer of the data-packet that will be sent to the 3D
+network, while \hw{CMD0} and \hw{CMD1} are commands that contain
+information used respectively to program the data PCI DMA read and to
+communicate to the \hw{EVENT QUEUE DMA CTRL} the completion of data
+reading (for more details see section \ref{sec:eventq}).
+
+Command-packets are written by the host in a \ringbuffer, which has a
+fixed size and is managed by two pointers: a \writepointer and a
+\readpointer.  The \writepointer is controlled by the software main
+processor and it is written in the DNP register \wrptr; on the
+contrary, the \readpointer is managed by the \hw{MULTI PKT INST}, and
+it is recorded in a read only register \rdptr.
+
+A difference between \wrptr and \rdptr informs the DNP of the presence
+of new command-packets to execute. 
+In this case, the \hw{MULTI PKT INST} programs a PCI DMA read
+transaction of $N$ command-packets, starting from the address of the
+last received command-packet, where
+$$N=\wrptr-\rdptr$$ 
+As soon as PCI DMA read transaction ends, \hw{MULTI PKT INST} computes
+the new \ringbuffer \readpointer and updates the \rdptr register (this
+mechanism is explained in detail in D6.1 ~\cite{euretile:D6_1}).
+
+In case of CPU TX transaction, \header and \footer are directly
+written in \hw{TX FIFO HD CPU}, while \hw{CMD0} and \hw{CMD1} are
+pushed in \hw{FIFO CMD TX} (figure \ref{fig:TX_CPU}).
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=0.9\textwidth]{Cpu_Interface_TX.pdf}
+  \caption{\apenetp's CPU TX flow.}
+  \label{fig:TX_CPU}
+\end{figure}
+
+Using size and address specified in the \hw{CMD0}, \hw{TX DMA CTRL} is
+able to program the requested DMA to load the packet's payload. In
+order to accelerate the data transfers, the DNP implements two
+separated DMA channels (DMA0 and DMA1): it instantiates transactions
+on the \PCIe bus switching from one channel to the other, reducing the
+latency between two consecutive data requests.
+
+\hw{TX CPU FSM 0} and \hw{TX CPU FSM 1} pop commands from the \hw{FIFO
+CMD TX} alternately; data received from channel DMA0 are written by
+\hw{RAM WRITE FSM 0} in the pages 0 and 2 of the \hw{DMA RAM}, while
+\hw{RAM WRITE FSM 1} is in charge of pages 1 and 3.
+
+At the end of the \hw{DMA RAM} writing process, \hw{TX DMA CTRL}
+analyzes the \hw{CMD1}.
+In case of not dummy command (that is \hw{CMD1} bit 3 - 2="00"), the
+\hw{TX DMA CTRL} communicates to the main processor that required
+operation has been executed through \hw{EVENT QUEUE DMA CTRL} (see
+section \ref{sec:eventq}); dummy \hw{CMD1} is simply dismissed.
+Finally \hw{RAM READ FSM} recursively reads all written RAM pages and
+pushes the \payload in \hw{TX FIFO DATA CPU}.
+
+Figures \ref{fig:TX_sim_1DMA} and \ref{fig:TX_sim_2DMA} show waveforms
+of a simulation of two READ commands sent to \apenetp.
+\begin{sidewaysfigure}
+  \centering
+  \includegraphics[width=\textheight]{waveform_1DMA.png}
+  \caption{\apenetp's CPU TX simulation with 1 DMA channel.
+Time elapsed between two consecutive DMA requests is very long
+(1152~ns) and the \payload of the second packet is written in \hw{TX
+FIFO DATA CPU} after 896~ns.}
+  \label{fig:TX_sim_1DMA}
+\end{sidewaysfigure}
+
+\begin{sidewaysfigure}
+  \centering
+  \includegraphics[width=\textheight]{waveform_2DMA.png}
+  \caption{\apenetp's CPU TX simulation with 2 DMA channels.
+The second request occurrs only 40~ns after the first one, 
+and the complete \payload of the second packet is available 
+only 392~ns after the first packet \payload.}
+  \label{fig:TX_sim_2DMA}
+\end{sidewaysfigure}
+
+In the first case only one DMA is enabled, and the \hw{DMA RAM} uses 2
+pages; time elapsed between two consecutive DMA requests is very long
+(1152~ns) and the \payload of the second packet is written in \hw{TX
+FIFO DATA CPU} after 896~ns. In the second case the DMA 1 channel
+requests data after 40~ns despite of DMA 0, and the complete \payload
+of the second packet is available only 392~ns after the first one.
+
+Figure \ref{fig:2DMA_BW} compares the read bandwidth measured using
+one or two DMA channel implementation, showing a bandwidth improvement
+of 40\%.
+
+ \begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{tx_bw_tuismeglkuan_A40.pdf}
+  \caption{Bandwidth with one or two DMA channels for HOST to HOST
+  transactions.}
+  \label{fig:2DMA_BW}
+\end{figure}
+
+
+
+ \begin{figure}[!htb]
+  \centering
+  \includegraphics[width=0.9\textwidth]{gpu_p2p_tx.pdf}
+  \caption{\apenetp's GPU p2p tx.}
+  \label{fig:tx_gpu}
+  
+\end{figure}
+Unlike host buffer transmission, which is completely handled by the
+kernel driver, GPU data transmission is delegated to \apenetp.  In
+particular, the \apenetp board is able to take part in the so-called
+\PCIe \PtoP (P2P) transactions: it can target GPU memory by ordinary
+RDMA semantics with no CPU involvement and dispensing entirely with
+intermediate copies.
+
+In case of GPU read transaction, command-packets are pushed into
+\hw{FIFO GPU CMD} (figure \ref{fig:tx_gpu}). \ptoptx reads the
+\hw{FIFO GPU CMD} and moves \header and \footer towards \hw{TX FIFO HD
+GPU} and \hw{CMD0} in \hw{FIFO P2P TX} to request data to the
+GPU. Finally it sends \hw{CMD1} to the \hw{EVENT QUEUE DMA CTRL} to
+generate a completion.
+
+
+The first version of \ptoptx ( version \textit{V1} ) reads just one command-packet at a
+time, waiting for the reception of the whole packet's \payload from
+the GPU before accomplishing the following command-packet.
+The slow rate of read requests emitted by the \ptoptx towards the
+GPU and the additional latency of the GPU response cause poor
+performance.
+
+
+In the last year we modified \ptoptx, implementing the packet-command
+multiple-read functionality, in order to collect a huge amount of data
+from the GPU memory, managing many \apenetp packets simultaneously.
+For this purpose we implemented a pipelining system, which requires
+some additional features to manage flow of request to the GPU:
+a \hw{FIFO DATA GPU} overflow control
+(\hw{GPU TX CHECK}) and a request controller (\hw{GPU DATA
+REQUESTING}).
+As in the previous version, \hw{WRITE TX FSM} sends \header and
+\footer to \hw{TX FIFO HD GPU} and \hw{CMD0} to the \hw{FIFO P2P TX}.
+Differently \ptoptx (version \textit{V2} ) pushes the \header also in \hw{FIFO LEN QUEUE}
+and \hw{CMD1} in \hw{FIFO CMD QUEUE} (\textbf{1} in figure
+\ref{fig:tx_gpu}).
+
+The \nios exploits the information contained in \hw{FIFO P2P TX}
+(\hw{CMD0}) to generate GPU data request: it fills \hw{FIFO GPU NIOS
+CMD} with the necessary information to instantiate PCI transactions
+and \hw{FIFO GPU NIOS DATA} with the messages for the GPU
+(\textbf{2}).
+
+
+\hw{GPU DATA REQUESTING} pops data from NIOS FIFO (\textbf{3}) and
+transmits the packet's size to \hw{GPU TX CHECK} (\textbf{4}); this
+block prevents \hw{FIFO DATA GPU} overflow following the equation:
+
+
+\begin{equation} 
+\label{CHECK_fifo}
+W_{REQ}-W_{WRT}+W_{NEW}<W_{FREE}
+\end{equation}
+
+in which $W_{REQ}$ is the number of words already requested to the
+GPU, $W_{WRT}$ is the number of words already written in \hw{FIFO DATA
+GPU}, $W_{NEW}$ is the number of word to request and $W_{FREE}$ is the
+free space in \hw{FIFO DATA GPU}.
+
+At the same time \hw{WRITE DATA FSM} pops the length of the processing
+packet from the \hw{FIFO LEN QUEUE} (as explained above this FIFO
+contains \header in \ptoptx) and sends it to the \hw{GPU DATA
+Cnt} which monitors, by means of a data counter, the data writing
+process in \hw{FIFO DATA GPU} (\textbf{4b}).
+
+\hw{GPU TX CHECK} is in charge of limiting the number of requests for the
+GPU; for this purpose it registers the number of sent requests
+($R_{SENT}$) and served requests ($R_{DONE}$), and it compares their
+difference with a programmable value written in a dedicated register
+($R_{MAX}$).
+
+\begin{equation} 
+\label{CHECK_req}
+R_{SENT}-R_{DONE}<R_{MAX}
+\end{equation}
+
+In case that inequalities \ref{CHECK_fifo} and \ref{CHECK_req} are
+true (the space in \hw{FIFO DATA GPU} is enough to contain the entire
+\payload of the requested packet and the number of pending request is
+acceptable) \hw{GPU DATA CHECK} asserts \hw{check\_ok} signal
+(\textbf{5}) and \hw{GPU DATA REQUESTING} starts the transaction
+(\textbf{6}).
+The end of writing operation is asserted by \hw{Pkt\_Sent} signal
+(\textbf{7}), and \hw{WRITE DATA FSM} starts sending \hw{CMD1} to
+\hw{EVENT QUEUE DMA CTRL} to program the TX completion (\textbf{8}).
+
+As already explained, \hw{GPU DATA REQUESTING} reads the \hw{FIFO GPU
+NIOS CMD} and programs fixed sized DMA write transaction (8 bytes)
+popping GPU command from \hw{FIFO GPU NIOS DATA}, that contains the
+physical address of the requested data.
+
+The calculation of this physical address is a demanding task for the
+\nios, that reduces its performance and slows the whole system. For
+this reason we developed a new component inside \hw{GPU DATA
+  REQUESTING}: the \hw{ACCELERATOR} (\ptoptx version \textit{V3}).
+
+This block, enabled by a \nios \emph{special word} that acts as
+template, produces a GPU command's sequence exploiting the information
+contained in the template.
+
+In this way \hw{GPU DATA REQUESTING} is able to send one request per
+cycle to the GPU despite of many cycle required to \nios. This
+improvement increases significantly the bandwidth of P2P GPU, from
+$\sim$500~MB/s to $\sim$1600~MB/s as shown in section \ref{sec:bwlat}.
+
+
+
+
+
+\subsubsubsection{Software Interface Accelerator (Event Queue)}
+\label{sec:eventq}
+The \CQ (CQs) is one of the main component of The Remote Direct Memory
+Access (RDMA) event-based protocol.
+
+
+The \apenetp communicates to the CPU the completion of each performed
+operation by generating an event, \ie writing in the \CQ.
+
+
+\begin{figure}[!hbt]
+  \centering \includegraphics[trim=30mm 45mm 30mm
+  35mm,clip,width=\textwidth]{EQ_dmactrl.pdf}
+  \caption{An overview of \hw{EVENT QUEUE DMA CTRL} and typical
+  completion flow.}
+  \label{fig:EQ}
+\end{figure}
+
+The \hw{EVENT QUEUE DMA CTRL} (see figure~\ref{fig:EQ}) is able to
+accelerate this communication via fast PCI write transfers.
+
+
+Currently we define 5 types of event:
+
+\begin{itemize}
+\item \TXaevent: \hw{TX BLOCK} completes the data read transfer from
+the host memory through DMA channel 0.
+\item \TXbevent: \hw{TX BLOCK} completes the data read transfer from
+the host memory through DMA channel 1.
+\item \GPUTXevent: \hw{GPUTX BLOCK} completes the data read transfer
+from the GPU memory through DMA channel 4.
+\item \RXevent: \hw{RX BLOCK} completes the data write transfer to the
+host/GPU memory through the DMA channel 6.
+\item \niosevent: it can be used to accelerate communication between
+the CPUs in the host and the \mbox{micro-controller} in the FPGA on
+board (for future development).
+\end{itemize}
+
+
+The completion event consist of two 128-bit words. As shown in table
+~\ref{tab:eq} the \SIprotocol provides a well defined message for each
+event.
+
+\begin{table}[!htb]
+\centering
+\setlength\extrarowheight{2pt}
+\begin{tabular}{|l|c|p{8cm}|}
+\hline
+\hline
+\textbf{Logic Block}      & \textbf{First Completion Word} & \textbf{Second Completion Word}  \\
+\hline                                                                                        
+\hw{TX BLOCK DMA0}        & \hw{CMD1}                      & \hw{TX0 MAGIC WORD}          \\ 
+\hw{TX BLOCK DMA1}        & \hw{CMD1}                      & \hw{TX1 MAGIC WORD}          \\            
+\hw{GPU\_TX BLOCK}         & \hw{CMD1}                      & \hw{GPUTX MAGIC WORD}       \\            
+\hw{RX BLOCK}             & \hw{HEADER}                    & \hw{RX MAGIC WORD}           \\            
+\nios                     & \hw{NIOS CMD}                  & \hw{NIOS MAGIC WORD}         \\
+\hline                    
+\hline                    
+\textbf{Word}             & \textbf{MSB}                   & \textbf{LSB}                \\
+\hline
+\hw{TX0 MAGIC WORD}       & \hw{11111111DAD0DAD0}          & \hw{11111111DAD0DAD0}       \\
+\hw{TX1 MAGIC WORD}       & \hw{22222222DAD0DAD0}          & \hw{22222222DAD0DAD0}       \\
+\hw{GPUTX MAGIC WORD}     & \hw{00000000DAD0DAD0}          & \hw{00000000DAD0DAD0}       \\
+\hw{RX MAGIC WORD}        & \hw{PHYS. ADDRESS}             & \hw{FOOTER(63 downto 0)}    \\
+\hw{NIOS MAGIC WORD}      & \hw{33333333DAD0DAD0}          & \hw{33333333DAD0DAD0}       \\
+\hline
+\hline
+\multicolumn{3}{|c|}{\textbf{\hw{CMD1} and \hw{NIOS CMD} layout}}\\
+\hline
+\textbf{Field}            & \textbf{Name}                  & \textbf{Description}        \\
+\hline
+  1 -  0                  & pad0                           & spare bits                  \\
+  3 -  2                  & tag                            & COMP\_EQ or COMP\_NONE      \\
+ 18 -  4                  & code                           & \nios or hardware COMP      \\
+ 20 - 19                  & port id                        & process id                  \\
+ 31 - 21                  & pad2                           & spare bits                  \\
+ 63 - 32                  & data                           & in case of \nios COMP contains message from the \muC \\
+127 - 64                  & magic                          & TX queue entry address      \\
+\hline
+\hline
+\end{tabular}
+\caption{A detailed view of the completion events.}
+\label{tab:eq}
+\end{table}
+
+
+Thus, once a Logic Block completes a PCI transfer, it writes the
+completion words in the corresponding FIFO. The \hw{EVENT QUEUE DMA
+CTRL} Finite State Machine checks the FIFO Interface
+continuously. When anyone of the FIFOs contains the completion words,
+the \hw{EVENT QUEUE DMA CTRL} instantiates a fixed size PCI write
+transfer (32 bytes). In this way the completion process adds just few
+overhead cycles to initialize the PCI transaction (about 10~cycles,
+40~ns). Furthermore we reserved a DMA channel (DMA7) for \hw{EVENT
+QUEUE DMA CTRL} then the completion process is totally parallelized to
+the process of the corresponding Logic Block. Summarizing the typical
+completion-flow is:
+
+\begin{itemize}
+\item Logic Blocks perform the entrusted tasks at the same time.
+\item One of the Logic Blocks completes its task and it writes the two
+words of completion in the corresponding \hw{EVENT QUEUE FIFO}.
+\item The Logic Block continues performing its tasks while the
+\hw{EVENT QUEUE DMA CTRL} instantiates a 32~bytes PCI write transfer
+through DMA7 to communicate the event completion.
+\end{itemize}
+
+
+In this way no latency is introduced with a relevant performance gain.
+
+
+\subsubsubsection{Logic for Sensors Interface} \label{sec:sensor}
+\apenetp card carries a number of on-board sensors for power and
+temperature monitoring. They are organized in two groups, one for on
+board temperature, FPGA temperature and 12V power monitoring, the
+second group for all others on board voltages (\ie 3.3V used by DDR3,
+1.1V and 1.4V needed by Stratix transceivers, \dots).  The two groups
+have separated serial interface directly connected to Altera's MAX2 
+CPLD (which is responsible for configuration and
+setting of all on board devices).
+
+Temperature is monitored with IC Maxim MAX1619, which features an
+internal temperature sensor and a connection to an external temperature
+diode, which in our case is connected to Altera Stratix internal sensor.
+12V voltage and current is sampled with a single IC Linear LTC4151. 
+Both ICs are interfaced to the programmable configuration device 
+through the same I2C line at different addresses.
+
+Dedicated circuitry has been implemented to sample all others power
+rails, using two Linears LTC2418 -- 8 lines differential analog
+to digital converters suited for sensing applications --. The ICs
+communicate with the programmable configuration device through a
+4-wire digital protocol (SPI-like).
+
+On the MAX2 device is implemented all the logic needed to gather and
+decode data from the sensors and to configure them at start up time,
+in particular I2C and SPI protocols. A number of internal 16-bit
+registers are used to store the data from sensors upon request. These
+registers are read and controlled from the main FPGA, through a 16-bit
+wide bus, and are memory mapped in the Altera \nios embedded
+microprocessor address space through the Avalon bus. Hence, a
+configuration or a data read from a sensor is performed with a
+specific \nios instruction in the system firmware.
+
+
+\subsubsection{Software Development}
+\label{sec:swstack}
+For what regards 2012, the objectives of the Software Development
+activities were the support to the HW innovations on the \apenetp IP
+and to open the path towards the support of the \euretile complete
+toolchain. A lot of effort is employed to achieve the best
+performances and usability for the hardware platform. The software
+layers have to match the same requisites. As a result the software
+development done during 2012 consisted in the implementation in the
+\apenetp Kernel Driver of the necessary support to the new hardware
+blocks and features (TX accelerator, Event Queue, NIOS completion) as
+well as a continuous tuning to reduce the latency due to the driver
+itself, and the support to a newer version of the Linux Kernel
+(v3). To make easier the exploitation of the 3D network and the
+advantages that come, from the application point of view, from the use
+of the \apenetp device, more standardized and user friendly APIs have
+been ported and developed, including an OpenMPI first
+implementation. To address the project objective of a final and
+complete integration between all the \euretile HW and SW layers the
+development of a preliminary version of the DNA-OS driver for \apenetp
+has been started together with TIMA.
+
+The software stack for DNP/\apenetp is outlined, for what regards
+communication, in figures \ref{fig:apenetsw} and \ref{fig:dnpsw}. In
+the following paragraphs we describe the components of this stack
+relevant to highlight the work done during 2012. The RDMA API has been 
+described in D2.1~\cite{euretile:D2_1} and some more can be found in 
+section \ref{sec:testsuite}.
+\begin{figure}[!htbp]
+\centering
+\includegraphics[trim=20mm 10mm 20mm 10mm,clip,width=0.75\textwidth]{apenetDNPswLayers-a.png}
+\caption{Communication software stack for the \apenetp card in the
+\quong platform.}
+\label{fig:apenetsw}
+\end{figure}
+\begin{figure}[!htbp]
+\centering
+\includegraphics[trim=20mm 10mm 20mm 20mm,clip,width=0.75\textwidth]{apenetDNPswLayers-b.png}
+\caption{Communication software stack for the DNP (DNP SystemC model)
+in the Virtual \euretile Platform.}
+\label{fig:dnpsw}
+\end{figure}
+\subsubsubsection{PCI Kernel Driver}
+All the RDMA primitives included in the RDMA API are actually
+implemented in a Linux kernel driver properly developed for
+\apenetp. The kernel driver is a run-time loadable dynamic object
+which abstracts the \apenetp card as a simple character device, a
+simple abstraction of an I/O unformatted data stream. Most of the RDMA
+APIs are channeled towards the kernel driver through the IOCTL system
+call. The most complex APIs are those involving buffer registration,
+which is mandatory for receive buffers, involves memory-pinning and
+virtual-to-physical translation, and persists until an explicit buffer
+deregistration. Pinning and translation are also implicitly done for
+communication primitives, like RDMA PUT and GET.  As memory pinning is
+a time-consuming operation, involving the manipulation (locking,
+traversal, \etc) of the data structures related to the OS memory
+management (MM) subsystem, we developed a Pin-Down Cache (PDC), a
+caching subsystem which keeps pinned memory areas in a proper data
+structure and delays the un-pinning to the closing (program tear-down)
+phase.  The MM traversal related to pinning of memory buffers is also
+used for the population of the virtual-to-physical (V2P) translation
+tables. The physical address of buffer memory is the address of that
+memory as it is seen from the peripheral bus, \PCIe. As
+the concept of virtual/physical addressing scheme is also present for
+the GPU of our choice, a similar technique is implemented for the GPU
+as well. V2P tables are produced during buffer pinning and
+communicated to the \apenetp firmware, which uses them, for example,
+in the receive path to translate virtual addresses carried by packets
+into physical addresses, suitable to be used on the \PCIe bus.
+
+During 2012 a number of new features have been implemented in the
+\apenetp driver:
+\begin{itemize}
+\item Support to the novel hardware features in the GPU TX side,
+  described in section \ref{sub:TxAcceleration}.
+\item Support to the NIOS completions (see \ref{sec:eventq})
+\item Management of overlapping entries in the PDC; user buffers may
+  overlap, the driver is able to manage both the case of intersecting
+  and inclusive memory ranges by merging the entries and maintaining a
+  list of collisions.
+\item Support to Linux kernels version 3.X.X. \end{itemize}
+
+\subsubsubsection{MPI for \apenetp}
+\label{sec:MPI}
+MPI is a standard syntax and semantics for message-passing for
+parallel computing platforms \cite{MPIstd}. The MPI primitives
+integrate with commonly used programming languages in a number of
+efficient implementations. OpenMPI \cite{OpenMPI} is the one we chose
+to port MPI for the \apenetp interconnection card: it is open source,
+it is portable and it is used by many TOP500 supercomputers
+\cite{top500}, which testify its value for the HPC community and the
+necessity for our project to put effort in this activity.
+
+The MPI API basically provides a virtual topology, synchronization and
+communication functionalities between \emph{processes} that are mapped
+onto computing nodes instances.  The MPI library functions include
+(but are not limited to) point-to-point rendezvous-type send/receive
+operations, choosing of logical process topology, combining partial
+results of computations (gather and reduce operations), synchronizing
+nodes (barrier operation) as well as obtaining network-related
+information (number of processes, process id, \etc). Point-to-point
+operations come in synchronous, asynchronous, buffered, and ready
+forms, to allow both relatively stronger and weaker semantics for the
+synchronization aspects of a rendezvous-send.
+
+The OpenMPI library has a layered structure in terms of
+dependency (figure \ref{fig:MPIframws}):
+\begin{itemize}
+\item \textbf{Open MPI (OMPI)} - The uppermost layer, contains the
+  proper implementation of the MPI API.
+\item \textbf{Open Run-time Environment (ORTE)} - The middle layer: it
+  is a common interface to the runtime system, it is responsible of
+  launching processes, out of bound communication, resource
+  management.
+\item \textbf{Open Portability Access Layer (OPAL)} - The bottom
+  layer, it mostly contains utility code.
+\end{itemize}
+
+The substructure is based on the concepts of \emph{frameworks} and
+\emph{components}: the \emph{components} are runtime loadable plugins,
+each of them is included in a \emph{framework}. Components of the same
+type are in the same framework.  This modular structure allows for
+example to specify at run-time which type of communication device to
+use when running an MPI program.  Each component can have one or more
+instances, called \emph{modules}.
+
+Here we restrict our description to the frameworks shown in figure
+\ref{fig:MPIstruct}, organized hierarchically:
+\begin{itemize}
+\item \textbf{PML - Point-to-point Message Layer}, it implements the
+  high level MPI point-to-point semantics and manages messages
+  scheduling and matching as well as the progress of the different
+  communication protocols (for long or short messages). The most
+  important component in the PML framework is \texttt{ob1}, which is
+  specifically targeted to BTLs, while the PML \texttt{cm} supports
+  MTLs.
+\item \textbf{BTL - Byte Transfer Layer}, it is the framework that
+  provides a uniform method for raw data transfer for numerous
+  interconnects, both send/receive and RDMA based. BTLs components of
+  common use are: \texttt{sm}, for intra-node communication between
+  processes; \texttt{self}, for intra-process communication (a
+  process that sends data to itself, useful to implement the
+  collective semantics); \texttt{tcp}, for inter-node communication
+  via sockets; \etc
+\item \textbf{MTL - Matching Transport Layer}, it's the framework
+  designed for networks that are able to implement message matching
+  inside the communication library.
+\item \textbf{BML - Byte Management Layer}, in this framework the
+  \texttt{r2} component is responsible of opening and multiplexing
+  between the BTLs.
+\end{itemize}
+
+In this context, the work of porting MPI communication library for the
+\apenetp card can be seen as the implementation of a new BTL component
+called \texttt{apelink} that relies on the \apenetp RDMA API (see
+\ref{sec:testsuite}).
+
+\begin{figure}[htbp]
+\centering
+\centering
+\includegraphics[trim=0mm 30mm 0mm 20mm,clip,width=0.9\textwidth]{MPIframews.pdf}
+\caption{OpenMPI layered structure. The OMPI layer contains the
+  implementation of the MPI API, ORTE is the runtime environment that
+  launches processes and manages resources, OPAL contains utility
+  code. Each layer is implemented as a library.}
+\label{fig:MPIframws}
+\end{figure}
+\begin{figure}
+\centering
+\includegraphics[trim=0mm 10mm 0mm 20mm,clip,width=0.9\textwidth]{mpistructure.pdf}
+\caption{The OpenMPI structure is based on \emph{frameworks} and
+  \emph{components}. Each framework can have multiple
+  components, for example the PML framework has the 'ob1' or the
+  'cm' components. Each of them supports a different low level
+  communication framework, BTL for 'ob1' and MTL for 'cm'. Each BTL
+  component allows a different communication means or device, for
+  example the BTL 'apelink' is the one written to use the \apenetp
+  card.}
+\label{fig:MPIstruct}
+\end{figure}
+
+
+Writing a new BTL basically consists in defining a series of functions,
+which are used by the upper PML component to manage communication.
+For the \texttt{apelink} BTL these handles can be summarized in table
+\ref{tab:btlapelink}. These are necessary for a minimal support to the
+MPI API, a few more can be defined to enable advanced features, like
+efficiency-tuned RDMA protocols, fault-tolerance, \etc
+
+\begin{table}[!htb]
+\centering
+\setlength\extrarowheight{3pt}
+\begin{tabular}{|l|p{9cm}|}
+\hline
+Function name & Description\\
+\hline
+\texttt{mca\_btl\_apelink\_add\_procs} & Discovers which processes are reachable by this module and create endpoints structures.\\
+\texttt{mca\_btl\_apelink\_del\_procs} & Releases the resources held by the endpoint structures.\\
+\texttt{mca\_btl\_apelink\_register} & Registers callback functions to support send/recv semantics.\\ 
+\texttt{mca\_btl\_apelink\_finalize} & Releases the resources held by the module.\\
+\texttt{mca\_btl\_apelink\_alloc} & Allocates a BTL specific descriptor for actual data.\\
+\texttt{mca\_btl\_apelink\_free} &  Releases a BTL descriptor.\\
+\texttt{mca\_btl\_apelink\_prepare\_src} & Registers user buffer or pack data into pre-registered buffer and return a descriptor that can be used for send/put.\\
+\texttt{mca\_btl\_apelink\_prepare\_dst} &  Prepares a descriptor for send/rdma using the user buffer if contiguous or allocating buffer space and packing.\\
+\texttt{mca\_btl\_apelink\_send} & Initiates a send.\\
+\texttt{mca\_btl\_apelink\_put} & Initiates a RDMA WRITE from a local buffer to a remote buffer address.\\
+\texttt{mca\_btl\_apelink\_get} & Initiates a RDMA READ from a remote buffer to a local buffer address.\\
+\texttt{mca\_btl\_apelink\_register\_error\_cb} & Registers callback function for error handling.\\
+\hline       
+\end{tabular}
+\caption{Functions defined by the BTL apelink.}
+\label{tab:btlapelink}
+\end{table}
+
+A minimal and non-optimized implementation of the \texttt{apelink} BTL
+is available and aligned with the OpenMPI repository trunk at July
+2012.  This implementation has not been completely tested yet, but has
+been proven to work with simple MPI applications, like DPSNN as
+reported in section \ref{sec:DPSNN}.
+
+The \texttt{apelink} BTL can be
+selected at launch time instead of the usual ones (infiniband,
+tcp,...) for example:
+\begin{verbatim}
+mpirun -mca btl apelink,sm,self -n PROCESSES -host HOSTLIST program_name
+\end{verbatim}
+
+Obviously the MPI frameworks add a substantial overhead
+to the communication latency so a consistent optimization work on the
+BTL is necessary to obtain interesting performances.
+We are now working on implementing the necessary logic inside the
+\apenetp OpenMPI module to support GPU-aware point-to-point primitives
+implemented via the GPU \PtoP technique.  The problem with GPU-aware
+MPI is the one with small message size, where the eager protocol,
+which is often used in MPI implementations, cannot be used
+effectively. In the eager case, the matching between the MPI Send and
+the MPI Recv is handled by the receiving node and so it is arbitrarily
+delayed. This means that the sender does not know whether the
+destination buffer will end up on either host or GPU, and, more
+importantly, the APEnet+ firmware, on processing the incoming packet
+on the receiver side, does not know which kind of buffer to put the
+data onto. Of course, this will be resolved as soon as the application
+code on the receiving node posts a matching request, but it will be
+too late to avoid memory copies; more importantly, this does not fit
+with the RDMA model.  One option we would like to experiment with is
+to embed additional GPU-related meta-data, necessary for the Send/Recv
+matching, in the eager packet, and to delay the processing of the
+packet, probably buffering it on the card, until the MPI Recv is
+actually executed by the application and its information are uploaded
+to the card; this would give the receiving card the opportunity to put
+the data in the correct final destination. With eager intensive
+traffic, this would probably be limited by on-board buffer space, and
+the additional processing could easily become counter-effective.  The
+easiest solution would be to disable eager for GPU buffers altogether
+and to always employ rendez-vous. In this case, when a GPU buffer is
+used on the send side, the sender initiates the rendez-vous protocol,
+but the receiver side code has to be properly modified to handle this
+case.  
+
+\subsubsubsection{Presto}
+\label{sec:presto}
+\emph{Presto} is an MPI-like communication library that implements
+RDMA data transfers using an \emph{eager} or \emph{rendez-vous}
+protocol on top of the DNP-\apenetp RDMA API.  It's implemented in C
+and it's available both for the DNP in VEP and for the \apenet+
+card. Presto doesn't offer the same variety of primitives of MPI, but
+because of this simplicity it is actually a thin and light-weight
+software layer.  Table \ref{tab:prestoapi} shows a list of the Presto
+communication primitives and the corresponding MPI primitives.
+
+\begin{table}[!htb]
+\centering
+\setlength\extrarowheight{3pt}
+\begin{tabular}{|p{10cm}|p{8cm}|}
+\hline
+\multicolumn{2}{|l|}{\emph{Basic functions}} \\
+\hline
+\texttt{pr\_init(pr\_mgr\_t \*\*m)} & like \texttt{MPI\_Init()}\\
+\texttt{pr\_fini(pr\_mgr\_t \*m)}  & like \texttt{MPI\_Finalize()}\\
+\texttt{pr\_get\_num\_procs(pr\_mgr\_t \*m, int \*n\_procs)}    & like \texttt{MPI\_Comm\_size()}\\
+\texttt{pr\_get\_self\_rank(pr\_mgr\_t \*m, pr\_rank\_t \*rank)} & like \texttt{MPI\_Comm\_rank()}\\
+\texttt{pr\_get\_clock(pr\_mgr\_t \*m, pr\_clock\_t \*clk)}     & fast cycle counter, in usec\\
+\texttt{pr\_get\_clock\_res(pr\_mgr\_t \*m, int \*clk\_res)}    & get clock resolution\\
+\texttt{pr\_get\_time(pr\_mgr\_t \*m, pr\_time\_t \*tm)}        & get wall-clock time in msec like \texttt{gettimeofday(), MPI\_Wtime()}\\
+\hline
+\hline
+\multicolumn{2}{|l|}{\emph{\PtoP primitives}}\\
+\hline
+\multicolumn{2}{|l|}{\emph{blocking}}\\
+\hline
+\texttt{pr\_send(pr\_mgr\_t \*m, pr\_rank\_t dest, pr\_word\_t\* buf, size\_t nwords)} & blocking send, like \texttt{MPI\_Send()}\\
+\texttt{pr\_recv(pr\_mgr\_t \*m, pr\_rank\_t src,  pr\_word\_t\* buf, size\_t nwords)} & non blocking receive, like \texttt{MPI\_Recv()}\\
+\texttt{pr\_bcst(pr\_mgr\_t \*m, pr\_rank\_t orig, pr\_word\_t\* buf, size\_t nwords)} & broadcast, like \texttt{MPI\_Bcast()}\\
+\hline
+\multicolumn{2}{|l|}{\emph{non-blocking}}\\
+\hline
+\texttt{pr\_isend(pr\_mgr\_t \*m, pr\_rank\_t dest, pr\_word\_t\* buf, size\_t nwords, pr\_req\_t \*r)} & non-blocking send, like \texttt{MPI\_Isend()}\\
+\texttt{pr\_irecv(pr\_mgr\_t \*m, pr\_rank\_t src,  pr\_word\_t\* buf, size\_t nwords, pr\_req\_t \*r)} & non-blocking receive, like \texttt{MPI\_Irecv()}\\
+\texttt{pr\_wait(pr\_mgr\_t \*m, pr\_req\_t r)} & wait for a request to complete, like \texttt{MPI\_Wait()}\\
+\texttt{pr\_waitall(pr\_mgr\_t \*m, pr\_req\_t \*r, size\_t n)} & wait for all the requests to complete, like \texttt{MPI\_Waitall()}\\
+\texttt{pr\_test(pr\_mgr\_t \*m, pr\_req\_t r)} & test for the completion of a request, like \texttt{MPI\_Test()}\\
+\texttt{pr\_req\_free(pr\_mgr\_t \*m, pr\_req\_t r)} & free a request, \texttt{MPI\_Request\_free()}\\
+\hline
+\hline
+\multicolumn{2}{|l|}{\emph{Collective primitives}}\\
+\hline
+\texttt{pr\_barrier()} & like \texttt{MPI\_Barrier()}\\
+\hline       
+\end{tabular}
+\caption{Functions defined by the Presto API.}
+\label{tab:prestoapi}
+\end{table}
+
+
+The Presto library have been available to the EURETILE partners since
+the early stages of the project, allowing the early integration and
+use of the DNP SystemC model in the Virtual EURETILE Platform (see
+D5.1~\cite{euretile:D5_1} and D5.2~\cite{euretile:D5_2}).
+
+More effort is still necessary to make the Presto library optimized in
+order to extract the best performances from the \apenetp card.  Even
+if MPI is a more standard tool for application development, Presto can
+be seen as the simplest way to reach the best performance and
+usability for the \apenetp card even with legacy MPI applications,
+that in principle would require just a renaming of the communication
+primitives to run in a Presto+\apenetp environment. Also the
+similarities in the implementation of MPI and Presto and the lack of
+complexity of the latter, make our library a good testbench to
+experiment a GPU-RDMA integration and find solutions to fix the
+communication protocol in case of small GPU packets as mentioned in
+section \ref{sec:MPI}.
+
+\subsubsubsection{DNA-OS Driver}
+DNA-OS was developed targeting
+MP-SoC's and embedded systems; devices using the \PCIe are not usually
+represented in such an IT ecosystem.
+The target of adapting DNA-OS to run within an x86 platform and drive
+a \PCIe device like \apenetp required significant work:
+\begin{itemize}
+\item accommodating the basic requirements of a generic \PCIe device
+  needed modifications to the DNA-OS Hardware Abstraction Layer (HAL)
+  and the creation of an API for a generic bus driver (described in
+  detail in section 6.1.2 and 6.1.3 of D4.2~\cite{euretile:D4_2});
+\item the addition of services in DNA-OS to manage the sources of
+  interrupts within an x86 platform --- peripherals like timers and
+  Ethernet/\apenetp cards --- and interaction with a user (described
+  in detail in section 5.1 and 5.3 of D4.2~\cite{euretile:D4_2});
+\item \textit{ex novo} development of a prototype driver specific to
+  the \apenetp card (described in detail in section 2.6.1 of D8.1~\cite{euretile:D8_1}).
+\end{itemize}
+
+First two items are structural modifications which were mandatory for
+having the chance of running the DNA-OS run on x86 platform as a
+'lightweight' OS while the third item is specific to the \apenetp
+card.
+With these additions in place, the modified infrastructure was tested
+and validated by a simple program produced by the DNA-OS toolchain and
+running on x86 that queries and sets some board internal registers
+through the PCIe Base Address Register 0 (BAR0).
+This program --- more complete details on its operation are available
+in section 6.1.5 of D4.2~\cite{euretile:D4_2}  --- is the first stage of what will become the complete
+\apenetp driver for DNA-OS.
+
+
+\subsubsection{Test, Debugging \& Measures}
+\subsubsubsection{Setup of Test \& Debug (T\&D) environment}
+\label{sec:IBinstall}
+The environment where the \apenetp card is being developed --- from
+now on the T(est) \& D(ebug) platform --- which is actually also a
+prototype for the \euretile HPC platform, the \quong cluster, consists
+of a mostly homogeneous x86 cluster where the nodes are 1U units
+equipped with dual Xeon CPUs.
+More precisely, the T\&D is composed of (not mentioning off-the-shelf
+components like the Gbit Ethernet switch, ECC DRAM banks, \etc):
+\begin{itemize}
+\item 10 SuperMicro X8DTG-D dual Xeon SuperServers;
+\item 9 Mellanox ConnectX VPI MT26428 InfiniBand Host Channel Adapters (HCAs)
+\item 1 SuperMicro X8DAH+ dual Xeon SuperWorkstation;
+\item 1 SuperMicro X8DTG-QF dual Xeon SuperWorkstation;
+\item 1 Mellanox MTS3600/U1 QDR 36-port switch;
+\item 13 \nvidia GPUs systems:
+\begin{itemize}
+\item 2 Tesla arch. discrete cards (2xC1060);
+\item 7 Fermi arch. discrete cards (2xC2050, 3xM2050, 2xM2070);
+\item 4 Fermi arch. cards housed into 1 S2070 multi-GPU rack.
+\end{itemize}
+\end{itemize}
+
+The diversity of the nodes is partly due to different procurement
+epochs but also to cater to different needs; \eg, the two
+SuperWorkstation units are 4U tower systems which, although more bulky
+than the 1U SuperServer ones, allow for easy 'open-heart' inspection
+of the \apenetp board when it is attached to a protocol analyzer ---
+\eg the Teledyne LeCroy Summit T2-16 --- to peruse the low-level
+workings of the \PCIe bus.
+The S2070 multi-GPU rack of the T\&D was the first assembly of the
+elementary building block which is the keystone for the \quong
+cluster, made of two 1U SuperServers that 'sandwich' the 1U S2070
+rack; the result is a unit with the optimal ratios of 4 GPUs vs. 4
+CPUs and 4 GPUs vs. 2 \apenetp cards compacted into a 3U volume.
+
+The CPUs are quad-core (X5570/E5620) and hexa-core (X5650/X5660)
+variants of Sandy-Bridge dual-core Xeons with frequencies in the
+2.40\textdiv2.93 GHz range and ECC RAM from 12 to 48 GB per node.
+Differently populated topologies can be tested on the T\&D rearranging
+the connections of the \apenetp cards: closed 1-dim loops, 2-dim and
+3-dim torus meshes (4x2 is actually in test), \etc
+The InfiniBand HCAs and switch are necessary for comparison purposes
+to a network fabric fat-tree topology having the high bandwidth and
+low latency currently considered state-of-the-art for an HPC cluster.
+
+A worth mentioning feature of the SuperMicro SuperServers is the
+compliance with the Intelligent Platform Management Interface (IPMI)
+for out-of-band management.
+This means that every T\&D node has onboard a subsystem (called a
+Baseboard Management Controller or BMC) which operates independently
+of the host OS and lets an administrator perform a number of tasks
+that would usually require physical proximity with the device --- as
+accessing BIOS settings, temperature/voltage probing or even
+power-cycling for the unit --- through an out-of-band connection, in
+this case conveyed over an auxiliary Ethernet plug.
+The value of IPMI is twofold:
+\begin{itemize}
+\item the debug phase of low level, potentially system-disrupting
+  software is made considerably easier --- a machine locked hard by an
+  unstable, under development kernel device driver can be power-cycled
+  without compelling the programmer to physically reach the cluster
+  and flip the switch;
+\item it provides essentially for free a number of machine stats ---
+  like voltages, fan speeds or system temperatures --- that can be
+  logged in real-time and eventually used to assess the health status
+  of the machine.
+\end{itemize}
+
+The operating system is a stock CentOS 5.X GNU/Linux, with standard
+2.6.18 kernel line; we are currently evaluating migration to the newer
+CentOS 6.X with 2.6.32 kernel line, which is to be the target OS for
+the \quong cluster.
+The software stack for the GPUs --- driver and development kit --- is
+standard \nvidia CUDA in both versions 4.2 and 5.0.
+
+\subsubsubsection{Software Testsuite (Tools, Synthetic Benchmarks)}
+\label{sec:testsuite}
+The development of the \apenetp card required writing a great deal of
+software; besides the fundamental middleware needed to implement a
+working API for communication with the board --- see \ref{sec:swstack}
+for more details ---, a large number of small test codes (mostly in C
+supplemented by scripts in Bash/TCSH) were written.
+They are necessary for automation of the procedure that 'kickstarts'
+the board to a usable state at system startup and, more importantly,
+to stimulate in the most punctual way all the device's subsystems, in
+order either to timely verify that each modification to the firmware
+was not causing regressions or to help in debugging them when they
+appeared.
+Moreover, especially when the APIs are under development so that
+resorting to extensive rewrites of a more complete application is
+unfeasible, these synthetic tests are invaluable to immediately gauge
+the gains or losses in performance for every optimization that was
+added to the board design along the course of its evolution.
+
+An exhaustive list of these tests is not very informational and a
+recap of the relevant data --- aggregated bandwidth and latency ---
+are given in \ref{sec:bwlat} together with a comparison to results
+gathered by the equivalent OSU benchmarks~\cite{Traff:2012:OMB-GPU}
+over the InfiniBand fabric of the T\&D platform described in
+\ref{sec:IBinstall}.
+We just show here an example of the data gauged by one of these tests,
+\emph{p2p\_gpu\_perf}, that measures the bandwidth of a loopback
+GPU-to-GPU data transfer; it exercises one of the most complex path
+inside the \apenetp.
+In figure \ref{fig:p2p_gpu_perf_host} we have the aggregated data of
+the test as seen by the host together with some debugging output.
+In this test, data packets in transit through the RX path of the
+transfer are processed in a number of steps performed by the \nios
+processor.
+
+\begin{figure}[!hbt]
+  \centering
+\centering
+  \includegraphics[width=\textwidth]{p2p_gpu_perf_test_cropped.png}
+  \caption{Host console output with \textit{p2p\_gpu\_perf} results.}
+  \label{fig:p2p_gpu_perf_host}
+\end{figure}
+
+In figure \ref{fig:p2p_gpu_perf_NIOS} we see a binning histogram with
+a run-down of these steps --- \eg \emph{B2A} is the time taken by
+looking up a buffer in a virtual-to-physical address conversion plus
+the initialization of the memory write, while \emph{B2B} is the time
+taken by the actual virtual-to-physical memory address translation ---
+and their duration in cycles, averaged over a large number of runs and
+output directly by the \nios.
+
+This highly granular profiling allowed us to focus the activity on the
+areas that benefited mostly of tight optimization or were worth the
+extra effort of an hardware implementation.
+\begin{figure}[!hbt]
+  \centering
+\centering
+  \includegraphics[width=0.45\textwidth]{p2p_gpu_perf_cropped3.png}
+  \caption{\nios console output with snapshot of profiling histogram.}
+  \label{fig:p2p_gpu_perf_NIOS}
+\end{figure}
+
+\subsubsubsection{Bandwidth \& Latency Measures}
+\label{sec:bwlat}
+The \apenetp benchmarks were performed on the T\&D platform ---
+hardware and software details are in section \ref{sec:IBinstall}.
+The \apenetp cards used were preliminary with a reduced link speed of
+28~Gbps.
+
+
+To give an idea of the performance and limitations of the current
+implementation, in table~\ref{tab:lowlevel} we collected the memory
+read performance, as measured by the \apenetp device, for buffers
+located on either host or GPU memory and figure~\ref{fig:apenet_tx_bw}
+shows a comparison between HOST and GPU memory read bandwidth at
+varying of the message size.
+\begin{small}
+\begin{table}[htbp]
+\centering
+\setlength\extrarowheight{2pt}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Test}  & \textbf{Bandwidth} & \textbf{GPU/method} & \textbf{\nios active tasks}\\
+\hline
+Host mem read  & 2.8~GB/s &             & none \\
+GPU mem read   & 1.5~GB/s & Fermi/P2P   & \ptoptx \\
+GPU mem read   & 1.6~GB/s & Kepler/P2P  & \ptoptx \\
+\hline
+GPU-to-GPU loop-back   & 1.1~GB/s  & Fermi/P2P  & \ptoptx + RX\\
+\hline
+Host-to-Host loop-back & 1.2~GB/s  &            & RX \\
+\hline
+\end{tabular}
+\caption{\apenetp \mbox{low-level} bandwidths, as measured with a
+  \mbox{single-board} loop-back test. The memory read figures have
+  been obtained by flushing the packets while traversing \apenetp
+  internal switch logic.  Kepler results are for a pre-release K20
+  (GK110), with ECC enabled. Fermi results are with ECC off.  GPU and
+  \apenetp linked by a PLX \PCIe switch.}
+\label{tab:lowlevel}
+\end{table}
+\end{small}
+
+
+\begin{figure}[!htb]
+\centering
+\includegraphics[trim=0mm 20mm 0mm 20mm,clip,width=.75\textwidth]{apenet_6link_tx_bw_A40.pdf}
+\caption{A comparison between HOST mem read and GPU mem read. The
+plots are obtained in a loop-back test flushing the TX injection
+FIFOs.}
+\label{fig:apenet_tx_bw}
+\end{figure}
+
+
+The complexity of the GPU \PtoP read protocol and the limitations of
+our implementation set a limit of 1.5~GB/s to the Fermi GPU memory
+read bandwidth, which is roughly half that obtained for host memory
+read (2.8~GB/s).
+For reference, the GPU-to-host reading bandwidth, as obtained by
+\texttt{cudaMemcpy}, which uses the GPU DMA engines, peaks at about
+5.5~GB/s on the same platform (note \nvidia GPU is an x16 I/O slot wide
+PCI Express card, while \apenetp is only x8 wide).
+We underline that this is the reading bandwidth as measured from
+\apenetp through the GPU \PtoP protocol, neither the internal device
+bandwidth, which is instead available to kernels running on the GPU,
+nor the GPU DMA engine bandwidth, \eg \texttt{cudaMemcpy()}.
+The last two lines of table~\ref{tab:lowlevel} and
+figure~\ref{fig:apenet_tx_bw} show that, when the packet RX processing
+is taken into account by doing a loop-back test, the peak bandwidth
+decreases from 2.8~GB/s to 1.2~GB/s in the host-to-host case, and from
+1.5~GB/s to 1.1~GB/s in the GPU-to-GPU case, \ie an additional 10\%
+price to pay in the latter case.
+The last column in the table shows that the \nios
+\mbox{micro-controller} is the main performance bottleneck.
+We are currently working on adding more hardware blocks to accelerate
+the RX task.
+The values reported in table~\ref{tab:lowlevel} are obtained as the
+peak values in a loop-back performance test, coded against the
+\apenetp RDMA API.
+The test allocates a single receive buffer (host or GPU), then it
+enters a tight loop, enqueuing as many RDMA PUT as possible to keep
+the transmission queue constantly full.
+Figure~\ref{fig:gpu_tx_prefetch_bw} is a plot of GPU reading bandwidth
+at varying message size, estimated by using the test above and by
+flushing TX injection FIFOs, effectively simulating a zero-latency
+infinitely fast switch.
+
+
+\begin{figure}[t]
+
+ \begin{minipage}[t]{0.48\textwidth}
+   \centering
+   \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_6link_gpu_tx_prefetch_A40.pdf}
+   \caption{Single-node GPU memory reading bandwidth, showing the
+  performance at varying message size, obtained by flushing TX
+  injection FIFOs. Different curves corresponds to the three \ptoptx
+  implementations and to different pre-fetch window sizes, where
+  appropriate. Figures are highly unstable for small message sizes,
+  mainly due to software related issues under queue-full conditions.}
+ \label{fig:gpu_tx_prefetch_bw}  
+ \end{minipage}
+ \hspace{3mm}
+ \begin{minipage}[t]{0.48\textwidth}
+ \centering
+ \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_6link_gpu_prefetch_A40.pdf}
+ \caption{Single-node GPU memory loop-back bandwidth, at varying
+  pre-fetch threshold size. Different curves are as in the the
+  previous plot. The full loop-back send-and-receive bandwidth is
+  plotted and it is limited by the \nios \mbox{micro-controller}
+  processing capabilities. }
+ \label{fig:gpu_prefetch_bw}
+ \end{minipage}
+\end{figure}
+
+
+The original \textit{V1} \ptoptx implementation without pre-fetching (for more
+details see \ref{sub:TxAcceleration}) shows its limits.
+\ptoptx \textit{V2} (HW acceleration of read requests and limited pre-fetching)
+shows a 20\% improvement while increasing the pre-fetch window size
+from 4KB to 8KB.
+Unlimited pre-fetching and more sophisticated flow-control in \ptoptx
+\textit{V3} partially shows its potential only in the full loop-back plot of
+figure~\ref{fig:gpu_prefetch_bw}.
+Here the \nios handles both the \ptoptx and the RX tasks, therefore
+any processing time spared thanks to a more sophisticated GPU TX
+flow-control logic reflects to an higher bandwidth.
+
+
+\begin{figure}[t]
+ \begin{minipage}[t]{0.48\textwidth}
+   \centering
+  \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_6link_bw_A40.pdf}
+  \caption{\mbox{Two-nodes} \mbox{uni-directional} bandwidth test, for
+  different combinations of both the source and the destination buffer
+  types. When source is in GPU memory, the overhead is visible; at
+  8KB, the bandwidth is almost half that in the host memory case. The
+  bandwidth cap is related to the limited processing capabilities of
+  the \nios \mbox{micro-controller}. }
+  \label{fig:apenet_bw} 
+ \end{minipage}
+ \hspace{3mm}
+ \begin{minipage}[t]{0.48\textwidth}
+ \centering
+ \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_6link_lat_A40.pdf}
+ \caption{\apenetp latency, estimated as half the round-trip
+  latency. Different combinations of both the source and the
+  destination buffer types.}
+ \label{fig:apenet_lat}
+ \end{minipage}
+\end{figure}
+
+
+As shown above, reading bandwidth from GPU memory and RX processing
+are the two keys limiting factors of the current \apenetp
+implementation.
+Therefore, it can be expected that they influence the communication
+bandwidth between two nodes in different ways, depending of the type
+of the buffers used.
+
+To measure the effect of those factors independently, we run a two
+node bandwidth test on \apenetp, in principle similar to the MPI
+OSU~\cite{Traff:2012:OMB-GPU} uni-directional bandwidth test, although
+this one is coded in terms of the \apenet RDMA APIs.
+The benchmark is basically a one-way point-to-point test involving two
+nodes. The receiver node allocates a buffer, on either host or GPU
+memory, registers it for RDMA, sends its address to the transmitter
+node, starts a loop waiting for N buffer received events and ends by
+sending back an acknowledgment (ACK) packet.  The transmitter node
+waits for an initialization packet containing the receiver node buffer
+(virtual) memory address, writes that buffer N times in a loop with
+RDMA PUT, then waits for a final ACK packet.
+
+The plot in figure~\ref{fig:apenet_bw} shows the bandwidth of \apenetp
+for the four different possible combinations of source and destination
+buffer types:
+for source buffers located in host memory, the best performance of
+1.2~GB/s is reached, with a 10\% penalty paid when receive buffers are
+on the GPU, probably related to the additional actions involved, \ie
+switching GPU \PtoP window before writing to it.
+For GPU source buffers, the GPU \PtoP reading bandwidth is the
+limiting factor, so the curves are less steep and only for larger
+buffer sizes, \ie beyond 32KB, the plateau is reached.
+Clearly, the asymptotic bandwidth is limited by the RX processing, but
+the overall performance is affected by the transmission of GPU
+buffers.
+Interestingly, the Host-to-GPU performance seems to be a very good
+compromise bandwidth-wise, \eg for 8KB message size the bandwidth is
+twice that of the GPU-to-GPU case.
+Of course this plot is good for analyzing the quality of the \apenetp
+implementation, but it says nothing about which method is the best for
+exchanging data between GPU buffers, \ie in which ranges GPU \PtoP is
+better than staging on host memory.
+
+\begin{figure}[t]
+ \begin{minipage}[t]{0.48\textwidth}
+   \centering
+   \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_vs_infiniband_g2g_bw_A40.pdf}
+   \caption{\mbox{Two-nodes} \mbox{uni-directional} bandwidth test,
+  GPU-to-GPU. P2P=OFF case corresponds to the use of staging in host
+  memory. MVAPICH2 result on OSU MPI bandwidth test is for reference.}
+   \label{fig:apenet_vs_ib_bw}
+ \end{minipage}
+ \ \hspace{2mm} \hspace{3mm} \
+ \begin{minipage}[t]{0.48\textwidth}
+ \centering
+\includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_vs_infiniband_g2g_lat_A40.pdf}
+\caption{\apenetp latency, GPU-to-GPU case. \PtoP has 50\% less
+  latency than staging. The MVAPICH2 plot is the GPU OSU latency test
+  on Infiniband.}
+\label{fig:apenet_vs_ib_lat}
+ \end{minipage}
+\end{figure}
+
+
+To this end, figure~\ref{fig:apenet_vs_ib_bw} is a plot of the
+GPU-to-GPU communication bandwidth, with three different methods:
+\apenetp using GPU \PtoP; \apenetp with staging of GPU data to host
+memory; OSU bandwidth test, using MVAPICH2~\cite{MVAPICH2} over
+Infiniband, which uses a pipelining protocol above a certain
+threshold, used for reference.
+The GPU \PtoP technique is definitively effective for small buffer
+sizes, \ie up to 32KB; after that limit, staging seems a better
+approach.
+
+
+\begin{figure}[!hbt]
+  \centering \includegraphics[trim=0mm 20mm 0mm
+20mm,clip,width=.75\textwidth]{host_overhead_A40.pdf}
+\caption{\apenetp \textit{host overhead}, estimated via bandwidth
+test.}
+\label{fig:host_overhead}
+\end{figure}
+
+
+Figure~\ref{fig:apenet_vs_ib_lat} is more useful to explore the
+behaviour of GPU \PtoP on small buffer size.
+Here the latency, estimated as half the round-trip time in a ping-pong
+test, shows a clear advantage of the \PtoP implementation with respect
+to staging (P2P=OFF in the figure), even on a very low-latency network
+as Infiniband.
+Indeed, the \apenetp \PtoP latency is 8.2\us, while for \apenetp with
+staging and MVAPICH2/IB it is respectively 16.8\us and 17.4\us.
+In the latter case, most of the additional latency comes from the
+overhead of the two CUDA memory copy (\texttt{cudaMemcpy}) calls
+necessary to move GPU data between temporary transmission buffers.
+By subtracting the \apenetp H-H latency (6.3\us in
+figure~\ref{fig:apenet_lat}) from the \apenetp latency with staging
+(16.8\us), the single \texttt{cudaMemcpy} overhead can be estimated
+around 10\us, which was confirmed by doing simple CUDA tests on the
+same hosts.
+
+The run times of the bandwidth test, for short message size, are plot
+in figure~\ref{fig:host_overhead}.
+In the LogP model~\cite{Culler:1993:LogP}, this is the host overhead,
+\ie the fraction of the whole message send-to-receive time which does
+not overlap with subsequent transmissions.
+Of those 5\us in the Host-to-Host case, at least a fraction can be
+accounted to the RX processing time (3\us estimated by cycle counters
+on the \nios firmware).
+When staging is used instead (P2P=OFF), out of the additional 12\us
+(17\us - 5\us of the host-to-host case), at least 10\us are due to the
+\texttt{cudaMemcpy} device-to-host, which is fully synchronous with
+respect to the host, therefore it does not overlap.
+
+In conclusion, the GPU \PtoP, as implemented in \apenetp, shows a
+bandwidth advantage for message sizes up to 32KB.
+Beyond that threshold, at least on \apenetp it is convenient to give
+up on \PtoP by switching to the staging approach.
+Eventually that could have been expected, as architecturally GPU \PtoP
+cannot provide any additional bandwidth, which is really constrained
+by the underlying \PCIe link widths (X8 Gen2 for both \apenetp and
+Infiniband) and bus topology.
+
+\begin{figure}[t]
+ \begin{minipage}[b]{0.48\textwidth}
+   \centering
+   \includegraphics[trim=15mm 20mm 10mm 15mm,clip,width=\textwidth]{apenet_vs_infiniband_h2h_bw_A40.pdf}
+   \caption{Host-to-Host Bandwidth comparison between \apenetp and
+   Infiniband.}
+   \label{fig:apenet_vs_ib_h2h_bw}
+ \end{minipage}
+ \ \hspace{2mm} \hspace{3mm} \
+ \begin{minipage}[b]{0.48\textwidth}
+  \centering
+   \includegraphics[trim=15mm 20mm 15mm 20mm,clip,width=\textwidth]{apenet_vs_infiniband_h2h_lat_A40.pdf}
+   \caption{Host-to-Host Latency comparison between \apenetp and
+   Infiniband.}
+   \label{fig:apenet_vs_ib_h2h_lat}
+ \end{minipage}
+\end{figure}
+
+
+Figure~\ref{fig:apenet_vs_ib_h2h_bw} and
+figure~\ref{fig:apenet_vs_ib_h2h_lat} show a comparison between
+\apenetp and Infiniband in case of Host-to-Host transaction.
+In this case \apenetp can not exploit any optimization for small
+message size, as \PtoP in case of GPU-to-GPU transaction. On the other
+hand Infiniband takes advantage of dedicated path for different
+message sizes to optimize the latency.
+When the message size increases (greater than 8~KB) the \apenetp RX
+processing is limited by the reduced performance of the \nios. This
+limitation explains the huge gap in bandwidth for great size messages.
+In section~\ref{sec:link_bw_lat} we define a roadmap to increase the
+performance of the link equalizing the HOST memory read bandwidth.
+Thus the only critical part remaining is the RX processing one.
+At the moment we are defining a re-working strategy of the hardware
+code to remove several tasks from \nios, trying to relieve it,
+optimizing the performance of the RX path.
+Referring to table~\ref{tab:lowlevel} and
+figure~\ref{fig:apenet_tx_bw} the maximum bandwidth that \apenetp can
+achieve is the HOST memory read one (2.8~GB/s) not much less than the
+Infiniband Host-to-Host bandwidth (3.3~GB/s).
+
+
+\subsubsubsection{Effective Frequency: theoretical approach to \apenetp 
+optimization}
+
+The results of benchmarks reported in section~\ref{sec:bwlat}, allowed us
+to select hardware/software blocks to be optimized, in order to further 
+speed-up the \apenetp design. 
+An alternative approach to the physical benchmarking leading to similar
+results is the analysis sketched in this paragraph, where a new blocks
+evaluation index is introduced.  
+The amount of available memory is one of the FPGA most critical resources
+The on-chip memory available in Stratix IV EP4SGX290NF45C2, the 
+\apenetp card device, is limited to 1.74~MB .
+Thus, the architectural choices performed during the hardware development
+phase aims to minimize the amount of used memory and to achieve the target
+performance. The right balance between these two aspects is one of the 
+factors behind the success of a project.
+
+
+To perform a deeper analysis about the connection between memory
+consumption and achieved bandwidth, we introduce the parameter
+Effective Frequency ($f_{eff}$) defined as the ratio of used memory to
+the achieved peak bandwidth with the implemented architecture.
+
+
+$$f_{eff}=\frac{PEAK\ BANDWIDTH}{USED\ MEMORY}$$
+
+
+Then we introduce the ratio $O$ of effective bandwidth to the
+operating frequency $f_{real}$.
+
+$$O=\frac{f_{eff}}{f_{real}}$$
+
+
+The aim of these parameters is to detect the limitations of the
+architectural decisions and to assist in re-allocating the available
+memory resources.
+$O$ is defined in a range $O\in[0;1]$.
+The closer to 1 the value approaches, the higher the level of memory
+optimization.
+The proper use of parameter $O$ is clarified by the following points.
+
+\begin{itemize}
+\item First of all, implement and optimize the architecture to achieve
+the desired performance.
+\item Once the desired performance is reached, analyze the memory
+consumption and calculate the $f_{eff}$ and $O$.
+\item Optimize the memory consumption without affecting the achieved
+performance.
+\item Uniform memory optimization level of all logic blocks of the
+implementation, eliminating the presence of bottlenecks.
+\end{itemize}
+
+
+\begin{small}
+\begin{table}[htbp]
+\centering
+\setlength\extrarowheight{2pt}
+\begin{tabular}{|l|cccccc|}
+\hline
+\hline
+\textit{Logic Block}  & \textit{Used Mem} & \textit{\% of Mem} & \textit{Peak Bandwidth} & $f_{eff}$ & $f_{real}$ & $O$    \\
+\hline                                                                                  
+\hw{TX BLOCK}         & 0.105 MB          & 6.0\%              & 2.8 GB/s                & 26.7  MHz & 250 MHz    & 0.107  \\ 
+\hw{GPUTX BLOCK}      & 0.088 MB          & 5.1\%              & 1.5 GB/s                & 17.0  MHz & 250 MHz    & 0.068  \\ 
+\hw{RX BLOCK}         & 0.070 MB          & 4.0\%              & >2.0 GB/s               & >28.6 MHz & 250 MHz    & >0.114 \\  
+\hw{TORUS LINK}       & 0.167 MB          & 9.6\%              & 9.6 GB/s                & 57.5  MHz & 175 MHz    & 0.328  \\                                                                                   
+\hline                                                                                     
+\nios                 & 0.402 MB          & 23.1\%             & 1.2 GB/s                &  3.0  Mhz & 200 MHz    & 0.015  \\
+\hline
+\hline
+\end{tabular}
+\caption{An overview of memory consumption and its connection to
+the achieved performance.}
+\label{tab:memory}
+\end{table}
+\end{small}
+
+
+We identified 5 key logic blocks to evaluate the performance of the
+\apenetp card:
+
+\begin{itemize}
+\item the \hw{TX BLOCK} is responsible of reading from the host
+memory.
+\item the \hw{GPUTX BLOCK} is responsible of reading from the GPU
+memory, implementing the \PtoP capabilities to optimize the latency of
+the reading process.
+\item the \hw{RX BLOCK} is responsible of writing to the host/GPU
+memory.
+\item the \hw{TORUS LINK} is responsible of data-transmission between
+neighbouring nodes.
+\item the \nios the on-board \mbox{micro-controller} simplifies the
+ tasks of \hw{GPUTX BLOCK} and mainly of \hw{RX BLOCK}.
+\end{itemize}
+
+
+In table~\ref{tab:memory} we collect the amount of memory used in the
+current implementation of the main logic blocks.
+
+
+The first line of the table~\ref{tab:memory} reports the memory
+consumption due to the implementation of the \hw{TX BLOCK}.  \hw{TX
+BLOCK} is the more performing logic block and it satisfies our
+expectation. It defines a good balance between performance and memory
+consumption (only 6\%) then $O_{TX}$ can be taken as reference to
+evaluate the memory optimization level of the remaining logic blocks.
+
+
+The second line collects the \hw{GPUTX BLOCK} status. In this case
+$O_{GPUTX}$ is lower than the \hw{TX BLOCK} one.
+We have to consider that \PtoP is a convenient optimization for small
+size messages. The size limitation prevents to reach the maximum
+performance. The effective frequency is an evaluating parameter in
+case of peak performance. Then it confirms that for greater size
+messages a different GPU memory reading protocol is necessary.
+As explained above the staging approach is a good alternative to
+increase the peak bandwidth of the GPU memory read process considering
+also the high level of optimization of the \hw{TX BLOCK}.
+
+
+To analyze the RX block by itself we modified the one-way
+point-to-point test involving two nodes described before, to bypass
+the \nios during the memory writing process.
+Basically the receiver node communicates to the transmitter node the
+physical memory address of the allocated buffer, on host memory,
+instead of the virtual one. In this way when the \hw{RX BLOCK}
+receives the data-packet can use the physical memory address contained
+in the \header to perform the PCI transaction without questioning the
+\nios. This make it possible to eliminate the bottleneck introduced by
+the \mbox{micro-controller}.
+At the moment the result of these tests is afflicted by the reduced
+capabilities of \hw{TORUS LINK} (as shown in
+section~\ref{sec:link_bw_lat}) but it allows to establish that \hw{RX
+BLOCK} can sustain a bandwidth equal to or greater than 2.0~GB/s. In
+this case $O_{RX}$ is in line with $O_{TX}$ but it could be better
+once we discover the real architecture limitation.
+
+
+The last line shows the memory resources reserved for \nios.
+Obviously a \mbox{micro-controller} needs a huge amount of memory
+compared to normal hardware blocks. In this case we want to evaluate
+the choice to use the \nios in the RX chain (\nios plus \hw{RX
+BLOCK}).  $O_{NIOS}$ is an order of magnitude lower of $O_{RX}$. It
+results in a dramatical loss of performance. This consideration may
+lead to produce an effort to move some RX functionalities from \nios
+to \hw{RX BLOCK}, re-allocating memory resources, in order to maximize
+the performance.
+
+Finally, the \hw{TORUS LINK} has the higher value of $O$ ratio (three
+times higher than $O_{TX}$). The value reported is the total memory
+used by 6 channels and we consider the aggregated bandwidth. The
+optimization of the memory resources is too high and clearly it limits
+the \hw{TORUS LINK} performance.
+The modification proposed in section~\ref{sec:link_bw_lat} (doubling
+\hw{RX LINK FIFO}) is strengthened by this observation even if it
+should cause a decrease in the effective frequency of the \hw{TORUS
+LINK}. In this case a reduction of memory optimization homogenizes the
+resources usage and increases the performance.
+   
+\subsubsubsection{HW instrumentation for debugging}
+
+
+In \apenetp we implemented two main components devoted to debugging:
+we monitor data transferred between two \apenetp cards by means
+\hw{CRC} (Cyclic Redundancy Check) blocks, and internal data path by
+means of a \hw{DATA PARITY CHECKER} (figure \ref{fig:par_check_1}).
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=\textwidth]{apenet_parity_checker_1.png}
+  \caption{Hardware instrumentations for debugging on \apenetp.
+}
+  \label{fig:par_check_1}
+\end{figure}
+
+
+\hw{CRC\_TX} calculates the check value for the whole data-packet to
+be sent (\hw{header}+\hw{payload}+\hw{footer}) using the CRC-32 IEEE
+standard polynomial. The check value is appended to the \footer.
+The error detection is performed by \hw{CRC\_RX}, that calculates the
+check value and compares it with the received one. The chosen
+polynomial (CRC-32 IEEE) is able to detect a maximum number of errors
+that ranges from 2 to 6.
+
+
+A \hw{TORUS LINK} is considered sick when the ratio between the number
+of errors and the number of packets received overruns a given
+(programmable) threshold.
+
+
+
+The \hw{DATA PARITY CHECKER} block detects error on each 128-bit data
+word transferred inside \apenetp. This error-detection technique
+requires a software support: the 128th bit of each payload's word have
+to contain the \hw{parity bit} of the first 127 bits. The \hw{DATA
+PARITY CHECKER} checks the \hw{parity bit}.
+
+We implement a \hw{DATA PARITY CHECKER} in the input of each data FIFO
+(as shown in figure \ref{fig:par_check_1}); it calculates for each
+128-bit data word pushed in FIFO the \hw{parity bit} according to the
+first 127 bits, and then it compares the result with the bit 128.  If
+the comparison fails, indicating that a parity error occurred, the
+block sends an interrupt request and writes in a dedicated register
+the incorrect word. Parity calculation is made by a XOR chain, as show
+in picture \ref{fig:par_check_2}.
+
+Once got interrupt, we can investigate and then modify the path
+between data FIFO connected at the \hw{DATA PARITY CHECKER} that
+founds error. Usually these problems are due to a long path between a
+signal's source and its destination.
+
+
+ \begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=\textwidth]{apenet_parity_checker_2.png}
+  \caption{Architecture of \hw{DATA PARITY CHECKER} Block.}
+  \label{fig:par_check_2}
+\end{figure}
+
+\subsubsubsection{Resource's utilization, power measurements and link characterization} \apenetp is developed on an EP4SGX290 FPGA, which is part of the
+Altera 40 nm Stratix IV device family.
+
+
+
+In Table \ref{tab:synt_summary} and \ref{tab:synt_block} is shown an
+outline of the FPGA logic usage measured with the synthesis software
+Quartus II.
+
+\begin{table}[!htb]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\hline
+Logic utilization                 & 42\%                          \\
+Total Thermal Power Dissipation   & 13,191 mW                     \\
+Combinational ALUTs               & 70,673 / 232,960 (30\%)       \\
+Memory ALUTs                      & 228 / 116,480 (< 1\%)         \\
+Dedicated logic registers         & 61,712 / 232,960 (26\%)       \\
+Total pins                        & 242 / 1,112 (22\%)            \\
+Total block memory bits           & 7,533,432 / 13,934,592 (54\%) \\
+DSP block 18-bit elements         & 4 / 832 (< 1\%)               \\
+Total GXB Receiver Channel PCS    & 32 / 32 (100\%)               \\
+Total GXB Receiver Channel PMA    & 32 / 48 (67\%)                \\
+Total GXB Transmitter Channel PCS & 32 / 32 (100\%)               \\
+Total GXB Transmitter Channel PMA & 32 / 48 (67\%)                \\
+Total PLLs                        & 3 / 12 (25\%)                 \\
+\hline
+\hline
+\end{tabular}
+\caption{Summary of \apenetp logic usage on Stratix IV EP4SGX290 FPGA.}
+\label{tab:synt_summary}
+\end{table}
+
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{|l|c|c|c|}
+\hline
+\hline
+ & Network Interface Block & Switch Block & Single Link Block\\
+\hline 
+Combinational ALUTs       & 32,858    & 12,879    & 4,216   \\
+Memory ALUTs              & 228       & 0         & 0       \\
+ALMs                      & 25,893    & 12,810    & 4,413   \\
+Dedicated logic registers & 29,622    & 12,321    & 3,842   \\
+Block memory bits         & 4,609,848 & 2,875,392 &  8,032  \\
+Power Dissipation         & 914 mW    &  3,464 mW & 1,134 mW\\
+\hline
+\hline
+\end{tabular}
+\caption{Logic usage per logic block on Stratix IV.}
+\label{tab:synt_block}
+\end{table}
+
+
+The thermal power dissipation measurements are obtained from the power
+analyzer tool by Altera, with a value for the power input I/O toggle
+rate set to 25\%. The power dissipation associated to a single channel
+(4 lanes and related logic) amounts to slightly more than 1
+Watt.
+
+The Stratix IV GX provides up to 32 full-duplex
+Clock-Data-Recovery-based transceivers with Physical Coding Sublayer
+(PCS) and Physical Medium Attachment (PMA). In order to produce the
+clearest signal and thus being able to increase signal clock frequency
+on cable, a fine tuning of PMAs analog settings is required. Since the
+transmitted signal is sensitive to the physical route that it must
+travel toward the receiver (cable, connectors, PCB lanes), a number of
+analog settings must be appropriately tuned to offset for distortions.
+Altera provides the Transceiver Toolkit as a specific tool to choose
+the appropriate values for these analog controls. The Transceiver
+Toolkit performs its job by tuning the Reconfig block; it can
+dynamically reconfigure analog settings of the PMAs such as
+Pre-emphasis and DC Gain on the transmitter side and Equalization and
+VOD on the receiver side; furthermore, it offers a simple GUI to tweak
+these settings and to see immediate feedback on receiver side. By
+means of this tool we found the optimal settings for each of the four
+lanes in all six channels (figure \ref{fig:trans_tk}).
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=\textwidth]{trans_tk.png}
+  \caption{Transceiver Toolkit GUI: analog settings for transmitter
+  and receive channels of X+ channel's lane 0.}
+  \label{fig:trans_tk}
+\end{figure}
+
+Once the tuning phase is done, a following step is the testing of
+these settings on our board with our custom logic. Our testing
+firmware is made of a random signal generator (PRBS @32 bits) on the
+transmitting side and a data checker on the receiving side.
+Transmitter and Receiver are synchronized by a dedicated protocol
+implemented in the \hw{TORUS LINK}.
+The numbers of correctly and incorrectly transferred 128-bits words
+are stored in registers. In this way we can either measure the bit
+error rate of the channels (number of incorrectly transferred
+words/number of transferred words) and verify our alignment custom logic.
+In the table \ref{tab:BER_table} we report some of the measures performed,
+taken with different cable lengths, channel ports, and data rate.
+
+\begin{table}[!t]
+\renewcommand{\arraystretch}{1.3}
+\centering
+\begin{tabular}{|l||l|l|l|}
+\hline
+\hline
+BER           & Direction & Cable length & Data Rate \\
+\hline
+$<~$7.04 E-11 & X+        & 5m           & 8.5~Gbps  \\
+\hline
+$<~$8.12 E-11 & Y+        & 5m           & 8.5~Gbps  \\
+\hline
+$<~$7.04 E-10 & Z+        & 5m           & 8.5~Gbps  \\
+\hline
+$<~$9.8 E-13  & X+        & 5m           & 7~Gbps    \\
+\hline
+$<~$2.46 E-14 & X+        & 2m           & 7~Gbps    \\
+\hline
+\hline
+\end{tabular}
+\caption{BER measurements on \apenetp's channel, taken with different 
+cable lengths and data rate.}
+\label{tab:BER_table}
+\end{table}
+
+
+We verified successful data transfer up to the maximum declared rate
+per single lane (8.5~Gbps) in a defined range of the analog
+settings. Anyway at this moment, for reliable operations and upper
+level firmware and software validation, we use a more conservative
+setting for all transceivers lanes at 7.0~Gbps, which makes the
+channels raw aggregated bandwidth at 28~Gbps.
+
+In order to verify link quality, we prepared a testbed for measuring
+signal integrity for the received data. Testbed is composed by an
+\apenetp board which acts as a sender, a QSFP+ cable, and a QSFP+ to
+SMA breakout custom card.
+We prepared a special firmware for \apenetp, in which all the
+transmitter part of the transceivers are sending a random data
+pattern, with no waiting for the receive side to be aligned (as it is
+a one way measurement). Measurements were performed with a 20~GHz,
+40~GS/s high bandwidth sampling scope (a LeCroy WaveMaster 820Zi-A)
+connected to the SMA test points on the break-out card.
+In figure \ref{fig:subfig} we show the Eye Pattern at 5~Gbps, 6~Gbps
+and 8.5~Gbps otteined using a cable of 1~m. length.
+Signal integrity could be improved by receiver side optimizations
+(like VOD or equalization) and by the insertion of a 100~$\Omega$
+differential termination (as required by QSFP+ standard).
+
+\begin{figure}
+\centering
+\subfloat[][\emph{5 Gbps}.]
+{\includegraphics[width=.45\textwidth]{5_0_gbps.png}} \quad
+\subfloat[][\emph{6 Gbps}.]
+{\includegraphics[width=.45\textwidth]{6_0_gbps.png}} \\
+\subfloat[][\emph{8.5 Gbps}.]
+{\includegraphics[width=.45\textwidth]{8500_good.png}} \quad
+\caption{Eye Pattern.}
+\label{fig:subfig}
+\end{figure}
+
+
+
+\subsubsection{Board Production} A production batch of 15 boards has been processed during 2012.  Some
+minor changes were introduced in this batch, with respect to the
+prototypal batch (4 boards) produced during 2011. These changes were
+including fixes of previous design mistakes.
+
+A request for tender has been initiated at the beginning of the year,
+and the selected vendor resulted to be Seco S.r.l. with the lowest bid
+and satisfactory technical proposal.
+
+Vendor was encharged with complete board production, component
+procurement (excluding the Altera Stratix IV component, which were
+provided directly by an Altera re-seller) and complete board
+assembly. Basic electrical tests have been performed at this stage.
+
+Before validation, boards need to be initialized with a list of tasks:
+\begin{itemize}
+ \item Altera EPM240 component programming --- in order to have
+ on-board Altera USB blaster capabilities on mini-USB connector.
+ \item FTDI component initialization --- for USB connection to JTAG
+ properly working.
+ \item Altera EPM2210 component programming --- in order to have all
+ on-board controllers working (sensors, clock management, JTAG
+ capabilities, \dots).
+ \item Altera Stratix IV programming.
+\end{itemize}
+
+Thus, production batch has been validated with a test suite on latest
+available software and firmware.
+
+
+
+\subsection{Assembly of the \quong Hybrid Cluster}
+
+During 2012 a 16 nodes \quong system has been deployed.  The hardware
+procurement procedure carried out during 2011 has been further
+extended in order to reach the 16 nodes count of the currently
+available system (figure \ref{fig:quong}).
+
+The \quong hybrid computing node integrates an Intel Xeon E5620 double
+processor host with 48~GB of system memory, two S2075 \nvidia Fermi
+class GPUs and an \apenetp 3D network card.
+A 40~Gb/s Infiniband Host Controller Adapter is also available, in
+order to provide a \emph{de facto} standard network interface to users
+and to perform comparative benchmarks with our custom 3D network
+interface.
+
+The \quong elementary mechanical unit is a 3U "sandwich" built
+assembling two Intel dual Xeon servers with a Next/IO vCORE Express
+2075, a 1U \PCIe bus extender hosting 4 \nvidia Tesla M2075 GPU (figure \ref{fig:quongsandwich}).
+Topologically it corresponds to 2 vertexes on the \apenetp 3D network.
+
+Currently, only 4 out of 16 nodes are actually equipped with an
+\apenetp board, enabling a bidimensional 2x2x1 network topology on
+these nodes.
+By Q2 2013 the whole system will be connected by the \apenetp 3D
+network, with a 4x2x2 topology.
+
+The software environment of the cluster is based on CentOS 6.3, with a
+diskless setup where the computing nodes are bootstrapped via the GbE
+network interface, and employs the \nvidia CUDA 4.2 driver and
+development kit for the GPUs. Both OpenMPI and MVAPICH2 MPI libraries
+are available.
+
+Users can submit parallel jobs using the SLURM batch system, with full
+support for task launch for OpenMPI and MVAPICH2 applications. 
+Programs linking  the OpenMPI library can perform communications both
+over \apenetp and Infiniband fabrics, those linking the MVAPICH2 can 
+use only the Infiniband.
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=0.70\textwidth]{monolite-scaled.jpg}
+  \caption{The \quong Hybrid Cluster}
+  \label{fig:quong}
+\end{figure}
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[width=0.70\textwidth]{assemblequong.pdf}
+  \caption{How to assemble a \quong sandwich.}
+  \label{fig:quongsandwich}
+\end{figure}
+\FloatBarrier
+
+\subsection{Applications}
+\label{sec:applic}
+Since its first deployment, \quong cluster is available to users from
+different research areas like Lattice Quantum
+Chromo-Dynamics~\cite{D'Elia:2012:zw}, Laser-Plasma
+Interaction~\cite{Rossi:pic}, Complex Systems~\cite{Berganza:2012:xy}
+and N-Body simulation for astrophysics~\cite{2012arXiv1207.2367C}.
+Herebelow we give an outlook of the codes that were more thoroughly
+examined and customized to exploit the \PtoP capabilities of the
+\apenetp boards equipping the \quong cluster.
+
+\subsubsection{OSU Micro Benchmarks}
+A cluster like \quong must be graded against what is currently
+considered standard reference for network performance gauging, \ie the
+synthetic tests \texttt{MPI\_latency} and \texttt{MPI\_bandwidth} from
+the Ohio State University Micro Benchmarks (OSU-MB)
+suite~\cite{Traff:2012:OMB-GPU}.
+Starting from version 3.5, they are also able to exercise any
+GPU-aware directives that the MPI infrastructure should offer.
+The pipelining strategies employed by different MPI stacks can be
+tested over the InfiniBand network fabric on \quong and compared to
+the more advanced \PtoP capabilities employed by \apenetp; a detailed
+run-down of these runs and the results of the comparison can be found
+in section~\ref{sec:bwlat}.
+
+\subsubsection{Heisenberg Spin Glass}
+One application that was used as testbench of the \apenetp
+capabilities comes from the statistical mechanics field; it is the
+simulation of a prototypical complex system called Heisenberg Spin
+Glass (HSG)~\cite{Bernaschi20121416}.
+This system models a cubic lattice of magnetic classical 3D spins
+$\sigma_{i}$ subject to an Hamiltonian function $H=-\sum_{i \neq j}
+J_{ij} \sigma_{i} \cdot \sigma_{j}$ with the $J_{ji}$ couplings
+distributed with a normal Gaussian distribution law restricted to
+next-neighbours interaction ($J_{ij}=0$ if $|i-j|>1$).
+
+Scanning the lattice, site after site, is needed for every computation
+performed onto the system, like in the heat-bath and over-relaxation
+algorithms for lattice dynamics or computation of observables like the
+internal energy.
+Standard techniques of domain decomposition are applied to this scan;
+the lattice is partitioned along one or more dimensions and different
+processes on different nodes scan a partition each, synchronizing with
+each other by exchange of lattice sites along the partition edges.
+The criticality of this exchange is apparent as soon as the processes
+are scaled up to make the ratio of computation time vs. exchange time
+smaller and smaller, all the more so when the computing processes are
+on GPUs and the exchange must take into account the staging needed to
+bounce back and forth the lattice partition from GPU memories.
+
+This is exactly the scenario where the \PtoP capabilities of the
+\apenetp board can be made to shine.
+After code rearrangement --- replacing a small number of key MPI calls
+with equivalent ones to the RDMA API --- a thorough study of the
+performance improvements was performed on the HSG application; results
+are published here~\cite{Bernaschi2013250} and here~\cite{CASS2013}.
+
+\subsubsection{Lattice Quantum Chromo-Dynamics}
+Lattice Quantum Chromo-Dynamics is a challenging application and a
+staple of INFN research work.
+The LQCD field has greatly benefited of the strong boost given by GPU
+acceleration to stencil computations: in this regard, the QUDA
+library~\cite{Clark:2009wm} is a renowned, advanced software package
+for multi-GPU Lattice QCD simulation that, in its standard form,
+employs MPI for communication but has not yet been modified to exploit
+the GPU-aware directives~\cite{Babich:2010}.
+
+\begin{figure}[!hbt]
+  \centering
+  \includegraphics[trim=18mm 20mm 12mm 20mm,clip,width=0.9\textwidth]{QUonG_dslash_wilson_SP_48x96_gflops_per_node_PROF_TUNED.png}
+  \caption{Strong-scaling plot of GFlops per node for a QUDA run on
+    \quong.}
+  \label{fig:qudagflops}
+\end{figure}
+
+Moreover, since the domain decomposition techniques employed for the
+LQCD algorithms are exactly the same as in the HSG, the scaling issues
+hindering the HSG application belong to the LQCD application as
+well~\cite{Babich2:2011}.
+Out-of-the-box QUDA was installed and run on the \quong cluster to
+verify those issues; in figure~\ref{fig:qudagflops} we see the
+decrease of efficiency when strong-scaling the application of the
+Wilson-Dirac operator over a $48^{3}\times96$ lattice up to 24 GPUs
+--- all twelve \quong nodes (2 GPUs per node) which were available
+when the test was run.
+
+The Gantt diagrams in figure~\ref{fig:qudagantt} clarify the problem.
+On the 'K' row, the bars show the span of the computation in the bulk
+('Int') and the frame of the lattice along the dimensions ('T', 'Z' and
+'Y') for one GPU.
+On the 'T+/-', 'Z+/-' and 'Y+/-' rows, the bars show the span of
+consecutive 'P'repare, 'G'ather, 'C'ommunication and 'S'catter phases
+for the frame exchange between GPUs.
+
+On the left side of figure~\ref{fig:qudagantt}, it is seen that on a
+$48^{3}\times96$ lattice split over 4 GPUs, the span of 'P', 'G', 'C'
+and 'S' phases is completely overlapped to the 'Int' one, so that
+computation is not delayed by communication.
+On the contrary, the GPU computation kernel is throttled on 24 GPUs by
+the wait for completion of the frames exchange between neighbouring
+nodes (along the 'T', 'Z' and 'Y' axes in the '+' and '-' directions),
+especially so since the various 'G' and 'S' phases imply a number of
+GPU-to-host and host-to-GPU memory transfers that must be scheduled
+one after the other, interfering with the scheduling of the CUDA
+stream performing the computation kernel and adding an overall
+significant latency to the computing over the frames --- see the blank
+areas of the 'K' row in the right side of the figure.
+
+\begin{figure}[ht]
+  \begin{minipage}[b]{0.45\linewidth}
+    \centering
+    \includegraphics[trim=22mm 22mm 25mm 25mm,clip,width=\textwidth]{QUonG_dslash_wilson_SP_48x96_4GPUs_Gannt.pdf}
+    \caption*{Lattice partitioned along T axis, 4 GPUs.}
+  \end{minipage}
+  \hspace{0.5cm}
+  \begin{minipage}[b]{0.45\linewidth}
+    \centering
+    \includegraphics[trim=22mm 22mm 25mm 25mm,clip,width=\textwidth]{QUonG_dslash_wilson_SP_48x96_24GPUs_Gannt.pdf}
+    \caption*{Lattice partitioned along T, Z and Y axes, 24 GPUs.}
+  \end{minipage}
+  \caption{GANTT diagrams of a QUDA run --- $48^{3}\times96$ lattice.}
+  \label{fig:qudagantt}
+\end{figure}
+
+Since usage of \PtoP primitives should do not require the 'G' and 'S'
+phases, porting of QUDA to \apenetp is foreseen to alleviate this
+degradation.
+Work for adding this support to the QUDA library is underway; it is a
+large and complex endeavour made even harder due to the fact that the
+application was not designed from the start with GPU-awareness for the
+communication primitives.
+
+In the mean time, parts of the \euretile toolchain were put to the
+test with LQCD on \quong --- especially the DAL functional simulator
+and the AED of the VEP simulator --- with a reduced kernel of the main
+LQCD computation that was rewritten from scratch using either the DAL
+syntax and the RDMA low-level API.
+A more complete description of the various forms of this LQCD
+reference application for \euretile is in section 4 of
+\textbf{D7.2}~\cite{euretile:D7_2}.
+
+\subsubsection{Distributed Polychronous Spiking Neural Networks (DPSNN)}
+\label{sec:DPSNN}
+The investigation on \textit{"brain-inspired"} techniques for the
+design of hardware and software components of future many-tile
+computing systems is among \euretile key topics.
+In the proposal, we stated a set of intuitions about the potentiality
+of such architectural concepts to many tile software and hardware
+architectures. Actually, we expect to exploit hints coming from the
+cortical architecture, a system capable of extreme parallelism and low
+power operation.
+We identified the development of a dedicated benchmark as a key asset
+to get quantitative and qualitative way-points along the project.
+
+Such a cortical simulation benchmark should be used:
+\begin{itemize}
+ \item as a source of requirements and architectural inspiration
+towards the extreme parallelism which will be exhibited by future
+many-tile systems;
+ \item as a parallel/distributed coding challenge;
+ \item as a scientific grand challenge. A well designed code could
+produce interesting scientific results.
+\end{itemize}
+
+During the previous reporting period (2011), in the framework of
+\textbf{WP7: Challenging Tiled Applications} we defined the
+characteristics of the DPSNN-STDP application benchmark (Distributed
+Polychronous Spiking Neural Network with synaptic Spiking Time
+Dependent Plasticity), as described by \textbf{D7.1} ~\cite{euretile:D7_1}.
+
+This benchmark will be coded during the temporal framework of the
+\euretile project both using a standard C/\cpp plus MPI environment, as
+well as using the C/\cpp plus XML DAL environment.
+This will allow to compare the features of the new environment in
+comparison to a classical environment on a benchmark which will be
+coded "from scratch" using an explicit description of parallelism.
+
+Here, we highlight only a few results directly related to the
+development of the \quong platform and \apenetp interconnection board
+that are fully described by \textbf{D7.2} ~\cite{euretile:D7_2} .
+
+In summary, during 2012, we designed and implemented the \cpp code of a
+complete prototype of the DPSNN-STDP simulator. Then we run the full
+simulation cycle (initialization and dynamic phases of a network
+including $10^{5}$ synapses) in the \cpp plus MPI environment on a
+\quong prototype, using the standard InfiniBand interconnections, and
+obtaining the same behavior with different number of processes. Then
+we ported and run the initialization phase of the DPSNN-STDP code
+under the DAL plus \cpp environment on a prototype environment where
+two \quong nodes were interconnected by two \apenetp card. We used the
+same \cpp classes as building blocks to construct the DAL and MPI
+network of processes.
+
+This will permit, during 2013, to start a comparison activity between
+the \apenetp interconnect system and the InfiniBand system, and among
+the performances offered by the DNA-OS, MPI and Presto message passing
+software layers, when applied to the DPSNN-STDP benchmark. Then we
+will identify the middleware and hardware bottlenecks, and derive
+architectural improvements for future generations of interconnect
+systems.
+
+\subsubsection{Breadth-First Search}
+Breadth-First Search (BFS) is a fundamental graph algorithm that
+systematically explores the nodes in a graph.
+BFS is typically considered one of the most important graph algorithms
+because it serves as a building block for many others, including
+betweenness centrality calculation, connected component
+identification, community structure detection and max-flow
+computation.
+Benchmark suites targeting graph applications perennially include BFS
+as a primary element.
+
+Most of graph algorithms have low arithmetic intensity and irregular
+memory access patterns.
+In this context, those irregular computation and communication
+patterns are very interesting; the typical traffic among nodes that
+BFS traversal is able to generate is non-deterministic all-to-all,
+depending on the edge partitioning.
+The buffer sizes vary as well, so that the performance of the
+networking compartment is exercised in different regions of the
+bandwidth plot.
+
+Recent works~\cite{Hong:2011:BFS} have shown that, by using a Level
+Synchronous BFS, a single-GPU implementation can exceed in performance
+high-end multi-core CPU systems.
+To overcome the GPU memory limitation, some authors
+proposed~\cite{Graph400:2012:BFS} a multi-GPU code that is able to
+explore very large graphs (up to 8 billion edges) by using a cluster
+of GPU connected by InfiniBand.
+
+The communication code of this BFS application was modified to use the
+\PtoP calls from the RDMA API of \apenetp; although the trials were
+conducted with \apenetp still in a development and testing stage, the
+results obtained~\cite{Graph400:2012:IA3,CASS2013}, albeit
+preliminary, show an advantage of \apenetp with respect to InfiniBand.
+
+\subsubsection{TRIGGU (RDMA API)}
+A very different endeavour for the \apenetp card is within
+TRIGGU~\cite{TRIGGU:2012:NSS}, a simulation of the data flow and
+processing --- the \emph{track fitting} --- of a real time event
+selection system in a High Energy Physics experiment.
+Data produced by the silicon detector at the Collider Detector at
+Fermilab is sent from a transmitter node (simulating the detector) to
+a receiver node (the selection system) where it is processed on the
+GPU to look for tracks left by charged particles.
+
+The system allows measuring both data transfer and processing latency.
+The time to copy memory into and out of the GPU represents a
+significant overhead for the total latency.
+
+A number of strategies were tested in the software infrastructure to
+improve upon this overhead, exploiting the GPUDirect functionalities
+of latest CUDA by \nvidia and the RDMA API of the \apenetp card.
+Using GPU-Aware MPI leads to a decrease in the memory transfer time
+for large data sizes, while usage of \PtoP communication strategies by
+means of the RDMA API over \apenetp shows a strong boost to
+performance (10 \us on average) for even small data sizes.
+
+\subsection{IP exploitation}
+\subsubsection{NaNet Project}
+The NA62 experiment at CERN aims at measuring an ultra-rare decay of
+the charged kaon ($K^{+} \rightarrow \pi^{+} \nu\overline{\nu}$ );
+signal has to be extracted from a huge background which is ten orders
+of magnitude more frequent.
+
+With an input particle rate of 10 MHz, some tens of thousands detector
+channels and the requirement of avoiding zero suppression as much as
+possible, triggerless readout into PCs is not feasible.
+
+Very promising results in increasing selection efficiency of
+interesting events come from a pilot project within NA62 that aims at
+integrating GPUs into the central L0 trigger processor, exploiting
+their computing power to implement more complex trigger primitives
+\cite{2012NIMPA.662...49C}.
+
+Independently, in the framework of the \euretile project, we were
+developing the low latency, scalable, GPU-accelerated PC cluster
+interconnect \apenetp, which is the first non-\nvidia device to 
+exploit the \nvidia GPUDirect P2P protocol to enable zero-copy 
+transfers to and from GPU memory.
+
+From the joint effort of these two projects comes the next step of
+GPUs integration for the NA62 L0 trigger: the NaNet project.
+
+The NaNet board is a custom FPGA-based NIC featuring a standard GbE
+interface and GPUDirect P2P capabilities, able to inject the UDP input
+data stream from the detector front-end directly into the Fermi/Kepler
+GPU(s) memory, with rates compatible with the low latency real-time
+requirements of the trigger system.
+
+This makes for a modular and customizable hybrid (CPU+FPGA+GPU) system
+able to sustain low response time and real-time features and
+potentially re-usable in analogous contexts of strict timing
+requirements.
+
+As main design rule, we partitioned the system in a way such that we
+could offload the CPU from any data communication or computing task,
+leaving to it only system configuration and GPU kernel launch tasks.
+
+This choice was really a step in the right direction for the real-time
+requirement, eliminating the unavoidable OS Jitter effects that
+usually hinder system response time stability.
+
+Data communication tasks have been entirely offloaded to NaNet by
+implementing a dedicated UDP protocol handling block that communicates
+with the P2P logic: this allows a direct (no data coalescing or
+staging is performed) data transfer with low and predictable latency
+on the GbE link-GPU data path.
+
+\begin{figure}[!htb]
+  \centering
+  \includegraphics[trim=30mm 0mm 15mm 0mm,clip,width=0.8\textwidth]{NaNet_Blocks.pdf}
+  \caption{The NaNet Architecture}
+  \label{fig:NaNet}
+\end{figure}
+
+The \hw{UDP OFFLOAD} is an open core module \cite{Udp:2009:Online}.
+It implements a method for UDP packet traffic offloading from a \nios
+system such that can be processed in hardware rather than in
+software. The open core design is built for a Stratix II 2SGX90
+development board.
+\hw{UDP OFFLOAD} collects data coming from the Avalon Streaming
+Interface (\hw{Avalon-ST}) of the Altera Triple-Speed Ethernet
+Megacore (\hw{TSE MAC}) and redirects UDP packets into a hardware
+processing data path.
+\nios subsystem executes the InterNiche TCP/IP stack to setup and tear
+down high speed UDP packet streams which are processed in hardware at
+the maximum data rate achievable over the GbE network.
+
+Within the NaNet project we adapted the open core for our purposes.
+Above all we ported the hardware code to the Stratix IV family. This
+operation made possible to exploit the very improved performance of a
+two technology steps forward FPGA.
+In the Stratix II, the hardware components of the \nios subsystem are
+synthesized at the operating frequency of 35~MHz. The limited
+operating frequency forces to implement multiple channels to sustain
+the data flow over a GbE Network.
+The synthesis performed on a Stratix IV achieves the target frequency
+of 200~MHz (in current implementation of \apenetp the \nios subsystem
+operates at the same frequency).
+The optimization allows to reduce the number of channels necessary to
+sustain the data-flow. Current implementation of NaNet board provides
+a single 32-bit width channel (at the present operating frequency it
+achieves the capabilities of 6.4~gbps, 6 times greater of the GbE
+requirements).
+
+
+Data coming from the single channel of the modified \hw{UDP OFFLOAD}
+are collected by the \hw{NaNet CTRL} (see figure \ref{fig:NaNet}).
+\hw{NaNet CTRL} is an hardware module in charge of managing the GbE
+flow by encapsulating packets in the typical \apenetp protocol
+(\header, \payload, \footer).
+
+The \hw{NaNet CTRL} main functionalities are:
+
+\begin{itemize}
+\item It implements an Avalon-ST Sink Interface (the hardware modules
+of the \hw{UDP OFFLOAD} communicates through Avalon-ST protocol)
+collecting the GbE data flow.
+\item It generates the \header for the incoming data, analyzing the
+UDP packet \header (message size) and several configuration registers
+(see table \ref{tab:nanetconf} and table \ref{tab:nanetcmd}).
+\item It parallelizes 32-bit data words coming from the \nios
+subsystem into 128-bit \apenetp data words.
+\item It redirects data-packets towards the corresponding FIFO (one
+for \header and \footer and another for the \payload).  \hw{NaNet
+HEADER FIFO} and \hw{NaNet DATA FIFO} are connected to the \hw{RX
+BLOCK} that exploits the commands stored in the \header to perform the
+GPU write transactions.
+\end{itemize}
+
+\begin{table}[!htb]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\hline
+\multicolumn{2}{|c|}{\textbf{NaNet Configuration Register layout}} \\
+\hline
+Register Name             & Description\\
+\hline 
+NaNet RDMA virt addr LSB  & LSB of virtual address used in RDMA protocol\\
+\hline
+NaNet RDMA virt addr MSB  & MSB of virtual address used in RDMA protocol\\
+\hline
+NaNet RDMA command        & Commands to initialize the RDMA process\\
+\hline
+\hline
+\end{tabular}
+\caption{NaNet Configuration Register Overview.}
+\label{tab:nanetconf}
+\end{table}
+
+
+\begin{table}[!htb]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\hline
+\multicolumn{3}{|c|}{\textbf{NaNet RDMA command}}        \\
+\hline
+Bit Range & Name            & Description                \\
+\hline
+27 - 26   & port id         & process ID                 \\
+\hline
+28        & is gpu          & Identify a GPU packet      \\   
+\hline
+29        & gpuid           & Identify the target GPU    \\
+\hline
+30        & NaNet Last Frag & Identify the last part of a buffer \\
+\hline
+31        & NaNet Phys Addr & Enable the \nios bypass    \\ 
+\hline
+\hline
+\end{tabular}
+\caption{NaNet RDMA Command Register Layout.}
+\label{tab:nanetcmd}
+\end{table}
+Preliminary benchmarks for latency and bandwidth were carried out.
+Latency was measured adding timing info in the \apenetp \footer
+with a resolution of 4~ns, and it shows that a packet traversal time 
+ranges between 5.2~us and 6.8~us from input of \hw{NaNet CTRL} to the 
+completion signal of the DMA transaction on the \PCIe bus 
+(see figure \ref{fig:nanetlat}).
+
+Currently we are investigating the spread of the measure.
+Measured bandwidth was of about 120~MB/s, saturating the GbE channel 
+capabilities.
+
+
+We foresee several improvements on the \hw{NaNet} design:
+
+\begin{itemize}
+\item Adding a buffering stage to the \hw{NaNet CTRL}, enabling the
+  coalescing of consecutive UDP payload data into a single \apenetp
+  packet payload, improving bandwidth figure also with small-sized UDP
+  packets.
+\item Increasing the number of GbE channel in input, in order to
+  sustain higher bandwidth demand coming from the experimental
+  requirements.
+\item Moving towards a 10-GbE data link interface.
+\end{itemize}
+\begin{figure}[h!]
+  \centering
+  \includegraphics[trim=0mm 0mm 0mm 0mm,clip,width=0.8\textwidth]{histogram60000_A31.png}
+  \caption{NaNet Latency; distribution plot over 60000 samples of a 
+  NaNet packet traversal time}
+  \label{fig:nanetlat}
+\end{figure} 

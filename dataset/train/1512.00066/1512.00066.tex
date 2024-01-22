@@ -1,0 +1,291 @@
+
+
+Sparse tensors have a correspondence to hypergraph dataset representations, where each hyperedge contains $d$ vertices if the tensor is of $d$th order.
+By providing a general interface for basic algebraic operations on tensors, we aim to allow succinct expression of bulk operations on multidimensional arrays and hypergraphs (graphs for $d=2$).
+We allow tensor elements to be defined on arbitrary algebraic structures, which express the basic properties (associativity, distributivity, zeros) of the desired elementwise tensor operations.
+Each tensor is not restricted to elementwise operations defined by its algebraic structure, auxiliary user-defined functions may also be defined and applied. 
+Such an approach is not entirely new, the Julia programming language~\cite{2012arXiv1209.5145B} leverages general types and elementwise functions for matrix computations.
+The algebraic properties of the elementwise functions define the space of algorithms and optimizations that are permitted when executing these operations over entire tensors.
+Finally, we employ an index interface that allows the definition of loop nests acting on one or two tensor operands and producing a single tensor output.
+The tensor indices may be thought of as loop indices, with the total number of unique indices in an expression defining a loop nest of that order, with the elementwise operations applied in the innermost loop.
+Indices that are omitted in the output are summed over, in line with the Einstein summation notation used in chemistry and physics.
+
+
+\subsection{Algebraic Structures}
+\label{subsec:algstrct}
+
+Algebraic structures allow us to define the types of tensor elements and specify their properties.
+Tensor summation and contraction are derived on top of the operations specified in these algebraic structures.
+Our interface provides five types of structures, whose properties are summarized in Table~\ref{tab:algstr}.
+\begin{table}[htbp]
+\centering
+\begin{tabular}{c | c | c | c | c | c}
+algebraic structure & add. op. & add. id. & add. inv. & mul. op. & mul. id. \\
+\hline
+{{set}} & & & & & \\
+\hline
+{{monoid}} & \checkmark & \checkmark & & & \\
+\hline
+{{group}} & \checkmark  & \checkmark & \checkmark & & \\
+\hline
+{{semiring}} & \checkmark & \checkmark & & \checkmark & \checkmark \\
+\hline
+{{ring}} & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark 
+\end{tabular} 
+\caption{Summary of algebraic structure properties: operators (add. op. and mul. op.), inverses (add. inv.), and identities (add. id., mul. id.).}
+\label{tab:algstr}
+\end{table}
+As it is also possible to define auxiliary functions, algebraic structures that do not have identity elements, namely semigroups (monoid without an additive identity) and rngs (ring without a multiplicative identity), do not need to be explicitly supported.
+The action of the semigroup operator may be fully expressed by a function applied to pairs of elements of a set and the action of the multiplicative operator in an rng may be expressed as a function on pairs of elements of a group.
+We assume associativity of the additive operators and distributivity of the multiplicative operators defined for these algebraic structures, but allow the user to specify these properties for auxiliary functions. 
+The user can also define algebraic structures that satisfy these properties within only a subdomain of elements or only approximately (e.g., floating point arithmetic).
+Currently, no static or runtime checks of these properties are done, so it is up to the user to ensure the computation is specified correctly.
+
+The most basic structure, a set, simply holds the C++ type of the tensor elements.
+Our implementation is restricted to statically-sized types, which makes iteration and communication of elements straight-forward.
+More advanced algebraic structures additionally take elementwise functions as parameters for operators and specific elements as zeros.
+The elementwise functions may be provided as function pointers or C++11 Lambdas, and the natural default operators/zeros are provided for basic types.
+For example, the default tensors are created on a ring algebraic structure equivalent to the following {\kwstyle Ring} {\CD r},
+\begin{lstlisting}
+     Ring<> r(0.0,                                    // additive identity
+              [](double a, double b){ return a+b; },  // additive operator
+              MPI_SUM,                                // MPI Op for additive operator
+              1.0,                                    // multiplicative identity
+              [](double a, double b){ return a*b; }); // multiplicative operator
+\end{lstlisting}
+As another example, we define an algebraic structure used for shortest path computations on graphs with integer weights, the tropical semiring, as follows,
+\begin{lstlisting}
+    Semiring<int> ts(INT_MAX/2,                             // additive identity
+                     [](int a, int b){ return min(a,b); },  // additive operator
+                     MPI_MIN,                               // MPI Op for additive operator
+                     0,                                     // multiplicative identity
+                     [](int a, int b){ return a+b; });      // multiplicative operator
+\end{lstlisting}
+In the tropical semiring, the addition operator is an integer minimum, while the multiplication operator is integer addition.
+The identity element of the multiplication operator is provided as $0$, while the identity element of the addition operator is provided as half of the largest representable integer.
+Using half of the integer max as the additive identity prevents integer overflow when adding (multiplying on the tropical semiring) two additive identities, avoiding the need for an overflow check in the actual operator for the tropical semiring computations presented in this paper. 
+
+
+
+
+
+\subsection{Tensors}
+
+Tensor objects may be defined as ordered collections of elements of some algebraic structure.
+We denote a tensor as $\mathbf{T}$ and its elements as $T_{ijk..}$.
+Each element of a tensor is given by some configuration of a set number of indices.
+This number of indices is referred to as the order of the tensor, while the size of the range of the indices are its dimensions.
+For instance, a scalar has order zero, a vector has order one, and a matrix has order two.
+
+Each tensor is distributed across a set of processors defined by a {\kwstyle{World}}.
+In our implementation each {\kwstyle{World}} corresponds to a set of MPI processes.
+For instance, a {\kwstyle{World}} containing all available processes may be defined as
+\begin{lstlisting}
+    World dw(MPI_COMM_WORLD);
+\end{lstlisting}
+
+
+
+
+
+The simplest and most commonly used tensors are those of low order.
+While we provide special interfaces for {\kwstyle{Scalar}}, {\kwstyle{Vector}}, and {\kwstyle{Matrix}}, they are all simply instances of {\kwstyle{Tensor}}.
+The constructors for all these objects take parameters in the following order
+\begin{enumerate}
+\item element type (template parameter)
+\item the order and dimensions of the tensor
+\item sparsity and symmetry attributes of the tensor
+\item the set of processes over which the tensors are distributed
+\item the algebraic structure of the tensor elements
+\end{enumerate}
+The parameters may be omitted when they take on the default, e.g., the element type is `double', no sparsity or symmetry attributes, the tensor is distributed over all processes, or the algebraic structure is the standard addition/multiplication over a basic type.
+The first integer parameter for {\kwstyle{Vector}} defines the dimension of the vector.
+
+
+The symmetry of a matrix may be specified as one of
+NS (nonsymmetric), SH (symmetric without diagonal), SY (symmetric with diagonal), and AS (antisymmetric).
+These can be combined (binary or) with an attribute for sparsity, SP.
+For instance, we can define an undirected graph with $n$ nodes and integer edge weights as a sparse $n\times n$ symmetric matrix with no diagonal on the tropical semiring,
+\begin{lstlisting}
+    Matrix<int> F(n,n,SP|SH,ts);
+\end{lstlisting}
+
+
+
+
+Tensors of arbitrary type and order are defined via the {\kwstyle{Tensor}} class.
+In our implementation, this templated (by element type) class derives from an internal non-templated class, which implements effectively all functionality, ensuring that instantiation of tensors of new type takes little compilation time.
+For arbitrary-order tensors, the symmetry attribute specification is more complex, and allows for the definition of partially symmetric tensors.
+An array of size equal to the order of the tensor of symmetry attributes must be provided, where the $i$th element specifies the symmetry relation of the $i$th tensor dimension with the $(i+1)$th.
+For example, we can construct a sparse fourth order tensor often used in quantum chemistry, which has two pairs of antisymmetric indices as
+\begin{lstlisting}
+    int dims[] = {nv,nv,no,no};
+    int syms[] = {AS,NS,AS,NS};
+    Tensor<> V(4,dims,SP,syms);
+\end{lstlisting}
+This tensor would contain double-precision floating-point elements with the standard ring operators, and have the dimensions {\CD nv}-by-{\CD{nv}}-by-{\CD{no}}-by-{\CD{no}} with the first index being antisymmetric with the second (specified by the position of the first AS), and the third being antisymmetric with the fourth (specified by the position of the second AS).
+
+While creation of dense tensors immediately maps and allocated the data (and sets to the additive identity, when the algebraic structure has one), a newly created sparse tensor contains no data.
+Data is read and written to sparse and dense tensors bulk synchronously via index-value pairs.
+Special functions provide access to data local to the processor and to certain specified distributions.
+
+\subsection{Tensor Operations}
+
+Having defined the algebraic structure and properties of the representation of the tensors, we can now define various algebraic operations.
+We focus on defining operations on one or two tensors, as functions of multiple tensors can be deconstructed into pairwise tensor functions (albeit with a potential need for larger intermediate tensors).
+We first recall how Einstein summation notation may be used to express tensor summations and contractions over the algebraic structure.
+We then study two types of specially-defined operators, `functions' that take one or two elements as operands and output a new element, and `transforms' that modify an element, based zero, one, or two other elements as operands.
+These functions are more general than those specifiable in algebraic structures, as all operands/outputs are permitted to be of different type.
+
+\subsubsection{Indexed Tensors}
+
+To relate tensors to one another, we can assign any order $k$ tensor, $k$ characters as `indices' for each of its $k$ ways.
+Such indices are commonly used in tensor mathematics, especially in chemistry and physics, and may also be thought of as for loop variables in the context of operations.
+When the same index appears in two tensors being operated on, or in a tensor and a result, these indices are matched and specify the semantics for the operation.
+When an index appears two or more times in the same tensor, it specifies that the operation should touch only the corresponding diagonal of the tensor.
+The use of pure indices for expression of tensor summations and contractions is referred to as Einstein summation notation.
+This indexed interface has been previously presented for CTF~\cite{solomonik2014massively}, and similar interfaces have been used in other tensor contraction libraries~\cite{JCC:JCC23377}.
+We start by recalling the basics of the index notation, then show how the notation can be combined with more arbitrary elementwise functions.
+
+Our interface creates indexed tensor objects from tensor objects by overloading the bracket operator for tensors, e.g., we can assign the {\CD V} tensor created above indices as follows,
+\begin{lstlisting}
+    Idx_Tensor V["abij"];
+\end{lstlisting}
+It is often convenient to inline this notation directly into the tensor expression.
+For example, given tensor {\CD W} with the same dimensions and symmetry as {\CD V}, we can add it to {\CD W} via the operation,
+\begin{lstlisting}
+    V["abij"]+=W["abij"];
+\end{lstlisting}
+When indices appear only in the operands, an implicit summation over this index is implied, while when an index appears exclusively in the output tensor, it is implied that the result is replicated (mapped) over this index.
+For example the following reduction and map operations:
+\[q = \sum_{i=1}^n v_i, \quad 
+ \forall i\in\{1,\ldots, n\}, b_{i} = \sum_{j=1}^n A_{ij}, \quad
+ \forall i \in \{1,\ldots, n\}, z_i = 42, \quad 
+ \forall i,j\in\{1,\ldots, n\}, F_{ij} = \sum_{k=1}^n G_{kj},\]
+are expressed very similarly in our interface once the tensors are defined appropriately,
+\begin{lstlisting}
+    q[""] = v["i"];       b["i"] = A["ij"];       z["i"] = 42;       F["ij"] = G["kj"];
+\end{lstlisting}
+Additionally, the interface supports iteration over diagonals.
+Below, we show three examples: defining an identity matrix, scaling the diagonal of a matrix, and computing the sum of the superdiagonal of a third-order tensor,
+\begin{lstlisting}
+    I["ii"] = 1.0;                 A["jj"] *= 3.0;                 double s = T["iii"];
+\end{lstlisting}
+The scalar $s$ is automatically cast to the type of an order-zero tensor.
+
+For basic types, it is possible to cast scalars to tensors with no indices, e.g., we can compute the square of the Frobenius norm (2-norm) of {\CD V} via the command,
+\begin{lstlisting}
+    double nrm_sq = V["abij"]*V["abij"];
+\end{lstlisting}
+although we also provide a special {\kwstyle norm2()} function for this faculty.
+Here all the four indices $a,b,i,j$ are summed over, which is implicitly inferred as these indices do not appear in the output.
+If {\CD V} has dimensions $n\times n\times n \times n$, the above line of code computes
+\[q = \sum_{a=1}^n\sum_{b=1}^n\sum_{i=1}^n\sum_{j=1}^n V_{abij}^2.\]
+This interface supports typical tensor contractions such as (with index and summation limits omitted for brevity),
+\[\forall i,\quad z_i = \sum_j W_{ik}\cdot v_k, \quad\quad 
+  \forall i,j, \quad C_{ij} = \frac{1}{2}\sum_k A_{ik}\cdot B_{kj}, \quad\quad 
+  \forall a,b,i,j, \quad F_{abij} = F_{abij} + \sum_k G_{ikab}\cdot H_{kj},\]
+via simple one line commands that closely correspond to the mathematical formulation:
+\begin{lstlisting}
+    z["i"] = W["ik"]*v["k"];   C["ij"] = .5*A["ik"]*B["kj"];   F["abij"] += G["ikab"]*H["kj"];
+\end{lstlisting}
+In the above tensor contractions each index appears in exactly two tensors, consistent with the typical definition of contractions.
+However, as in summations, within our interface it is also possible to perform tensor operations where indices appear in exclusively one tensor, corresponding, as before, to reductions or maps.
+Further, it is possible for indices to appear in all three tensors, which specifies a set of independent problems over this index.
+For example, the Hadamard matrix product, defined by
+\(\forall i,j, T_{ij} = V_{ij}\cdot W_{ij}\)
+is easily expressible via our interface,
+\begin{lstlisting}
+    T["ij"] = V["ij"]*W["ij"];
+\end{lstlisting}
+More generally, indexed tensor summations and contractions can be interpreted by imagining a set of nested for loops over every unique index with the tensor expression appearing in the innermost loop as an (accumulation) operation on elements of multidimensional arrays.
+
+
+
+
+\subsubsection{Tensor Functions and Transforms}
+
+We allow the algebraic structure operator to be replaced (or the algebraic structure to be extended), by allowing basic user-defined functions.
+This syntax allows the user to succinctly express tensor transformations that modify each element independently, as well as combine pairs of element of two tensors to produce a third.
+There are two signatures for user defined functions:
+\begin{lstlisting}
+    (type_B) <- (type_A),
+    (type_C) <- (type_A, type_B).
+\end{lstlisting}
+When the types are the same, the latter function signature is the same as that of the addition and multiplication operators defined for algebraic structures.
+When the tensor expression requires summation of a set of function outputs, the addition operator of the output tensor algebraic structure is used.
+
+As an example, a vector of forces {\CD F} may be formed as a set of partial sums of interactions of particles stored in vector {\CD P}.
+To do this, first a {\kwstyle Monoid} algebraic structure is created, which requires defining an MPI reduction operator for the summation of forces.
+Then, once the vector {\CD P} is populated with data (local data may be written to tensor bulk-synchronously via the {\kwstyle write} function), the forces are calculated and accumulated in one command.
+\begin{lstlisting}
+    struct force{
+      double x, y; 
+      force(double x0, double y0){ x=x0; y=y0; }
+    };
+    MPI_Op op_add;
+    MPI_Op_create([](void * a, void * b, int * n, MPI_Datatype *){
+                    for (int i=0; i<*n; i++){
+                      ((force*)b)[i].x += ((force*)a)[i].x;
+                      ((force*)b)[i].y += ((force*)a)[i].y;
+                    }
+                  }, 1, &op_add);
+    Monoid<force> mf(force(0.,0.), [](force a, force b){ return force(a.x+b.x,a.y+b.y); }, op_add);
+    Vector<force> F(n, mf);
+    
+    struct particle{ double x, y, px, py, A; };
+    Vector<particle> P(n, Set<particle>());
+    P.write( ... ); // input local particle data and indices **/ 
+
+    force interact(particle a, particle b){
+      double dx = a.x-b.x;    double dy = a.x-y.x;    double f21 = a.A*b.A/dx*dx*dy*dy;
+      return force(f21*dx, f21*dy);
+    }
+    Function<particle,particle,force> f(&interact);
+    F["i"] += f(P["i"],P["j"]); // in parallel compute for i = 1 to n, F_i = sum_j f(P_i, P_j)
+\end{lstlisting}
+
+Transforms provide a more powerful abstraction, that allows accumulation and modification to existing elements, overriding the addition operator of the output tensor algebraic structure.
+There are three signatures for transforms:
+\begin{lstlisting}
+    void (&type_A), 
+    void ( type_A, &type_B),
+    void ( type_A,  type_B, &type_C).
+\end{lstlisting}
+In each case, the last value is passed by reference and should be modified within the transform function.
+As an example, a set of forces may be integrated to update a particle's location, via the following transform.
+\begin{lstlisting}
+    Transform<force,particle> t([] (force f, particle & p){ p.px += p.A*f.x; p.py += p.A*f.y; });
+    t(F["i"],P["i"]);
+\end{lstlisting}
+This interface syntax allows arbitrary-depth nested loops to be executed in parallel via one line of code, e.g., the command,
+\begin{lstlisting}
+    ((Transform<>)([] (double a, double b, double & c){ c=c/(a+b); }))(A["i"],B["j"],C["ij"]);
+\end{lstlisting}
+amounts to executing the following code over distributed arrays,
+\begin{lstlisting}
+    for (int i=0; i<n; i++){
+      for (int j=0; j<n; j++){
+        C[i,j] = C[i,j]/(A[i]+B[j]);
+      }
+    }
+\end{lstlisting}
+By default the framework assumes transforms and functions are distributive.
+The non-distributive case, which also has important use-cases, is not yet supported by our implementation.
+
+\subsection{Implementation of the Interface}
+
+The realization of arbitrary elementwise tensor functions and transforms does not present an algorithmic challenge, but poses an interesting practical implementation challenge.
+In particular, functions that combine/interact/produce tensors of different types imply that the entire framework cannot simply be templated and instantiated for a given type (the approach taken by CTF previously).
+Instead, the overwhelming bulk of the logic of the framework is implemented using runtime-specification of the type, i.e., the number of bytes needed for each tensor element suffices for the execution of the mapping and redistribution logic.
+A lightweight templated layer is built on top of this, providing a user-friendly typed interface, while keeping compilation time small even when triply-templated user-defined functions are being applied.
+This approach is a significant departure from and extension of the standard four numerical types provided by BLAS and LAPACK libraries.
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,623 @@
+
+
+\documentclass[final]{cvpr}
+
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{eucal}
+\usepackage{amssymb}
+\usepackage{caption}
+\usepackage{enumerate}
+\usepackage{subcaption}
+\usepackage{threeparttable}
+\usepackage{multirow,booktabs,makecell}
+
+
+
+\usepackage[pagebackref=true,breaklinks=true,colorlinks,bookmarks=false]{hyperref}
+
+\usepackage{color}
+\usepackage{colortbl}
+\definecolor{mygray}{gray}{.9}
+\definecolor{mypink}{rgb}{.99,.91,.95}
+\definecolor{mycyan}{cmyk}{.3,0,0,0}
+
+\definecolor{tianyuan_comment}{rgb}{.9,.1,.1} 
+
+\definecolor{hzw_comment}{rgb}{.1,.1,.9} 
+
+\definecolor{MyRed}{rgb}{0.8,0.2,0}
+\definecolor{MyBlue}{rgb}{0,0,1.0}
+\def\red#1{\textcolor{MyRed}{#1}}
+\def\blue#1{\textcolor{MyBlue}{#1}}
+\def\first#1{\red{\textbf{#1}}}
+\def\second#1{\blue{\underline{#1}}}
+
+\newcommand{\forwardwarp}{\overrightarrow{\mathcal{W}}}
+\newcommand{\backwardwarp}{\overleftarrow{\mathcal{W}}}
+
+
+\def\cvprPaperID{5280} \def\confYear{CVPR 2022}
+
+
+
+\begin{document}
+    \title{RIFE: Real-Time Intermediate Flow Estimation for Video Frame Interpolation}
+
+    \author{Zhewei Huang$^{1}$
+		~~~~
+		Tianyuan Zhang$^{1}$
+		~~~~
+		Wen Heng$^{1}$
+		~~~~
+		Boxin Shi$^{2}$
+		~~~~
+		Shuchang Zhou$^{1}$\\
+		$^{1}$Megvii Inc~~~~$^{2}$Peking University\\
+		{\tt\small \{huangzhewei, zhangtianyuan, hengwen, zsc\}@megvii.com, shiboxin@pku.edu.cn}
+		}
+\maketitle
+
+
+\begin{abstract}
+   We propose RIFE, a Real-time Intermediate Flow Estimation algorithm for Video Frame Interpolation (VFI). Many recent flow-based VFI methods first estimate the bi-directional optical flows, then scale and reverse them to approximate intermediate flows, leading to artifacts on motion boundaries and complex pipelines. RIFE uses a neural network named IFNet that can directly estimate the intermediate flows from coarse-to-fine with much better speed. We design a privileged distillation scheme for training IFNet, resulting in a large performance improvement. RIFE does not rely on pre-trained optical flow models and can support arbitrary-timestep frame interpolation with the temporal encoding input. Experiments demonstrate that RIFE achieves state-of-the-art performance on several public benchmarks. Compared with the popular SuperSlomo and DAIN methods, RIFE is 4--27 times faster and produces better results. The code is available at \url{https://github.com/hzwer/arXiv2020-RIFE}.
+\end{abstract}
+
+\section{Introduction}
+Video Frame Interpolation (VFI) aims to synthesize intermediate frames between two consecutive video frames. VFI supports various applications like slow-motion generation, video compression~\cite{wu2018video}, and novel view synthesis. Moreover, real-time VFI algorithms running on high-resolution videos have many potential applications, such as reducing bandwidth requirements for live video streaming, providing video editing services for users with limited computing resources, and video frame rate adaption on the display devices.
+
+VFI is challenging due to the complex, large non-linear motions and illumination changes in real-world videos. Recently, flow-based VFI algorithms have offered a framework to address these challenges and achieved impressive results~\cite{liu2017video, jiang2018super, niklaus2018context, xue2019video, bao2019depth, xu2019quadratic, liu2020enhanced}. Common approaches for these methods involve two steps: 1) warping the input frames according to approximated optical flows and 2) fusing and refining the warped frames using Convolutional Neural Networks (CNNs). 
+
+\begin{figure}
+	\centering
+	\includegraphics[width=7.5cm]{image/Vimeo/psnr_inference.pdf}
+	\caption{\textbf{Speed and accuracy trade-off for different model size settings.} Results are reported for Vimeo90K benchmark~\cite{xue2019video}.} \label{fig:intro_fig}
+	\vspace{-1em}
+\end{figure}
+
+Optical flow models can not be directly used in VFI. Given the input frames $I_0, I_1$, flow-based methods~\cite{liu2017video,jiang2018super,bao2019depth} need to approximate the intermediate flows $F_{t\rightarrow 0}, F_{t\rightarrow 1}$ from the perspective of the frame $I_t$ that we are expected to synthesize. There is a ``chicken-and-egg" problem between intermediate flows and frames because $I_t$ is not available beforehand, and its estimation is a difficult problem~\cite{jiang2018super, park2020bmbc}. Many practices~\cite{jiang2018super, bao2019depth, xu2019quadratic, liu2020enhanced} first compute bi-directional flows from optical flow models, then reverse and refine them to generate intermediate flows. However, such flows may have flaws in motion boundaries, as the object position changes from frame to frame~(``object shift" problem). Another pioneering work, DVF~\cite{liu2017video} proposes voxel flow to jointly model the intermediate flow and occlusion mask by using CNNs to estimate them end-to-end. AdaCoF~\cite{lee2020adacof} further extends intermediate flows to adaptive collaborative flows. BMBC~\cite{park2020bmbc} designs a bilateral cost volume operator for obtaining more accurate intermediate flows. 
+
+In this paper, we aim to build a lightweight pipeline that achieves state-of-the-art performance while maintaining the conciseness of direct intermediate flow estimation. Our pipeline has two main design concepts: \begin{enumerate}[1)] 
+	\item Not requiring additional components, like image depth model~\cite{bao2019depth}, flow refinement model~\cite{jiang2018super} and flow reversal layer~\cite{xu2019quadratic}, which are introduced to compensate for the defects of intermediate flow estimation. We also want to eliminate reliance on pre-trained state-of-the-art optical flow models that are not tailored for VFI tasks. 
+	\item Providing direct supervision for the approximated intermediate flows: To the best of our knowledge, most VFI models are trained with only the final reconstruction loss. Lacking supervision explicitly designed for the flow estimation, degrades the performance of interpolation.
+\end{enumerate}
+
+We propose IFNet, which directly estimates intermediate flow from adjacent frames and a temporal encoding input. IFNet adopts a coarse-to-fine strategy~\cite{ilg2017flownet} with progressively increasing resolution: it iteratively updates intermediate flows and soft fusion mask via successive IFBlocks. Conceptually, according to the iteratively updated flow fields, we could move corresponding pixels from two input frames to the same location in a latent intermediate frame and use a fusion mask to combine pixels from two input frames. To make our model lightweight, unlike most previous optical flow models~\cite{dosovitskiy2015flownet, ilg2017flownet, sun2018pwc, hui2018liteflownet, teed2020raft}, IFBlocks do not contain expensive operators like cost volume and only use $3\times3$ convolution and deconvolution as building blocks, which are found to be efficient on resource-constrained devices~\cite{ding2021repvgg}.
+
+
+
+Employing intermediate supervision is very important. When training the IFNet end-to-end using the final reconstruction loss, our method produces worse results than state-of-the-art methods because of the inaccurate optical flow estimation. The situation dramatically changes after we design a privileged distillation scheme that employs a teacher model with access to the intermediate frames to guide the student to learn.
+
+Combining these designs, we propose the Real-time Intermediate Flow Estimation (\textbf{RIFE}). RIFE can achieve satisfactory results when trained from scratch, without requiring pre-trained optical flow models or datasets with optical flow labels. We illustrate the speed and accuracy trade-off compared with other methods in Figure~\ref{fig:intro_fig}. 
+
+To sum up, our main contributions include:
+\begin{itemize}
+	\item We design an effective coarse-to-fine IFNet using simple operators to directly approximate the intermediate flows. 
+	\item We introduce a privileged distillation scheme for IFNet, which leads to large performance improvement.
+	\item Our experiments demonstrate that RIFE achieves state-of-the-art performance on several public benchmarks. 
+	\item In addition, we show RIFE can be extended to applications such as depth map interpolation and dynamic scene panorama stitching, thanks to its high-quality flow estimation and flexible temporal encoding.
+\end{itemize}
+
+
+
+
+
+
+
+
+
+
+\begin{figure*}
+	\centering
+	\includegraphics[width=16cm]{image/MAIN.pdf}
+	\caption{\textbf{Overview of RIFE pipeline.} Given two input frames $I_0, I_1$ and temporal encoding $t$~(timestep encoded as an separate channel), we directly feed them into the IFNet to approximate intermediate flows $F_{t\rightarrow 0}, F_{t\rightarrow 1}$ and the fusion map $M$. During the training phase, a privileged teacher refines student's results based on ground truth $I_t$ using a special IFBlock. The student model and the teacher model are jointly trained from scratch using the reconstruction loss. The teacher's approximations are more accurate so that they can guide the student to learn. }\label{fig:main}
+\end{figure*} 	\section{Related Works}
+\paragraph{Optical flow estimation.} Optical flow estimation is a long-standing vision task that aims to estimate the per-pixel motion, useful in many downstream tasks. Since the milestone work of FlowNet~\cite{dosovitskiy2015flownet} based on U-net autoencoder~\cite{ronneberger2015u}, architectures for optical flow models have evolved for several years, yielding more accurate results while being more efficient, such as FlowNet2~\cite{ilg2017flownet}, PWC-Net~\cite{sun2018pwc} and LiteFlowNet~\cite{hui2018liteflownet}. Recently Teed~\etal~\cite{teed2020raft} introduce RAFT, which iteratively updates a flow field through a recurrent unit and achieves a remarkable breakthrough in this field. Another important research direction is unsupervised optical flow estimation~\cite{meister2017unflow, jonschkowski2020matters, luo2020upflow} which tackles the difficulty of optical flow labeling.
+
+
+
+
+
+
+
+\paragraph{Video frame interpolation.} Recently, the optical flow has been a prevalent component in video interpolation. In addition to the method of directly estimating the intermediate flow~\cite{liu2017video, lee2020adacof, park2020bmbc}, Jiang~\etal.~\cite{jiang2018super} propose SuperSlomo using the linear combination of the two bi-directional flows as an initial approximation of the intermediate flows and then refine them using U-Net. Reda~\etal.~\cite{reda2019unsupervised} and Liu~\etal.~\cite{liu2019deep} propose to improve intermediate frames using cycle
+consistency. Bao~\etal.~\cite{bao2019depth} propose DAIN to estimate the intermediate flow as a weighted combination of bidirectional flow. Niklaus~\etal.~\cite{niklaus2020softmax} propose SoftSplat to forward-warp frames and their feature map using softmax splatting. Xu~\etal.~\cite{xu2019quadratic} propose QVI to exploit four consecutive frames and flow reversal filter to get the intermediate flows. Liu~\etal.~\cite{liu2020enhanced} further extends QVI with rectified quadratic flow prediction to EQVI. 
+
+Along with flow-based methods, flow-free methods have also achieved remarkable progress in recent years. Meyer~\etal.~\cite{meyer2015phase,meyer2018phasenet} utilize phase information to learn the motion relationship for multiple video frame interpolation. Niklaus~\etal.~\cite{niklaus2017video, Niklaus_ICCV_2017} formulate VFI as a spatially adaptive convolution whose convolution kernel is generated using a CNN given the input frames. Cheng~\etal. propose DSepConv~\cite{cheng2020video} to extend kernel-based method using deformable separable convolution and further propose EDSC~\cite{cheng2020multiple} to perform multiple interpolation. Choi~\etal.~\cite{choi2020channel} propose an efficient flow-free method named CAIN, which employs the PixelShuffle operator and channel attention to capture the motion information implicitly. Some work further 
+focus on increasing the resolution and frame rate of the video together and has achieved good visual effect~\cite{xiang2020zooming, xu2021temporal}.
+
+\paragraph{Knowledge distillation.} Our privileged distillation~\cite{lopez2015unifying} for intermediate flow conceptually belongs to the knowledge distillation~\cite{hinton2015distilling} method, which originally aims to transfer knowledge from a large model to a smaller one. In privileged distillation, the teacher model gets more input than the student model, such as scene depth, images from other views, and even image annotation. Therefore, the teacher model can provide more accurate representations to guide the student model to learn. This idea is applied to some computer vision tasks, such as image super resolution~\cite{lee2020learning}, hand pose estimation~\cite{yuan2018rgb}, re-identification~\cite{porrello2020robust} and video style transfer~\cite{chen2020optical}. Our work is also related to codistillation~\cite{anil2018large} where student and teacher have the same architecture and different inputs during training. 	\section{Method}
+
+We first provide an overview of RIFE. Then we describe the major components in RIFE, elaborate on our proposed distillation scheme, and explain the training details. 
+
+\subsection{Pipeline Overview}
+\label{subsec:overview}
+
+
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=8.3cm]{image/IFFlow.pdf}
+	\caption{\textbf{Comparison between indirect intermediate flow estimation approaches~\cite{jiang2018super, xu2019quadratic, bao2019depth, liu2020enhanced} (left) and the IFNet (right).} These previous methods contain two stages: 1) bi-directional flow estimation and 2) flow reversal modules. As the object shifts, they may have flaws in motion boundaries. RIFE directly estimates the intermediate flows using coarse-to-fine IFNet. }\label{fig:IFFlow}
+\end{figure}
+
+We illustrate the overall pipeline of RIFE in Figure~\ref{fig:main}. Given a pair of consecutive RGB frames, $I_0, I_1$ and target timestep $t~(0 \leq t \leq 1)$, our goal is to synthesize an intermediate frame $\widehat{I}_t$. We estimate the intermediate flows $F_{t\rightarrow 0}$, $F_{t\rightarrow 1}$ and fusion map $M$ by feeding input frames and $t$ as an additional channel into the IFNet. We can get reconstructed image $\widehat{I}_t$ using following formulation:
+
+\begin{equation}
+\widehat{I}_t = M \odot \widehat{I}_{t\leftarrow 0} + (1 - M) \odot \widehat{I}_{t\leftarrow 1},
+\end{equation}
+\begin{equation}
+\widehat{I}_{t\leftarrow 0} = \backwardwarp(I_0, F_{t\rightarrow 0}),\quad \widehat{I}_{t\leftarrow 1} = \backwardwarp(I_1, F_{t\rightarrow 1}).
+\end{equation}
+where $\backwardwarp$ is the image backward warping, $\odot$ is an element-wise multiplier, and M is the fusion map $(0 \leq M \leq 1)$. We use another encoder-decoder CNNs named RefineNet following previous methods~\cite{jiang2018super, niklaus2020softmax} to refine the high-frequency area of $\widehat{I}_t$ and reduce artifacts of the student model. Its computational cost is similar to the IFNet. The RefineNet finally produce a reconstruction residual $\Delta~(-1\leq \Delta \leq 1)$. And we will get a refined reconstructed image $\widehat{I}_t + \Delta$. The detailed architecture of RefineNet is in the Appendix.
+
+\subsection{Intermediate Flow Estimation}
+\label{subsec:architecture}
+
+
+
+
+
+
+Some previous VFI methods reverse and refine bi-directional flows~\cite{jiang2018super, xu2019quadratic, bao2019depth, liu2020enhanced} as depicted in Figure~\ref{fig:IFFlow}. The flow reversal process is usually cumbersome due to the difficulty of handling the changes of object positions. Intuitively, the previous flow reversal method hopes to perform spatial interpolation on the optical flow field, which is not trivial because of ``object shift" problem. The role of our IFNet is to directly and efficiently predict $F_{t\rightarrow 0}, F_{t\rightarrow 1}$ and fusion mask $M$ given two consecutive input frames $I_0, I_1$ and timestep $t$. When $t=0$ or $t=1$, IFNet is similar to the classical optical flow models.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=8.3cm]{image/IFNet.pdf}
+	\caption{\textbf{Left}: The IFNet is composed of several stacked IFBlocks operating at different resolution. \textbf{Right}: In an IFBlock, we first backward warp the two input frames based on current approximated flow $F^{i-1}$. Then the input frames $I_0, I_1$, warped frames $\widehat{I}_{t\leftarrow 0}, \widehat{I}_{t\leftarrow 1}$, the previous results $F^{i-1}, M^{i-1}$ and timestep $t$ are fed into the next IFBlock to approximate the residual of flow and mask. The privileged information $I_t^{GT}$ is only provided for teacher. }\label{fig:IFNet}
+\end{figure}
+
+
+To handle the large motion encountered in intermediate flow estimation, we employ a coarse-to-fine strategy with gradually increasing resolution, as illustrated in Figure \ref{fig:IFNet}. Specifically, we first compute a rough prediction of the flow on low resolution, which is believed to capture large motions easier, then iteratively refine the flow fields with gradually increasing resolution. Following this design, our IFNet has a stacked hourglass structure, where a flow field is iteratively refined via successive IFBlocks:
+
+
+
+\begin{figure*}[htbp]
+  \centering
+  \begin{minipage}[t]{0.162\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{image/Vimeo/overlay.pdf}
+  \centerline{Inputs~(Overlay)}
+  \end{minipage}
+  \begin{minipage}[t]{0.162\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{image/Vimeo/SepConv.pdf}
+  \centerline{SepConv~\cite{niklaus2017video}}
+  \end{minipage}
+\begin{minipage}[t]{0.162\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{image/Vimeo/DAIN.pdf}
+  \centerline{DAIN~\cite{bao2019depth}}
+  \end{minipage}
+  \begin{minipage}[t]{0.162\linewidth}
+  \centering
+  \includegraphics[width=1\linewidth]{image/Vimeo/CAIN.pdf}
+  \centerline{CAIN~\cite{choi2020channel}}
+  \end{minipage}
+  \begin{minipage}[t]{0.163\textwidth}
+  \centering
+  \includegraphics[width=1\linewidth]{image/Vimeo/Ours.pdf}
+  \centerline{RIFE (Ours)}
+  \end{minipage}
+  \begin{minipage}[t]{0.1635\textwidth}
+  \centering
+  \includegraphics[width=1\linewidth]{image/Vimeo/GT.pdf}
+  \centerline{GT}
+  \end{minipage}
+  \caption{\textbf{Qualitative comparison on Vimeo90K~\cite{xue2019video} testing set}. We cut out the objects and zoom in them~\cite{choi2020channel}. While other methods cause various artifacts, our method produces good effects on the moving objects.}
+\label{fig:Vimeo}
+\end{figure*} 
+\begin{equation}
+\left[ \begin{array}{c}F^i \\ M^i \end{array} \right ]= \left[ \begin{array}{c}F^{i-1} \\ M^{i-1} \end{array} \right ]+ \text{IFB}^{i}(\left[ \begin{array}{c}F^{i-1} \\ M^{i-1} \end{array} \right ], t, \widehat{I}^{i-1}),
+\end{equation}
+where $F^{i-1}$ and $M^{i-1}$ denote the current estimation of the intermediate flows and fusion map from the $(i-1)^{th}$ IFBlock, and $\text{IFB}^{i}$ represents the $i^{th}$ IFBlock. We use a total of 3 IFBlocks, and each has a resolution parameter, $(K_0, K_1, K_2)=(4,2,1)$. During inference time, the final estimation is $F^n$ and $M^n(n=2)$. To keep our design simple, each IFBlock has a feed-forward structure consisting of serveral convolutional layers and an up-sampling operator. Except for the layer that outputs the optical flow residuals and the fusion map, we use PReLU~\cite{he2015delving} as the activation function.
+
+\begin{table}[t]
+	\centering
+	\begin{tabular}{ccccc}
+		\hline
+		Method&PWC-Net~\cite{sun2018pwc}&RAFT~\cite{teed2020raft}&IFNet\\ \hline
+		Runtime & $2\times21$ms & $2\times52$ms& \first{7ms} \\ \hline
+	\end{tabular}
+	\caption{\textbf{Average inference time on the $640\times 480$ frames}. Recent flow-based VFI methods~\cite{jiang2018super, bao2019depth, niklaus2020softmax} run the optical flow model twice to obtain bi-directional optical flows.}\label{tab:runtime}
+\end{table}
+
+
+
+
+
+
+We compare the runtime of the state-of-the-art optical flow models~\cite{sun2018pwc, teed2020raft} and IFNet in Table~\ref{tab:runtime}. Current flow-based VFI methods~\cite{jiang2018super, bao2019depth, niklaus2020softmax} usually need to run their flow models twice then scale and reverse the bi-directional flows. Therefore the intermediate flow estimation in RIFE runs at a faster speed than previous methods, achieving an acceleration of about 6--15 times. Although these optical models can estimate inter-frame motion accurately, as previously noted, they are not suitable for direct migration to VFI tasks.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Priveleged Distillation for IFNet}
+
+\label{subsec:leakage}
+
+Directly approximating the intermediate flows is challenging because of no access to the intermediate frame and the lack of supervision. To address this problem, we design a privileged distillation loss to IFNet. We stack an additional IFBlock (teacher model $\text{IFB}^{Tea}$, $K_{Tea} = 1$) that refines the results of IFNet referring to the target frame $I^{GT}_t$: 
+
+\begin{equation}
+\left[ \begin{array}{c}F^{Tea} \\ M^{Tea} \end{array} \right ] = \left[ \begin{array}{c}F^n \\ M^n \end{array} \right ] + \text{IFB}^{Tea}(\left[ \begin{array}{c}F^n \\ M^n \end{array} \right ], t, \widehat{I}^n, I^{GT}_t).
+\end{equation}
+
+With the access of $I^{GT}_t$ as privileged information, the teacher model produces more accurate flows. We define the distillation loss $\mathcal{L}_{dis}$ as follows:
+\begin{equation}
+\mathcal{L}_{dis} = \sum_{i\in\{0, 1\}}|| F_{t\rightarrow i} - F^{Tea}_{t\rightarrow i}||_1.
+\end{equation} 
+We apply the distillation loss over the full sequence of predictions generated from the iteratively updating process in the student model. The gradient of this loss will not be backpropagated to the teacher model. The teacher block will be discarded after the training phase, hence this would incur no extra cost for inference.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Implementation Details}
+\label{subsec:implement}
+
+\paragraph{Supervisions.} Our training loss $\mathcal{L}$ is a linear combination of the reconstruction losses $\mathcal{L}_{rec}, \mathcal{L}^{Tea}_{rec}$ and privileged distillation loss $\mathcal{L}_{dis}$:  
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{rec} + \mathcal{L}^{Tea}_{rec} + \lambda_{d} \mathcal{L}_{dis}
+\label{eq:total_loss},
+\end{equation}
+where we set $\lambda_{d} = 0.01$ to balance the scale of losses.
+
+The reconstruction loss $\mathcal{L}_{rec}$ models the reconstruction quality of the intermediate frame. We denote the synthesized frame by $\widehat{I}_t$ and the ground-truth frame by ${I}^{GT}_t$.
+
+
+The reconstruction loss has the formulation of :
+\begin{equation}
+\mathcal{L}_{rec} = d(\widehat{I}_t, {I}^{GT}_{t}), \mathcal{L}_{rec}^{Tea} = d(\widehat{I}_t^{Tea},  {I}^{GT}_{t}) \label{eq:loss},
+\end{equation}
+where $d$ is often a pixel-wised loss. Following previous work~\cite{niklaus2018context, niklaus2020softmax}, we use $\mathcal{L}_1$ loss between two Laplacian pyramid representations of the reconstructed image and ground truth (denoted as $\mathcal{L}_{Lap}$).
+
+
+
+
+\paragraph{Training dataset.}
+We use the Vimeo90K dataset~\cite{xue2019video} to train RIFE. This dataset has $51,312$ triplets for training, where each triplet contains three consecutive video frames with a resolution of $448\times256$. We randomly augment the training data using horizontal and vertical flipping, temporal order reversing, and rotating by $90$ degrees.
+
+\paragraph{Training strategy.}
+We train RIFE on the Vimeo90K training set and fix $t=0.5$. RIFE is optimized by AdamW~\cite{loshchilov2018fixing} with weight decay $10^{-4}$ for $300$ epochs on $224\times224$ patches from the Vimeo90K training set. Our training uses a batch size of $64$. We gradually reduce the learning rate from $3 \times 10^{-4}$ to $3 \times 10^{-5}$ using cosine annealing during the whole training process. We train RIFE on four TITAN X (Pascal) GPUs for about 15 hours. 
+
+Inspired by previous work~\cite{kalluri2020flavr, cheng2020multiple}, we use the Vimeo90K-Septuplet~\cite{xue2019video} dataset to extend RIFE to support arbitrary-timestep frame interpolation. This dataset has $91,701$ sequence with a resolution of $448\times256$, each of which contains $7$ consecutive frames. For each training sample, we randomly select $3$ frames $(I_{n_0}, I_{n_1}, I_{n_2})$ and calculate the target timestep $t = (n_1 - n_0) / (n_2 - n_0)$, where $0\leq n_0 < n_1 < n_2 < 7$. We keep other training setting unchanged and denote this model as RIFE$_m$.  	\definecolor{mygray}{gray}{.9}
+\begin{table*}
+\caption{
+		\textbf{Quantitative comparisons on the UCF101, Vimeo90K, Middlebury-\textsc{other} set, and HD benchmarks.} The images of each dataset are directly inputted to each model. Some models are unable to run on 1080p images due to exceeding the memory available on our graphics card (denoted as “OOM”). To report the runtime, we test all models for processing a pair of $640\times 480$ images using the same device. \first{Bold} and \blue{underlined} numbers represent the best and second-best performance. We use gray backgrounds to mark the methods that require pre-trained depth models or optical flow models.
+	}
+\centering
+	\begin{tabular}{lcccccccccc}
+		\toprule
+\multirow{2}{*}[-0.28em]{Method}  &\# Parameters&
+		Runtime
+&\multicolumn{2}{c}{UCF101~\cite{soomro2012ucf101}} &\multicolumn{2}{c}{Vimeo90K~\cite{xue2019video}} & M.B.~\cite{baker2011database} & ~~HD~\cite{bao2019depth}~~\\
+
+
+		
+		\cmidrule(l{7pt}r{7pt}){4-5}
+		\cmidrule(l{7pt}r{7pt}){6-7}
+		\cmidrule(l{5pt}r{5pt}){8-8}
+		\cmidrule(l{5pt}r{5pt}){9-9}
+\vspace{0.2em}
+		&(Million) & (ms) &PSNR & SSIM 	&PSNR & SSIM & IE & PSNR\\
+		\addlinespace[-1pt]
+		\midrule
+
+
+
+
+			DVF~\cite{xue2019video} (Vimeo90K) &~\second{1.6} &80 & {34.92} & {0.968} &{34.56}& {0.973}  &{2.47} & 31.47 \\
+		
+		Superslomo~\cite{jiang2018super} (Vimeo90K) &19.8 &62 & {35.15} & {0.968} &{34.64}& {0.974}  &{2.21} & 31.55\\
+		
+		SepConv~\cite{niklaus2017video} & 21.6 & 51 & 34.78 & 0.967  &33.79& {0.970} &2.27& 30.87 \\
+		
+		TOFlow~\cite{baker2011database} &~\first{1.1} &84 & 34.58 & 0.967  &33.73& 0.968 &2.15 &29.37  \\
+		
+\rowcolor{mygray} MEMC-Net~\cite{bao2019memc} & 70.3 & 401 & {35.01} & {0.968} &{34.29}& {0.970}  &{2.12} & 31.39  \\ 
+
+		 \rowcolor{mygray}DAIN~\cite{bao2019depth} & 24.0 & 436 & {35.00} & {0.968} &{34.71}& {0.976}  &2.04 & 31.64$^{\dag}$\\ 
+
+		DSepConv~\cite{cheng2020video} & 21.8 & 236 & 35.08 & 0.969 & 34.73 & 0.974 & 2.03 & OOM\\
+		
+		CAIN~\cite{choi2020channel} & 42.8 & 38 & 34.98 & {0.969} & 34.65 & 0.973 & 2.28 & 31.77\\
+		
+		\rowcolor{mygray} SoftSplat~\cite{niklaus2020softmax}$^{\dag}$ & ~7.7 & 135 & \second{35.39} & \first{0.970} & \second{36.10} & \first{0.980} & \first{1.81} & - \\
+		
+		AdaCoF~\cite{lee2020adacof} & 21.8 & \second{34} & 34.91 & 0.968 & 34.27 & 0.971 & 2.31 & 31.43 \\ 
+		
+		BMBC~\cite{park2020bmbc} & 11.0 & 1580 & 35.15 & {0.969} & 35.01 & 0.976 & 2.04 & OOM\\
+		
+		CDFI~\cite{ding2021cdfi} & ~5.0 & 198 & 35.21 & 0.969 &35.17 & 0.977 & 1.98 & OOM\\
+		EDSC~\cite{cheng2020multiple} & {~8.9} & 46 & 35.13 & 0.968 & 34.84 & 0.975 & 2.02 & 31.59
+		
+		\\\hline \hline
+		
+		RIFE & {~9.8} & \first{16} & 35.28 & {0.969} & 35.61 & {0.978} & 1.96 & \second{32.14}\\
+		
+		RIFE-Large (2T2R) & {~9.8} & 80 & \first{35.41} & \first{0.970} & \first{36.13} & \first{0.980} & \second{1.86} & \first{32.32}
+		\\
+		\bottomrule
+	\end{tabular} 
+	\label{tab:comparison}
+	\begin{tablenotes}
+		\raggedleft
+		\item{
+   
+$\dag$: copy from the original papers.
+    
+	}
+	\end{tablenotes}
+	\label{tab:UCF101_Vimeo90K_MB}
+	\vspace{-1em}
+\end{table*} \section{Experiments}
+We first introduce the benchmarks for evaluation. Then we provide variants of our models with different computational costs. We compare these models with representative state-of-the-art methods, both quantitatively and visually. In addition, we show the capability of generating arbitrary-timestep frames and other applications using our models. An ablation study is carried out to analyze our design. Finally, we discuss some limitations of RIFE.
+
+\subsection{Benchmarks and Evaluation Metrics}
+We train our models on the Vimeo90K training dataset and directly test it on the following benchmarks. 
+
+\textbf{Middlebury.} The Middlebury-\textsc{other} (M.B.) benchmark~\cite{baker2011database} is widely used to evaluate VFI methods. The image resolution in this dataset is around $640 \times 480$. 
+
+\textbf{Vimeo90K}.
+There are 3,782 triplets in the Vimeo90K testing set~\cite{xue2019video} with resolution of $448 \times 256$.
+
+
+\textbf{UCF101.}
+The UCF101 dataset~\cite{soomro2012ucf101} contains videos with various human actions. There are 379 triplets with a resolution of $256 \times 256$.
+
+
+
+\textbf{HD.}
+Bao~\etal~\cite{bao2019memc} collect 11 high-resolution videos for evaluation. The HD benchmark consists of four 1080p, three 720p and four $1280 \times 544$ videos. Following the author of this benchmark, we use the first 100 frames of each video for evaluation. We further use this benchmark for quantitative comparison of multiple frame interpolation.
+
+We measure the peak signal-to-noise ratio (PSNR), structural similarity (SSIM), and interpolation error (IE) for quantitative evaluation. All the methods are tested on a TITAN X (Pascal) GPU. We calculate the average processing time for 100 runs after a warm-up process of 100 runs. 
+
+
+
+\subsection{Test-Time Augmentation and Model Scaling}
+\label{sec:model_scaling}
+
+
+
+
+
+
+\begin{table}[t]
+	\caption{\textbf{Increase model complexity to achieve better quantitative results.} }\label{tab:large}
+	\centering
+	\begin{tabular}{lcccc}
+		\hline
+		Model Setting  & RIFE & \textit{2T} & \textit{2R} & \textit{2T2R} \\ \hline
+		UCF101~\cite{soomro2012ucf101} PSNR & 35.28 & 35.35 & 35.34 & \first{35.41} \\
+		Vimeo90K~\cite{xue2019video} PSNR& 35.61 & 35.76 & 35.98 & \first{36.13}\\ M.B.~\cite{baker2011database} IE & 1.96 & 1.93    & 1.89 & \first{1.86}
+		\\
+		HD~\cite{bao2019depth} PSNR& 32.14 & 32.26 & 32.16 & \first{32.32} \\ 
+
+		\# Parameters & 9.8M & 9.8M & 9.8M & 9.8M\\ Runtime$^*$ & \first{16ms} & 25ms & 42ms & 80ms\\
+		
+		Complexity$^*$ & \first{67G} & 133G & 263G & 527G\\
+		\hline
+	\end{tabular}
+	\normalsize
+	\begin{tablenotes}
+		\raggedleft
+		\item{
+			*: on $640\times 480$ frames
+		}
+	\end{tablenotes}
+\end{table}
+
+To provide models with different computation overheads that meet different needs, we introduce two modifications following: test-time augmentation and resolution multiplying. 1) We flip the input images horizontally and vertically to get augmented test data. Then we use the same model to infer some results and reverse the flipping on the results. We average these two results finally. Its effect is similar to training a model with twice the computational cost. This model is denoted as RIFE-\textit{2T}. 2) We remove the first downsample layer of IFNet and add a downsample layer before its output to match the origin pipeline. We also perform this modification on RefineNet. It enlarges the process resolution of the feature maps and produces a model named RIFE-\textit{2R}. We combine these two modifications to extend RIFE to RIFE-Large (\textit{2T2R}). The performance and runtime for these models is reported in Table~\ref{tab:large} and depicted in Figure~\ref{fig:intro_fig}. 
+
+\subsection{Comparisons with Previous Methods}
+\label{sec:comparison}
+
+We compare RIFE with previous VFI models  \cite{xue2019video, Niklaus_ICCV_2017, bao2019memc, bao2019depth, choi2020channel, niklaus2020softmax, park2020bmbc, cheng2020video, lee2020adacof, ding2021cdfi, cheng2020multiple}. These models are officially released except SoftSplat. SoftSplat is not fully open-sourced and its results are reported by the origin authors. In addition, we train DVF~\cite{liu2017video} model and SuperSlomo~\cite{jiang2018super} using our training pipeline on Vimeo90K dataset because the released models of these methods are trained on early datasets. We report the performance in Table~\ref{tab:UCF101_Vimeo90K_MB}.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=8.5cm]{image/Multi/merged.png}
+	\caption{\textbf{Interpolating multiple frames using RIFE$_m$.} These images are from HD~\cite{bao2019depth}, M.B.~\cite{baker2011database}, Vimeo90K~\cite{xue2019video} benchmarks, respectively. We attach the results of CAIN~\cite{choi2020channel} for comparison. RIFE$_m$ provides smooth and continuous motions without artifacts.}\label{fig:multi}
+\end{figure}
+
+RIFE runs considerably faster than other methods. Meanwhile, RIFE needs only 3.1 gigabytes of GPU memory to process 1080p videos, while some methods exceed 12 gigabytes. We get a larger version of our model (RIFE-Large) by model scaling and test-time augmentation, which runs about $1.7$ times faster than the previous state-of-the-art method SoftSplat~\cite{niklaus2020softmax} with comparable performance. Compared with SoftSplat, RIFE does not require a specially designed forward warping operator or any pre-trained optical flow model. We provide a visual comparison of video clips with large motions from the Vimeo90K testing set in Figure~\ref{fig:Vimeo}, where SepConv~\cite{Niklaus_ICCV_2017} and DAIN~\cite{bao2019depth} produce ghosting artifacts, and CAIN~\cite{choi2020channel} causes missing-parts artifacts. Overall, our method can produce more reliable results.
+
+\subsection{Generating Arbitrary-timestep Frame}
+\label{sec:model_multi}
+We apply RIFE$_m$ to interpolate multiple intermediate frames at different timesteps $t \in (0, 1)$, as shown in Figure~\ref{fig:multi}. It's worth noting that $t=0.125$ is not included in the training data, and RIFE$_m$ can successfully handle it.
+
+To provide a quantitative comparison of multiple frame interpolation, we further extract every fourth frame of videos from HD benchmark~\cite{bao2019memc} and use them to interpolate other frames. We divide the HD benchmark into three subsets with different resolution to test these methods. We show the quantitative PSNR between generated frames and frames of the original videos in Table~\ref{tab:hd8}. Note that DAIN~\cite{bao2019depth}, BMBC~\cite{park2020bmbc} and EDSC$_m$~\cite{cheng2020video} can generate a frame at an arbitrary timestep. However, some other methods can only interpolate the intermediate frame at $t=0.5$. So we use them recursively to produce $4\times$ results. Specifically, we firstly apply the single interpolation method once to get intermediate frame $\widehat I_{0.5}$. We then feed $I_0$ and $\widehat I_{0.5}$ to get $\widehat I_{0.25}$. RIFE$_m$ has more than twice the speed of CAIN~\cite{choi2020channel} and improves the performance by $1.5$ dB. Overall, RIFE$_m$ is very effective in the $4\times$ interpolation. Furthermore, since RIFE$_m$ can support arbitrary-timestep frame interpolation, it is suitable for non-multiplier frame rate conversion.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=8.5cm]{image/depth.pdf}
+	\caption{\textbf{Interpolating depth map using RIFE$_m$}. $D_0$ and $D_1$ are estimated by the MiDaS-large~\cite{Ranftl2020} model. RIFE$_m$ correctly maintains the occlusion relationship and object boundaries.} \label{fig:depth}
+\end{figure}
+
+\paragraph{Image Representation Interpolation.} RIFE$_m$ can interpolate other image representations using the intermediate flows and fusion map approximating from images. For instance, we interpolate the results of MiDaS~\cite{Ranftl2020} which is a popular monocular depth model, shown in Figure~\ref{fig:depth}. The synthesis formula is simply as follows:
+
+\begin{equation}
+\widehat{D}_t = M \odot \backwardwarp(D_0, F_{t\rightarrow 0}) + (1 - M) \odot \backwardwarp(D_1, F_{t\rightarrow 1}),
+\end{equation}
+where $D_0, D_1$ are estimated by MiDas-large~\cite{Ranftl2020} and $F, M$ are estimated by RIFE$_m$.
+
+\begin{table}[t]
+	
+	\caption{\textbf{Quantitative evaluation for $4\times$ interpolation on the HD benchmark~\cite{bao2019memc}. } The 544p videos of HD benchmark are relatively more dynamic. Thus the PSNR index of these 544p videos is lower.}\label{tab:hd8}
+	\centering
+	\small
+	\begin{tabular}{lccccc}
+		\hline
+		Method & Recursion & 544p & 720p & 1080p\\ \hline
+		DAIN~\cite{bao2019depth} & -& \second{22.17} & 30.25 & OOM \\
+		CAIN~\cite{choi2020channel} & \checkmark & 21.81 & \second{31.59} & \second{31.08}  \\
+		BMBC~\cite{park2020bmbc} & - & 19.51 & 23.47 & OOM 
+		\\ 
+		DSepconv~\cite{cheng2020video} & \checkmark & 19.28 & 23.48 & OOM\\
+		CDFI~\cite{ding2021cdfi} & \checkmark & 21.85 & 29.28 & OOM \\
+		EDSC$_s$~\cite{cheng2020multiple} & \checkmark & 21.20 & 31.50 & 29.75\\
+		EDSC$_m$~\cite{cheng2020multiple} & - & 21.89 & 30.35 & 30.39 \\
+		\hline
+		RIFE$_m$ & - & \first{22.95} & \first{31.87} & \first{34.25} \\ \hline
+	\end{tabular}
+	\normalsize
+
+
+\end{table}
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=8cm]{image/Stitching.pdf}
+	\caption{\textbf{Synthesize images from two views on one ``panoramic" image $\widehat{I}_p$ using RIFE$_m$.} The temporal encoding $t_p$ is gradually changed from $0$ to $1$ in columns. $\widehat{I}_p$ has been stretched for better visualization. Note that RIFE$_m$ produces smooth results in the dynamic scene.}\label{fig:Stitching}
+\end{figure}
+
+\subsection{General Temporal Encode}
+To show the generalization capability of RIFE, we demonstrate that we can control the temporal encoding $t$ to implement diverse applications. As shown in Figure~\ref{fig:Stitching}, if we input a gradient encoding $t_p$, the RIFE$_m$ will synthesize the two images from dynamic scenes in a ``panoramic" view. Similarly, this method may have the potential to eliminate the rolling shutter of the videos by having different timestamps for each horizontal row.
+
+\subsection{Ablation Studies}
+\label{sec:model_ablation}
+
+
+
+We design some ablation studies on the distillation scheme, intermediate flow estimation, and model design, shown in Table~\ref{tab:ablation2}. These experiments use the same hyper-parameter setting and evaluation on Vimeo90K~\cite{xue2019video} and MiddleBury~\cite{baker2011database} benchmarks. 
+
+\paragraph{Ablation on the distillation scheme.} We show the importance of our privileged distillation loss in three experiments. 1) Remove the whole scheme; 2) Remove the privileged teacher block and use the last IFBlock’s results to guide the first two IFBlocks, denoted as ``self-consistency"; 3) Use pre-trained RAFT~\cite{teed2020raft} to estimate the intermediate flows based on the ground truth image, denoted as ``RAFT-KD". This guidance is inspired by the pseudo-labels method~\cite{lee2013pseudo}. However, this implementation relies on the pre-trained optical flow model and extremely increases the training duration. We found 1) leads to a large performance degradation while 2) and 3) suffer in quality. These experiments demonstrate the importance of optical flow supervision.
+\paragraph{IFNet vs. flow reversal.}
+
+We compare IFNet with previous intermediate flow estimation methods. Specifically, we use RAFT~\cite{teed2020raft} and PWC-Net~\cite{sun2018pwc} with officially pre-trained parameters to estimate the bi-directional flows. Then we implement three flow reversal methods, including linear reversal~\cite{jiang2018super}, using a hidden convolutional layer with $128$ channels, and the flow reversal method from EQVI~\cite{liu2020enhanced} consisting of a reversal layer and a U-Net filter. The optical flow models and flow reversal modules are combined together to replace the IFNet. They are jointly trained with RefineNet. Because these models can not directly approximate the fusion map, the fusion map is subsequently approximated by RefineNet. As shown in Table~\ref{tab:ablation2}, RIFE is more efficient and gets better interpolation performance. These flow models can estimate accurate bi-directional optical flow, but the flow reversal has difficulties in dealing with object shift problem illustrated in Figure~\ref{fig:IFFlow}. 
+
+
+\begin{table}[t]
+	\caption{\textbf{Ablation study on distillation scheme, intermediate flow estimation, model design and loss function.}}
+	\small
+	\begin{tabular}{lccc}
+		\hline
+		\multicolumn{1}{c}{\multirow{2}{*}{Setting}} & \multicolumn{1}{c}{Vimeo90K} & \multicolumn{1}{c}{M.B.} & \multicolumn{1}{c}{Runtime} \\ 
+		\multicolumn{1}{c}{}                         & \multicolumn{1}{c}{PSNR}   & \multicolumn{1}{c}{IE}     & \multicolumn{1}{c}{$640\times 480$}            \\ \hline 
+		\multicolumn{4}{l}{\emph{Distillation Scheme}}\\
+		RIFE w/o distillation & 35.22 & 2.15 & 16ms\\
+		RIFE w/ self-consistency & 35.38 & 2.02 & 16ms\\
+		RIFE w/ RAFT-KD & {35.42} & {1.99} & 16ms\\ \hline
+\multicolumn{4}{l}{\emph{Intermediate Flow Estimation}}\\
+		RAFT + linear reversal & 34.68 & 2.31 & {60ms} \\
+		RAFT + CNN reversal &  34.82 & 2.24 & 65ms \\
+		RAFT + reversal layer &  35.16 & {2.04} & 101ms \\
+		PWC-Net + reversal layer &  {35.24} & 2.06 & 83ms \\ \hline
+\multicolumn{4}{l}{\emph{Model Design and Loss Function}}\\
+		RIFE w/ one IFBlock & 35.22 & 2.13 & \first{12ms}\\ 
+		RIFE w/ two IFBlocks & {35.49} & {1.98} & 14ms\\ 
+		RIFE w/ $\mathcal{L}_1$ & {35.46} & \first{1.94} & 16ms \\
+\hline \hline
+		RIFE& \first{35.61} & {1.96} & 16ms \\
+		\multicolumn{4}{l}{~(Priviledged Distillation, IFNet, three IFBlocks, $\mathcal{L}_{Lap}$)}\\
+		\hline 
+		\normalsize
+	\end{tabular}
+\label{tab:ablation2}
+\end{table}
+
+\paragraph{Ablation on RIFE's architecture and loss function.}To verify the coarse-to-fine strategy of IFNet, we removed the first IFBlock and the first two IFBlocks in two experiments, respectively, shown in Table~\ref{tab:ablation2}. We provide a pair of experiments to show $\mathcal{L}_{Lap}$ (default setting of RIFE) is quantitatively better than $\mathcal{L}_1$. 
+
+
+\subsection{Limitations}
+\label{sec:limitation}
+Our work may not cover some practical application requirements. Firstly, RIFE focuses on only using two input frames and multi-frame input~\cite{xu2019quadratic, liu2020enhanced, kalluri2020flavr} is left to future work. One straightforward approach is to extend IFNet to use more frames as input. Secondly, most experiments are done with SSIM and PSNR as quantitative indexes. If human perception quality is preferred, RIFE can readily be changed to use the perceptually related loss functions, such as LPIPS~\cite{blau2018perception, niklaus2017video}.
+
+ 	\section{Conclusion}
+We develop an efficient and flexible algorithm for VFI, namely RIFE. A separate neural module IFNet directly estimates the intermediate optical flows, supervised by a privileged distillation scheme, where the teacher model can access ground truth intermediate frames. Experiments confirm RIFE can effectively process videos of different scenes. Furthermore, an extra input with temporal encoding enables RIFE for arbitrary-timestep frame interpolation and dynamic scene panorama stitching. The lightweight nature of RIFE makes it much more accessible for downstream tasks.     
+{\small
+		\bibliographystyle{ieee_fullname}    
+		\bibliography{egbib}
+	}
+	\clearpage
+\section{Appendix}
+
+\subsection{Architecture of RefineNet}
+Following the previous work~\cite{niklaus2020softmax}, we design a RefineNet with an encoder-decoder architecture similar to U-Net and a context extractor. The context extractor and encoder part have similar architectures, consisting of four convolutional blocks, and each of them is composed of two $3\times 3$ convolutional layers, respectively. The decoder part in the FusionNet has four transpose convolution layers. 
+
+Specifically, the context extractor first extracts the pyramid contextual features from input frames separately. We denote the pyramid contextual feature as $C_0$: $\{C_0^0, C_0^1, C_0^2, C_0^3\}$ and $C_1$: $\{C_1^0, C_1^1, C_1^2, C_1^3\}$. We then perform backward warping on these features using estimated intermediate flows to produce aligned pyramid features, $C_{t \leftarrow 0}$ and $C_{t \leftarrow 1}$. The origin frames $I_0, I_1$, warped frames $\widehat{I}_{t\leftarrow 0}, \widehat{I}_{t\leftarrow 1}$, intermediate flows $F_{t\rightarrow 0}, F_{t\rightarrow 1}$ and fusion mask $M$ are fed into the encoder. The output of $i-th$ encoder block is concatenated with the $C_{t \leftarrow 0}^{i}$ and $C_{t \leftarrow 1}^{i}$ before being fed into the next block. The decoder parts finally produce a reconstruction residual $\Delta$. And we will get a refined reconstructed image $\widehat{I}_t + \Delta$, where $\widehat{I}_t$ is the reconstruct image before the RefineNet. We show some visualization results in Figure~\ref{fig:mb}. RefineNet seems to make some uncertain areas more blurred to improve quantitative results. 
+
+\begin{figure}[h]
+	\centering
+	\includegraphics[width=8cm]{image/visual.pdf}
+	\caption{\textbf{Visualization of intermediate flow $F_{t\rightarrow 0}$ and blend mask $M$.} We show that stack 3 IFblocks can get finer intermediate flow and blend mask.  }\label{fig:mb}
+\end{figure}
+
+\subsection{Intermediate Flow Visualization}
+In Figure~\ref{fig:compare_flow}, we provide visual results of our IFNet and compare them with the linearly combined bi-directional optical flows~\cite{jiang2018super}. IFNet produces clear motion boundaries.
+
+\begin{figure}[h]
+	\centering
+	\begin{minipage}[t]{0.325\linewidth}
+		\centering
+		\includegraphics[width=1\linewidth]{image/CompareFlow/f1.png}
+		\centerline{Inputs~(Overlay)}
+	\end{minipage}
+	\begin{minipage}[t]{0.325\linewidth}
+		\centering
+		\includegraphics[width=1\linewidth]{image/CompareFlow/f2.png}
+		\centerline{Combination}
+	\end{minipage}
+	\begin{minipage}[t]{0.325\linewidth}
+		\centering
+		\includegraphics[width=1\linewidth]{image/CompareFlow/f3.png}
+		\centerline{IFNet}
+	\end{minipage}
+	
+	\caption{\textbf{Visual comparison between linearly combined bi-directional flows~\cite{jiang2018super} and the result of IFNet.} }
+	\label{fig:compare_flow}
+	\vspace{-1em}
+\end{figure}
+
+
+\subsection{Training Dynamic}
+\begin{figure}[ht]
+	\centering
+	\includegraphics[width=7cm]{image/Vimeo/train_curve_vimeo.pdf}
+	\caption{\textbf{PSNR on Vimeo90K benchmark during the whole training process. } The distillation scheme helps RIFE converge to better performance}\label{fig:dynamic}
+\end{figure}
+
+\begin{figure*}[t]
+	\centering
+	\includegraphics[width=17cm]{image/MBresidual.pdf}
+	\caption{\textbf{Interpolating results on the MiddleBury~\cite{baker2011database} dataset.} We show that the function of RefineNet is mainly to refine the high frequency content of the results.}\label{fig:mb}
+\end{figure*}
+
+We study the dynamic during the RIFE training. As shown in Figure~\ref{fig:dynamic}, the privileged distillation scheme helps RIFE converge to better performance. Furthermore, we try to adjust the weights of losses. We found that larger scale$~(10\times)$ of weights will cause the model to not converge and smaller weights$~(0.1\times)$ will slightly reduce model performance.
+
+
+\subsection{Model Efficiency Comparison}
+The speed of models is very important in frame interpolation applications. However, to the best of our knowledge, currently published papers do not test the speed of each state-of-the-art VFI model on same hardware, and rarely report the complexity of the model. Some previous works  report runtime data from the MiddleBury public leaderboard without indicating running devices. These data are reported by the submitters of various methods. A more reliable survey comes from EDSC (Table 10)~\cite{cheng2020multiple}. We collect the models of each paper and test them on a NVIDIA TITAN X(Pascal) GPU with same environment. 
+ \end{document} 

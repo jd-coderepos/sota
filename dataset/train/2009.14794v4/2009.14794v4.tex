@@ -1,0 +1,1217 @@
+\section*{APPENDIX: Rethinking Attention with Performers}
+\setcounter{section}{0}
+\renewcommand{\thesection}{\Alph{section}}
+\label{sec:appendix}
+
+\section{Hyperparameters for experiments}
+\label{appendix:hyperparameters}
+This optimal setting (including comparisons to approximate softmax) we use for the Performer is specified in the Generalized Attention (Subsec. \ref{subsec:generalized_default}), and \textbf{unless specifically mentioned (e.g. using name "Performer-SOFTMAX"), "Performer" refers to using this generalized attention setting.}
+
+\subsection{Metrics}
+We report the following evaluation metrics:
+\vspace{-3mm}
+\begin{enumerate}[itemsep=0.2mm]
+\item \textbf{Accuracy}: For unidirectional models, we measure the accuracy on next-token prediction, averaged across all sequence positions in the dataset. For bidirectional models, we mask each token with $15\%$ probability (same as \citep{bert}) and measure accuracy across the masked positions.
+\item \textbf{Perplexity}: For unidirectional models, we measure perplexity across all sequence positions in the dataset. For bidirectional models, similar to the accuracy case, we measure perplexity across the masked positions.
+\item \textbf{Bits Per Dimension/Character (BPD/BPC)}: This calculated by loss divided by $\ln(2)$.
+\end{enumerate}
+\vspace{-3mm}
+We used the full evaluation dataset for TrEMBL in the plots in the main section, while for other datasets such as ImageNet64 and PG-19 which have very large evaluation dataset sizes, we used random batches (>2048 samples) for plotting curves. 
+
+\subsubsection{PG-19 Preprocessing}
+
+The PG-19 dataset \citep{compr} is presented as a challenging long range text modeling task. It consists of out-of-copyright Project Gutenberg books published before 1919. It does not have a fixed vocabulary size, instead opting for any tokenization which can model an arbitrary string of text. We use a unigram SentencePiece vocabulary \citep{sentencepiece} with 32768 tokens, which maintains whitespace and is completely invertible to the original book text. Perplexities are calculated as the average log-likelihood per token, multiplied by the ratio of the sentencepiece tokenization to number of tokens in the original dataset. The original dataset token count per split is: train=1973136207, validation=3007061, test=6966499. Our sentencepiece tokenization yields the following token counts per split: train=3084760726, valid=4656945, and test=10699704. This gives log likelihood multipliers of train=1.5634, valid=1.5487, test=1.5359 per split before computing perplexity, which is equal to $\exp(\text{log likelihood multiplier} * \text{loss})$.
+
+Preprocessing for TrEMBL is extensively explained in Appendix \ref{appendix:protein_extended}.
+
+\subsection{Training Hyperparameters} 
+Unless specifically stated, all Performer + Transformer runs by default used $0.5$ grad clip, $0.1$ weight decay, $0.1$ dropout, $10^{-3}$ fixed learning rate with Adam hyperparameters $(\beta_{1} = 0.9, \beta_{2} = 0.98, \epsilon = 10^{-9})$, with batch size maximized (until TPU memory overload) for a specific model. 
+
+All 36-layer protein experiments used the same amount of compute (i.e. 16x16 TPU-v2, 8GB per chip). For concatenated experiments, 16x16 TPU-v2's were also used for the Performer, while 8x8's were used for the 1-3 layer $(d = 256)$ Transformer models (using 16x16 did not make a difference in accuracy).
+
+\textbf{Note that Performers are using the same training hyperparameters as Transformers, yet achieving competitive results} - this shows that FAVOR can act as a simple drop-in without needing much tuning.
+
+\subsection{Approximate Softmax Attention Default Values} The optimal values, set to default parameters\footnote{\url{https://github.com/google-research/google-research/blob/master/performer/fast_attention}}
+, are: renormalize\_attention = True, numerical stabilizer = $10^{-6}$, number of features = 256, ortho\_features = True, ortho\_scaling = 0.0.
+
+\subsection{Generalized Attention Default Values} \label{subsec:generalized_default} The optimal values, set to default parameters\footnote{\url{https://github.com/google-research/google-research/blob/master/performer/fast_attention}}
+, are: renormalize\_attention = True, numerical stabilizer = 0.0, number of features = 256, kernel = ReLU, kernel\_epsilon = $10^{-3}$. 
+
+\subsection{Reformer Default Values} \label{subsec:reformer_default}
+For the Reformer, we used the same hyperparameters as mentioned for protein experiments, without gradient clipping, while using the defaults\footnote{\url{https://github.com/google/trax/blob/master/trax/supervised/configs/reformer_imagenet64.gin}} (which instead use learning rate decay) for ImageNet-64. In both cases, the Reformer used the same default LSH attention parameters.
+
+\subsection{Linformer Default Values} \label{subsec:linformer_default}
+Using our standard pipeline as mentioned above, we replaced the attention function with the Linformer variant via Jax, with $\delta = 10^{-6}, k=600$ (same notation used in the paper \citep{linformer}), where $\delta$ is the exponent in a renormalization procedure using $e^{-\delta}$ as a multiplier in order to approximate softmax, while $k$ is the dimension of the projections of the $\mathbf{Q}$ and $\mathbf{K}$ matrices. As a sanity check, we found that our Linformer implementation in Jax correctly approximated exact softmax's output within $0.02$ error for all entries.
+
+Note that for rigorous comparisons, our Linformer hyperparameters are even stronger than the defaults found in \citep{linformer}, as:
+
+\begin{itemize}
+\item We use $k=600$, which is more than twice than the default $k=256$ from the paper, and also twice than our default $m = 256$ number of features.
+\item We also use redrawing, which avoids "unlucky" projections on $\mathbf{Q}$ and $\mathbf{K}$. 
+\end{itemize}
+
+
+\newpage
+
+\section{Main Algorithm: FAVOR+}
+\label{appendix:main_algorithm}
+We outline the main algorithm for FAVOR+ formally: 
+
+\begin{algorithm}[h]
+\SetAlgoLined
+\SetKwInOut{Input}{Input}
+\Input{ $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{L \times d}$, $\mathrm{isBidirectional}$ - binary flag.}
+\KwResult{$\widehat{\mathrm{Att}}_\leftrightarrow (\mathbf{Q}, \mathbf{K}, \mathbf{V}) \in \mathbb{R}^{L \times L}$ if $\mathrm{isBidirectional}$, $\widehat{\mathrm{Att}}_\to (\mathbf{Q}, \mathbf{K}, \mathbf{V}) \in \mathbb{R}^{L \times L}$ otherwise.}
+Compute $\mathbf{Q}^{\prime}$ and $\mathbf{K}^{\prime}$ as described in Section \ref{sec:gka} and Section \ref{howto} and take $\mathbf{C} := \begin{bmatrix} \mathbf{V} & \mathbf{1}_L \end{bmatrix}$\;
+\eIf{$\mathrm{isBidirectional}$}{
+    $\mathrm{Buf}_1 := (\mathbf{K}^{\prime})^\top \mathbf{C} \in \mathbb{R}^{M \times (d + 1)}, \quad \mathrm{Buf}_2 := \mathbf{Q}^{\prime} \mathrm{Buf}_1 \in \mathbb{R}^{L \times (d + 1)}$\;
+}{
+    Compute $\mathbf{G}$ and its prefix-sum tensor $\mathbf{G}^\mathrm{PS}$ according to (\ref{eq:cumsum})\;
+    $\mathrm{Buf}_2 := \begin{bmatrix} \mathbf{G}^\mathrm{PS}_{1,:,:} \mathbf{Q}^{\prime}_1 & \dots & \mathbf{G}^\mathrm{PS}_{L,:,:} \mathbf{Q}^{\prime}_L \end{bmatrix}^\top \in \mathbb{R}^{L \times (d + 1)}$\;
+}
+$\begin{bmatrix} \mathrm{Buf}_3 & \mathrm{buf}_4 \end{bmatrix} := \mathrm{Buf}_2, \quad \mathrm{Buf}_3 \in \mathbb{R}^{L \times d}, \quad \mathrm{buf}_4 \in \mathbb{R}^L$\;
+\Return $\mathrm{diag} (\mathrm{buf}_4)^{-1} \mathrm{Buf}_3$\;
+\caption{FAVOR+ (bidirectional or unidirectional).}
+\label{alg:1}
+\end{algorithm}
+
+
+\subsection{Unidirectional Case and Prefix Sums}
+\label{subsec:unidirectional}
+We explain how our analysis from Section \ref{sec:gka} can be extended to the unidirectional mechanism in this section.
+Notice that this time attention matrix $\mathbf{A}$ is masked, i.e. all its entries not in the lower-triangular part (which contains the diagonal) are zeroed (see also Fig. \ref{fig:prefix_sum}).
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/prefix_sum.jpg}
+  \caption{\small{Visual representation of the prefix-sum algorithm for unidirectional attention. For clarity, we omit attention normalization in this visualization. The algorithm keeps the prefix-sum which is a matrix obtained by summing the outer products of random features corresponding to keys with value-vectors. At each given iteration of the prefix-sum algorithm, a random feature vector corresponding to a query is multiplied by the most recent prefix-sum (obtained by summing all outer-products corresponding to preceding tokens) to obtain a new row of the matrix $\mathbf{AV}$ which is output by the attention mechanism.\\}}
+  \label{fig:prefix_sum}
+\end{figure}
+
+For the unidirectional case, our analysis is similar as for the bidirectional case, but this time our goal is to compute $\mathrm{tril}(\mathbf{Q}^{\prime} (\mathbf{K}^{\prime})^\top) \mathbf{C}$ without constructing and storing the $L \times L$-sized matrix $\mathrm{tril}(\mathbf{Q}^{\prime} (\mathbf{K}^{\prime})^\top)$ explicitly, where
+$\mathbf{C}~=~\begin{bmatrix} V & \mathbf{1}_L \end{bmatrix} \in \mathbb{R}^{L \times (d + 1)}$. In order to do so, observe that $\forall 1 \leq i \leq L$:
+\begin{equation} \label{eq:cumsum}
+    [\mathrm{tril}(\mathbf{Q}^{\prime} (\mathbf{K}^{\prime})^\top) \mathbf{C}]_i = \mathbf{G}^\mathrm{PS}_{i,:,:} \times \mathbf{Q}^{\prime}_i, \quad \mathbf{G}^\mathrm{PS}_{i,:,:} = \sum_{j = 1}^i \mathbf{G}_{j,:,:}, \quad \mathbf{G}_{j,:,:} = \mathbf{K}^{\prime}_j \mathbf{C}_j^\top \in \mathbb{R}^{M \times (d + 1)}
+\end{equation}
+where $\mathbf{G}, \mathbf{G}^\mathrm{PS} \in \mathbb{R}^{L \times M \times (d + 1)}$ are 3d-tensors. Each slice $\mathbf{G}^\mathrm{PS}_{:,l,p}$ is therefore a result of a prefix-sum (or cumulative-sum) operation applied to $\mathbf{G}_{:,l,p}$: $\mathbf{G}^\mathrm{PS}_{i,l,p} = \sum_{j = 1}^i \mathbf{G}_{i,l,p}$. An efficient algorithm to compute the prefix-sum of $L$ elements takes $O(L)$ total steps and $O(\log L)$ time when computed in parallel \citep{cumsum, cormen}. 
+See Algorithm \ref{alg:1} for the whole approach.
+
+
+\subsection{Orthogonal Random Features - Extensions}
+\label{subsec:extensions}
+
+As mentioned in the main text, for isotropic $\Omega$ (true for most practical applications, including regular attention), instead of sampling $\omega_{i}$ independently, we can use \emph{orthogonal random features} (ORF) \citep{ort, unreas, geom}: these maintain the marginal distributions of samples $\omega_{i}$ while enforcing that different samples are orthogonal. If we need $m>d$, ORFs still can be used locally within each $d \times d$ block of $\mathbf{W}$ \citep{ort}.
+
+ORFs were introduced to reduce the variance of Monte Carlo estimators \citep{ort, unreas, geom, kama, hron,psrnn, uni} and we showed in the theoretical and experimental sections from the main body that they do indeed lead to more accurate approximations and substantially better downstream results. There exist several variants of the ORF-mechanism and in the main body we discussed only the base one (that we refer to here as \textit{regular}). Below we briefly review the most efficient ORF mechanisms (based on their strengths and costs) to present the most complete picture.
+
+\textbf{(1) Regular ORFs [R-ORFs]:} Applies Gaussian orthogonal matrices \citep{ort}. Encodes matrix $\mathbf{W}$ of $\omega$-samples (with different rows corresponding to different samples) in $O(md)$ space. Provides algorithm for computing $\mathbf{Wx}$ in $O(md)$ time for any $\mathbf{x} \in \mathbb{R}^{d}$. Gives unbiased estimation. Requires one-time $O(md^{2})$ preprocessing (Gram-Schmidt orthogonalization).
+
+\textbf{(2) Hadamard/Givens ORFs [H/G-ORFs]:} Applies random Hadamard \citep{unreas} or Givens matrices \citep{uni}. Encodes matrix $\mathbf{W}$ in $O(m)$ or $O(m\log(d))$ space. Provides algorithm for computing $\mathbf{Wx}$ in $O(m\log(d))$ time for any $\mathbf{x} \in \mathbb{R}^{d}$. Gives small bias (tending to $0$ with $d \rightarrow \infty$).
+
+\subsection{Time and Space Complexity - Detailed Analysis}
+
+We see that a variant of bidirectional FAVOR+ using iid samples or R-ORFs has $O(md+Ld+mL)$ space complexity as opposed to $\Theta(L^{2} + Ld)$ space complexity of the baseline. Unidirectional FAVOR+ using fast prefix-sum pre-computation in parallel \citep{cumsum, cormen} has $O(m L d)$ space complexity to store $\mathbf{G}^\textrm{PS}$ which can be reduced to $O(md+Ld+mL)$ by running a simple (though non-parallel in $L$) aggregation of $\mathbf{G}^\textrm{PS}_{i,:,:}$ without storing the whole tensor $\mathbf{G}^{\textrm{PS}}$ in memory. From Subsec. \ref{subsec:extensions}, we know that if instead we use G-ORFs, then space complexity is reduced to $O(m\log(d) + Ld + mL)$ and if the H-ORFs mechanism is used, then space is further reduced to $O(m + Ld + mL)=O(Ld+mL)$. Thus for $m,d \ll L$ all our variants provide substantial space complexity improvements since they do not need to store the attention matrix explicitly.
+
+The time complexity of Algorithm \ref{alg:1} is $O(L m d)$ (note that constructing $\mathbf{Q}^{\prime}$ and $\mathbf{K}^{\prime}$ can be done in time $O(Lmd)$). Note that the time complexity of our method is much lower than $O(L^2 d)$ of the baseline for $L \gg m$.
+
+As explained in Subsec. \ref{subsec:extensions}, the R-ORF mechanism incurs an extra one-time $O(md^{2})$ cost (negligible compared to the $O(Lmd)$ term for $L \gg d$). H-ORFs or G-ORFs do not have this cost, and when FAVOR+ uses them, computing $\mathbf{Q}^{\prime}$ and $\mathbf{K}^{\prime}$ can be conducted in time $O(L\log(m)d)$ as opposed to $O(Lmd)$ (see: Subsec. \ref{subsec:extensions}). Thus even though H/G-ORFs do not change the asymptotic time complexity, they improve the constant factor from the leading term. This might play an important role in training very large models. 
+
+The number of random features $m$ allows a trade-off between computational complexity and the level of approximation: bigger $m$ results in higher computation costs, but also in a lower variance of the estimate of $\mathbf{A}$. In the theoretical section from the main body we showed that in practice we can take $M=\Theta(d\log(d))$.
+
+Observe that the FAVOR+ algorithm is highly-parallelizable, and benefits from fast matrix multiplication and broadcasted operations on GPUs or TPUs.
+
+\newpage
+
+\section{Experimental Details for Protein Modeling Tasks}
+\label{appendix:protein_extended}
+\subsection{TrEMBL Dataset}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\resizebox{0.9\textwidth}{!}{\begin{tabular}{ |c|c|c|c|c|c|c|c|c| } 
+\hline
+\multirow{2}{*}{\bf Dataset} & \multirow{2}{*}{\bf Set Name} & \multirow{2}{*}{\bf Count} & \multicolumn{5}{|c|}{\bf Length Statistics} \\
+\cline{4-8}
+ & &  & \textbf{Min} & \textbf{Max}& \textbf{Mean}& \textbf{STD} & \textbf{Median} \\
+\hline
+\multirow{4}{*}{TrEMBL}
+& Train & 104,863,744 & 2 & 74,488 & 353.09 & 311.16 & 289.00 \\ 
+& Valid & 102,400 & 7 & 11,274 & 353.62 & 307.42 & 289.00 \\ 
+\cline{2-8}
+& Test & 1,033,216 & 8 & 32,278 & 353.96 & 312.23 & 289.00 \\ 
+& OOD & 29,696 & 24 & 4,208 & 330.96 & 269.86 & 200.00 \\ 
+\hline
+& & & & & & & \vspace{-4.5mm}\\
+\hline
+\multirow{2}{*}{\begin{tabular}{c}TrEMBL\\ (concat)\end{tabular}} & Train & 4,532,224 & \multirow{2}{*}{8,192} & \multirow{2}{*}{8,192} & \multirow{2}{*}{8,192} & \multirow{2}{*}{0} & \multirow{2}{*}{8,192}\\
+& Valid & 4,096 & & & & & \\ 
+\hline
+\end{tabular}
+}
+\vspace{2mm}
+\caption{Statistics for the TrEMBL single sequence and the long sequence task.}
+\label{table-trembl-statistics}
+\end{table}
+
+We used the TrEMBL dataset\footnote{\url{https://www.uniprot.org/statistics/TrEMBL}}, which contains 139,394,261 sequences of which 106,030,080 are unique. While the training dataset appears smaller than the one used in Madani et al. \citep{progen}, we argue that it includes most of the relevant sequences. Specifically, the TrEMBL dataset consists of the subset of UniProtKB sequences that have been computationally analyzed but not manually curated, and accounts for $\approx99.5\%$ of the total number of sequences in the UniProtKB dataset\footnote{\url{https://www.uniprot.org/uniprot/}}.
+
+Following the methodology described in Madani et al. \citep{progen}, we used both an OOD-Test set, where a selected subset of Pfam families are held-out for valuation, and an IID split, where the remaining protein sequences are split randomly into train, valid, and test tests. We held-out the following protein families (PF18369, PF04680, PF17988, PF12325, PF03272, PF03938, PF17724, PF10696, PF11968, PF04153, PF06173, PF12378, PF04420, PF10841, PF06917, PF03492, PF06905, PF15340, PF17055, PF05318), which resulted in 29,696 OOD sequences. We note that, due to deduplication and potential TrEMBL version mismatch, our OOD-Test set does not match exactly the one in Madani et al. \citep{progen}. We also note that this OOD-Test selection methodology does not guarantee that the evaluation sequences are within a minimum distance from the sequences used during training. In future work, we will include rigorous distance based splits.
+
+The statistics for the resulting dataset splits are reported in Table \ref{table-trembl-statistics}. In the standard sequence modeling task, given the length statistics that are reported in the table, we clip single sequences to maximum length $L=1024$, which results in few sequences being truncated significantly.
+
+In the long sequence task, the training and validation sets are obtained by concatenating the sequences, separated by an end-of-sequence token, and grouping the resulting chain into non-overlapping sequences of length $L=8192$.
+
+
+
+\subsection{Empirical Baseline}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\linewidth]{img/empirical_distribution.png}
+  \caption{\small{Visualization of the estimated empirical distribution for the 20 standard amino acids, colored by their class. Note the consistency with the statistics on the TrEMBL web page.}}
+  \vspace{2mm}
+  \label{figure-empirical-baseline}
+\end{figure}
+
+A random baseline, with uniform probability across all the vocabulary tokens at every position, has accuracy $5\%$ (when including only the 20 standard amino acids) and $4\%$ (when also including the 5 anomalous amino acids \citep{uniprot2019uniprot}). However, the empirical frequencies of the various amino acids in our dataset may be far from uniform, so we also consider an \textit{empirical baseline} where the amino acid probabilities are proportional to their empirical frequencies in the training set.
+
+Figure \ref{figure-empirical-baseline} shows the estimated empirical distribution. We use both the standard and anomalous amino acids, and we crop sequences to length 1024 to match the data processing performed for the Transformer models. The figure shows only the 20 standard amino acids, colored by their class, for comparison with the visualization on the TrEMBL web page\footnote{\url{https://www.uniprot.org/statistics/TrEMBL}}.
+
+\subsection{Tabular Results}
+
+Table \ref{table-trembl} contains the results on the single protein sequence modeling task ($L=1024$). We report accuracy and perplexity as defined in Appendix \ref{appendix:hyperparameters}:
+
+\begin{comment}
+We report the following evaluation metrics:
+\begin{enumerate}
+\item \textbf{Accuracy}: For unidirectional models, we measure the accuracy on next-token prediction, averaged across all sequence positions in the dataset. For bidirectional models, we mask each token with $15\%$ probability and measure accuracy across the masked positions.
+\item \textbf{Perplexity}: For unidirectional models, we measure perplexity across all sequence positions in the dataset. For bidirectional models, similar to the accuracy case, we measure perplexity across the masked positions. \end{enumerate}
+\end{comment}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\resizebox{0.9\textwidth}{!}{\begin{tabular}{ |c|c|c|c|c| } 
+\hline
+\textbf{Model Type} & \textbf{Set Name} & \textbf{Model} & \textbf{Accuracy} & \textbf{Perplexity} \\
+\hline
+\multirow{6}{*}{UNI} & \multirow{3}{*}{Test} & Empirical Baseline & 9.92 & 17.80 \\ 
+& & Transformer & 30.80 & 9.37\\ 
+& & Performer (generalized) & 31.58 & 9.17 \\ 
+\cline{2-5}
+& \multirow{3}{*}{OOD} & Empirical Baseline & ~9.07 & ~17.93 \\ 
+& & Transformer & 19.70 & 13.20 \\ 
+& & Performer (generalized) & 18.44 & 13.63 \\
+\hline
+& & & &\vspace{-4.5mm}\\
+\hline
+\multirow{6}{*}{BID} & \multirow{3}{*}{Test} & Transformer & 33.32 & 9.22 \\ 
+& & Performer (generalized) & 36.09 &  8.36 \\ 
+& & Performer (softmax) & 33.00 &  9.24 \\ 
+\cline{2-5}
+& \multirow{3}{*}{OOD} & Transformer & 25.07 & 12.09 \\ 
+& & Performer (generalized) & 24.10 & 12.26 \\ 
+& & Performer (softmax) & 23.48 & 12.41 \\ 
+\hline
+\end{tabular}
+}
+\vspace{2mm}
+\caption{Results on single protein sequence modeling ($L=1024$). We note that the empirical baseline results are applicable to both the unidirectional (UNI) and bidirectional (BID) models.}\label{table-trembl}
+\end{table}
+
+\begin{comment}
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\resizebox{0.9\textwidth}{!}{\begin{tabular}{ |c|c|c|c|c| } 
+\hline
+\textbf{Model Type} & \textbf{Set Name} & \textbf{Model} & \textbf{Accuracy} & \textbf{Perplexity} \\
+\hline
+\multirow{14}{*}{BID} & \multirow{3}{*}{Test-1} & Empirical Baseline & 9.92 & 17.80 \\
+& & Transformer & {\color{red} ?} & {\color{red} ?}\\ 
+& & Performer (generalized) & {\color{red} ?} & {\color{red} ?}\\ 
+\cline{2-5}
+& \multirow{2}{*}{Test-5} & Transformer & {\color{red} ?} & {\color{red} ?}\\ 
+& & Performer (generalized) & {\color{red} ?} & {\color{red} ?}\\ 
+\cline{2-5}
+& \multirow{2}{*}{Test-10} & Transformer & {\color{red} ?} & {\color{red} ?}\\ 
+& & Performer (generalized) & {\color{red} ?} & {\color{red} ?}\\ 
+\cline{2-5}
+& & & &\vspace{-4.5mm}\\
+\cline{2-5}
+& \multirow{3}{*}{OOD-1} & Empirical Baseline & 9.07 & 17.93 \\ 
+& & Transformer & {\color{red} ?} & {\color{red} ?}\\ 
+& & Performer (generalized) & {\color{red} ?} & {\color{red} ?}\\ 
+\cline{2-5}
+& \multirow2{*}{OOD-5} & Transformer & {\color{red} ?} & {\color{red} ?}\\ 
+& & Performer (generalized) & {\color{red} ?} & {\color{red} ?}\\ 
+\cline{2-5}
+& \multirow{2}{*}{OOD-10} & Transformer & {\color{red} ?} & {\color{red} ?}\\ 
+& & Performer (generalized) & {\color{red} ?} & {\color{red} ?}\\ 
+\hline
+\end{tabular}
+}
+\vspace{2mm}
+\caption{Results on concatenated protein sequence modeling on the TrEMBL dataset. }\label{table-trembl-concatenated}
+\end{table}
+\end{comment}
+
+
+
+\subsection{Attention Matrix Illustration}
+
+In this section we illustrate the attention matrices produced by a Performer model. We focus on the bidirectional case and choose one Performer model trained on the standard single-sequence TrEMBL task for over 500K steps. The same analysis can be applied to unidirectional Performers as well.
+
+We note that while the Transformer model instantiates the attention matrix in order to compute the attention output that incorporates the (queries $Q$, keys $K$, values $V$) triplet (see Eq.~\ref{eq:attnorm} in the main paper), the FAVOR mechanism returns the attention output directly (see Algorithm~\ref{alg:1}). To account for this discrepancy, we extract the attention matrices by applying each attention mechanism twice: once on each original $(Q, K, V)$ triple to obtain the attention output, and once on a modified $(Q, K, V^\circ)$ triple, where $V^\circ$ contains one-hot indicators for each position index, to obtain the attention matrix. The choice of $V^\circ$ ensures that the dimension of the attention output is equal to the sequence length, and that a non-zero output on a dimension $i$ can only arise from a non-zero attention weight to the $i^{th}$ sequence position. Indeed, in the Transformer case, when comparing the output of this procedure with the instantiated attention matrix, the outputs match.
+
+\textbf{Attention matrix example.} We start by visualizing the attention matrix for an individual protein sequence. We use the BPT1\_BOVIN protein sequence\footnote{\url{https://www.uniprot.org/uniprot/P00974}}, one of the most extensively studied globular proteins, which contains 100 amino acids. In Figure \ref{fig:attention_matrices}, we show the attention matrices for the first 4 layers. Note that many heads show a \textit{diagonal} pattern, where each node attends to its neighbors, and some heads show a \textit{vertical} pattern, where each head attends to the same fixed positions. These patterns are consistent with the patterns found in Transformer models trained on natural language \citep{kovaleva2019revealing}. In Figure \ref{fig:model_view} we highlight these attention patterns by focusing on the first 25 tokens, and in Figure \ref{fig:attention_heads}, we illustrate in more detail two attention heads.
+
+\textbf{Amino acid similarity.} Furthermore, we analyze the amino-acid similarity matrix estimated from the attention matrices produced by the Performer model, as described in Vig et al. \citep{bertology}. We aggregate the attention matrix across 800 sequences. The resulting similarity matrix is illustrated in Figure \ref{figure:amino-acid-similarity}. Note that the Performer recognizes highly similar amino acid pairs such as (D, E) and (F, Y).
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/attention_matrices.png}
+  \vspace{2mm}
+  \caption{\small{We show the attention matrices for the first 4 layers and all 8 heads (each row is a layer, each column is head index, each cell contains the attention matrix across the entire BPT1\_BOVIN protein sequence). Note that many heads show a \textit{diagonal} pattern, where each node attends to its neighbors, and some heads show a \textit{vertical} pattern, where each head attends to the same fixed positions.}}
+  \label{fig:attention_matrices}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.49\textwidth]{img/head_1_2.png}
+  \includegraphics[width=0.49\textwidth]{img/head_4_1.png}
+  \vspace{2mm}
+  \caption{\small{We illustrate in more detail two attention heads. The sub-figures correspond respectively to: \textbf{(1)} Head 1-2 (second layer, third head), \textbf{(2)} Head 4-1 (fifth layer, second head). Note the block attention in Head 1-2 and the vertical attention (to the start token (`M') and the 85th token (`C')) in Head 4-1.}}
+  \label{fig:attention_heads}
+\end{figure}
+
+\newpage
+
+\begin{figure}[ht]
+    \centering
+  \includegraphics[height = 0.6\linewidth, width=0.9\linewidth]{img/model_view.png}
+  \vspace{2mm}
+  \caption{\small{We highlight the attention patterns by restricting our attention to the first 25 tokens (note that we do not renormalize the attention to these tokens). The illustration is based on Vig et al. \protect\citep{vig2019multiscale, analyzing_attention}. Note that, similar to prior work on protein Transformers \protect\citep{progen}, the attention matrices include both local and global patterns.}}
+  \label{fig:model_view}
+\end{figure}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.49\textwidth]{img/blosum.pdf}
+  \includegraphics[width=0.49\textwidth]{img/performer.pdf}
+  \vspace{1mm}
+  \caption{\small{Amino acid similarity matrix estimated from attention matrices aggregated across a small subset of sequences, as described in Vig et al. \protect\citep{bertology}. The sub-figures correspond respectively to: \textbf{(1)} the normalized BLOSUM matrix, \textbf{(2)} the amino acid similarity estimated via a trained Performer model. Note that the Performer recognizes highly similar amino acid pairs such as (D, E) and (F, Y).}}
+  \label{figure:amino-acid-similarity}
+\end{figure}
+
+\clearpage
+
+\section{Extended approximation and comparison results}
+\label{appendix:extended_approx}
+
+\subsection{Backwards Compatibility - Error Propagation}
+Although mentioned previously (Sec. \ref{subsec:approx_error_compatibility}) that the Performer with additional finetuning is backwards compatible with the Transformer, we demonstrate below in Fig. \ref{fig:appendix_approx} that error propagation due to non-attention components of the Transformer is one of the primary reasons that pretrained Transformer weights cannot be immediately used for inference on the corresponding Performer.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.75\textwidth]{img/transformer_output_layer.png}
+  \caption{Output approximation errors between a vanilla Transformer and a Performer (with orthogonal features) for varying numbers of layers.}
+  \label{fig:appendix_approx}
+\end{figure}
+
+\begin{comment}
+\subsection{Redrawing in Softmax}
+\label{subsec:redraw}
+While the benefits of redrawing features was shown in Subsec. \ref{subsec:softmax_approx_transformer} of the main body of the paper, we also demonstrate its benefits when there are multiple layers with large scale (16x16 TPU-v2) training. This can be found below in Fig. \ref{fig:appendix_redraw}.
+
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/progen_B_redraw.png}
+  \caption{The importance of redrawing features. If redrawing is not used, an "unlucky" set of random features may cause training degradation, shown by the early-stopped curve with Seed 1, while a 'lucky' set of random features may cause no issue, shown by the curve with Seed 2. Redrawing allows the training to correct itself, as seen at the black vertical line.}
+  \label{fig:appendix_redraw}
+\end{figure}
+
+
+
+\subsection{Softmax Unidirectional}
+\label{subsec:softmax_unidirectional}
+While we have shown on TrEMBL that Performer with generalized ReLU attention outperforms softmax, we also show that approximate softmax attention can still be a solid choice, for example on ImageNet64 (U), in Fig. \ref{fig:im64_relu_softmax}.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/im64_relu_softmax.png}
+  \caption{Using the same 8x8 TPU-v2 compute and same 6-layer standard model, approximate softmax with positive features achieves the same result as generalized ReLU attention.}
+  \label{fig:im64_relu_softmax}
+\end{figure}
+
+\end{comment}
+\subsection{Approximate Softmax - Extended Properties}
+\label{subsec:redraw}
+\label{subsec:softmax_unidirectional}
+\label{subsec:unstable_trig}
+We show the following properties of our softmax approximation, in Fig. \ref{fig:appendix_redraw}:
+
+\textbf{Redrawing:} While the benefits of redrawing features was shown in Subsec. \ref{subsec:softmax_approx_transformer} of the main body of the paper, we also demonstrate its benefits when there are multiple layers with large scale (16x16 TPU-v2) training.
+
+\textbf{Unidirectional:} While we have shown on TrEMBL that Performer with generalized ReLU attention outperforms softmax, we also show that approximate softmax attention can still be a solid choice, for example on ImageNet64 (U). After 100K steps of training, the Performer-ReLU, Performer-Softmax, and Performer-Softmax (SMREG) variants achieve respectively, 3.67, 3.69, 3.67 BPD.
+
+\textbf{Instability of Trigonometric Features:} We see the full view of the unstable training curve when using Trigonometric softmax.
+
+\vspace{2mm}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/three_softmax.png}
+  \caption{Best viewed zoomed in. \textbf{Left:} The importance of redrawing features. If redrawing is not used, an "unlucky" set of random features may cause training degradation, shown by the early-stopped curve with Seed 1, while a `lucky' set of random features may cause no issue, shown by the curve with Seed 2. Redrawing allows the training to correct itself, as seen at the black vertical line. \textbf{Middle:} Using the same 8x8 TPU-v2 compute and same 6-layer standard model, approximate softmax with positive features achieves the same result as generalized ReLU attention. \textbf{Right:} Zoomed out view of right subfigure of Fig. \ref{fig:backward_compatibility}, showing that Trigonometric softmax causes very unstable training behaviors.
+  }
+  \label{fig:appendix_redraw}
+  \label{fig:im64_relu_softmax}
+  \label{fig:pg19_full_softmax}
+\end{figure}
+
+
+
+\subsection{Generalized Attention}
+\label{subsec:appendix_generalized_attention}
+We investigated Generalized Attention mechanisms (mentioned in Sec. \ref{sec:gka}) on TrEMBL when $L=512$ for various kernel functions. This is similar to \citep{tsai2019transformer} which also experiments with various attention kernels for natural language. Using hyperparameter sweeps across multiple variables in FAVOR, we compared several kernels and also renormalization on/off (Fig. \ref{fig:attention_comparisons_2x2} and Fig. \ref{fig:attention_comparisons_4x4}), where $\mathrm{Renormalize}$ corresponds to applying $\mathbf{D}^{-1}$ operator in attention, as for the standard mechanism, though we noticed that disabling it does not necessarily hurt accuracy) to produce the best training configuration for the Performer. We note that the effective batch size slightly affects the rankings (as shown by the difference between 2x2 and 4x4 TPU runs) - we by default use the generalized ReLU kernel with other default hyperparameters shown in Appendix \ref{appendix:hyperparameters}, as we observed that they are empirically optimal for large batch size runs (i.e. 8x8 or 16x16 TPU's).
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/attention_comparisons_2x2.png}
+  \caption{To emphasize the highest accuracy runs but also show the NaN issues with certain kernels which caused runs to stop early, we set both x and y axes to be log-scale. We tested kernels defined by different functions $f$ (see: Sec. \ref{sec:gka}): sigmoid, exponential, ReLU, absolute, gelu, cosine (original softmax approximation), tanh, and identity. All training runs were performed on 2x2 TPU-v2's, 128 batch size per device.}
+  \label{fig:attention_comparisons_2x2}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/attention_comparisons_4x4.png}
+  \caption{We also performed a similar setup as Fig. \ref{fig:attention_comparisons_2x2} for 4x4 TPU-v2's.}
+  \label{fig:attention_comparisons_4x4}
+\end{figure}
+
+\subsection{Comparison with Linear Transformer}
+\label{appendix:linear_transformer}
+
+We use the attention implementation of the Linear Transformer from \citep{trans-rnns}, which mainly involves setting our feature map $\phi(x) = \text{elu}(x) + 1$, where $\text{elu}(x)$ is the shifted-eLU function from \citep{elu}. 
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/linear_transformer.png}
+  \caption{\textbf{Left:} In the unidirectional 36-ProGen setting, we ran 3 seeds of the Linear Transformer, and found that all 3 seeds produced exploding gradients very early on, stopping the training run. \textbf{Right:} The Linear Transformer in the bidirectional setting also produced an exploding gradient in the middle of training, near 125K steps. Exploding gradients can be evidenced by the sharp drop in train accuracy right before a NaN error.}
+  \label{fig:linear_transformer}
+\end{figure}
+
+For the sake of fairness and to prevent confounding results, while \citep{trans-rnns} also uses the GeLU nonlinearity for the MLPs in the Linear Transformer, we instead use the original ReLU nonlinearity. We also used the exact same training hyperparameters as Performer-ReLU on our exact ProGen setting from Fig. \ref{fig:big_benchmarking}. Ultimately, we empirically found that the Linear Transformer possessed numerical instability during training via unstable training curves, \textbf{ultimately stopping training by producing exploding gradients (NaNs)} (Fig. \ref{fig:linear_transformer}).
+
+\subsection{Long Range Arena}
+Performers are compared against many additional (scalable and not scalable) methods not included in our paper: \textit{Local Attention}, \textit{Sparse Attention}, \textit{Longformer}, \textit{Sinkhorn Transformer}, \textit{Synthesizer}, \textit{Big Bird} and the aforementioned \textit{Linear Transformer} on challenging long range context tasks in the Long Range Arena \citep{lra}, with Fig. \ref{fig:lra_figure} displaying the original paper's results. Performers obtain the largest LRA (Long Range Arena) score among all tested \textbf{scalable} Transformers methods (which we define by having speed of > 100 examples/sec). 
+
+Tasks used for comparison include: \textbf{(1)} a longer variation of the standard ListOps task proposed in \citep{listops}, \textbf{(2)} byte-level text classification using real-world data, \textbf{(3)} byte-level document retrieval, \textbf{(4)} image classification on sequences of pixels, and \textbf{(5)} Pathfinder task (long-range spatial dependency problem). In the Long Range Arena paper, the authors found that all models do not learn anything on Path-X task (denoted by FAIL), contrary to the Pathfinder task, which shows that increasing the sequence length can cause seriously difficulties for model training.
+\vspace{0.2cm}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.99\textwidth]{img/lra-all-3.pdf}
+  \vspace{0.15cm}
+  \caption{\textbf{Upper Table:} Results on Long-Range Arena benchmark. Best model is in boldface and second best is underlined. \textbf{Lower Table:} Benchmark results of all X-former models with a consistent batch size of 32 across all models. The authors report relative speed increase/decrease in comparison with the vanilla Transformer in brackets besides the steps per second. Memory usage refers to per device memory usage across each TPU device. Benchmarks are run on 4x4 TPU-v3 chips. \textbf{Right Fig:} Performance (y-axis), speed (x-axis), and memory footprint (size of the circles) of different models.} 
+  \label{fig:lra_figure}
+\end{figure}
+
+\newpage 
+
+\section{Computation costs - Extended results}
+
+In this subsection, we empirically measure computational costs in terms wall clock time on forward and backward passes for three scenarios in Fig. \ref{fig:appendix_runtime}:
+\begin{enumerate}
+\item Performer, with varying number of layers. We show that our method can scale up to (but not necessarily limited to) even 20 layers.
+\item Attention time complexities when comparing standard attention (from Transformer) and FAVOR (from Performer). Note that the maximum memory size here is not reflective of the maximum memory size in an actual model (shown below), as this benchmark requires computing explicit tensors (causing memory increases) in Jax, while a model does not.
+\item Time complexities when comparing the Transformer and Performer models. "X" (OPT) denotes the maximum possible speedup achievable, when attention simply returns the $\mathbf{V}$-vector, showing that the Performer is nearly optimal. We see that the maximum possible power of 2 length allowed on a V100 GPU (16GB) is $2^{15} = 32768$ using regular dimensions.
+\end{enumerate}
+
+Since some of the computational bottleneck in the Transformer may originate from the extra feed-forward layers \citep{reformer}, we also benchmark the ``Small" version, i.e. $(n_{heads}, n_{layers}, d_{ff}, d) = (1,6,64,64)$ as well, when the attention component is the dominant source of computation and memory. We remind the reader that the ``Regular" version consists of  $(n_{heads}, n_{layers}, d_{ff}, d) = (8,6,2048,512)$. 
+
+\vspace{0.1cm}
+\label{appendix:computation_costs_bidirectional}
+
+\begin{comment}
+\begin{figure}
+  \includegraphics[width=1.0\textwidth]{img/performer_layers_small.png}
+  \includegraphics[width=1.0\textwidth]{img/performer_layers_regular.png}
+  \caption{Varying layers when using Performer. We show that our method can scale up to (but not necessarily limited to) even 20 layers.}
+  \label{fig:appendix_layers}
+\end{figure}
+
+
+\begin{figure}
+  \includegraphics[width=1.0\textwidth]{img/attention_small.png}
+  \includegraphics[width=1.0\textwidth]{img/attention_regular.png}
+  \caption{Attention time complexities when comparing standard attention (from Transformer) and FAVOR (from Performer). Note that the maximum memory size here is not reflective of the maximum memory size in an actual model (shown below), as this benchmark requires computing explicit tensors (causing memory increases) in Jax, while a model does not.}
+  \label{fig:appendix_attention}
+\end{figure}
+
+
+\begin{figure}
+  \includegraphics[width=1.0\textwidth]{img/model_small_opt.png}
+  \includegraphics[width=1.0\textwidth]{img/model_regular_opt.png}
+  \caption{Time complexities when comparing the Transformer and Performer models. "X" (OPT) denotes the maximum possible speedup achievable, when attention simply returns the $\mathbf{V}$-vector, showing that the Performer is nearly optimal. We see that the maximum possible length allowed on a V100 GPU (16GB) is $2^{15} = 32768$ using regular dimensions.}
+  \label{fig:appendix_transformer}
+\end{figure}
+\end{comment}
+
+
+\begin{figure}[h]
+  \includegraphics[width=1.0\textwidth]{img/performer_layers_small.png}
+  \includegraphics[width=1.0\textwidth]{img/performer_layers_regular.png}
+  \includegraphics[width=1.0\textwidth]{img/attention_small.png}
+  \includegraphics[width=1.0\textwidth]{img/attention_regular.png}
+
+  \caption{Captions (1) and (2) for each 2x2 subfigure mentioned above.}
+  \label{fig:appendix_runtime}
+\end{figure}
+
+\clearpage
+\begin{figure}[ht]
+  \includegraphics[width=1.0\textwidth]{img/model_small_opt.png}
+  \includegraphics[width=1.0\textwidth]{img/model_regular_opt.png}
+
+  \caption{Caption (3) for this 2x2 subfigure mentioned above.}
+  \label{fig:appendix_runtime_2}
+\end{figure}
+
+
+
+
+
+\clearpage
+
+\section{Theoretical results}
+\label{appendix:theoretical_results}
+We provide here the proofs of all theoretical results presented in the paper.
+
+\subsection{Proof of Lemma \ref{pos_random_features_lemma}}
+
+\begin{proof}
+We first deduce that for any $\va, \vb \in \R^d$
+\begin{equation*}
+\mathrm{SM}(\mathbf{x},\mathbf{y})=
+    \exp (\vx^\top \vy) = \exp (- \| \vx \|^2 / 2) \cdot \exp (\| \vx + \vy \|^2 / 2) \cdot \exp (- \| \vy \|^2 / 2) .
+\end{equation*}
+Next, let $\vw \in \R^d$. We use the fact that
+\begin{equation*}
+    (2 \pi)^{-d/2} \int \exp (- \| \vw - \vc \|_2^2 / 2) d \vw = 1
+\end{equation*}
+for any $\vc \in \mathbb{R}^d$ and derive:
+\begin{align*}
+    \exp (\| \vx &+ \vy \|^2 / 2) = (2 \pi)^{- d / 2} \exp (\| \vx + \vy \|^2 / 2) \int  \exp (- \| \vw - (\vx + \vy) \|^2 / 2) d \vw \\
+    &= (2 \pi)^{- d / 2} \int  \exp (- \| \vw \|^2 / 2 + \vw^\top (\vx + \vy) - \| \vx + \vy \|^2 / 2 + \| \vx + \vy \|^2 / 2) d \vw \\
+    &= (2 \pi)^{- d / 2} \int  \exp (- \| \vw \|^2 / 2 + \vw^\top (\vx + \vy) ) d \vw \\
+    &= (2 \pi)^{- d / 2} \int  \exp (- \| \vw \|^2 / 2 ) \cdot \exp (\vw^\top \vx) \cdot \exp (\vw^\top \vy) d \vw \\
+    &= \E_{\omega \sim \mathcal{N} (\mathbf{0}_d, \mathbf{I}_{d})} [\exp (\omega^\top \vx) \cdot \exp (\omega^\top \vy)] .
+\end{align*}
+That completes the proof of the first part of the lemma. An identity involving hyperbolic cosine function is implied by the fact that for every $\mathbf{u} \in \mathbb{R}^{d}$ and $\omega \sim \mathcal{N}(0, \mathbf{I}_{d})$ the following is true:
+\begin{equation}
+\mathbb{E}[\exp(\omega^{\top}\mathbf{u})] = \sum_{i=0}^{\infty} \frac{\mathbb{E}[(\omega^{\top}\mathbf{u})^{2i}]}{(2i)!} = 
+\frac{1}{2} \sum_{i=0}^{\infty}
+\frac{\mathbb{E}[(\omega^{\top}\mathbf{u})^{2i}] + \mathbb{E}[(-\omega^{\top}\mathbf{u})^{2i}]}{(2i)!}.
+\end{equation}
+The cancellation of the odd moments $\mathbb{E}[(\omega^{\top}\mathbf{u})^{2i+1}]$ follows directly from the fact that $\omega$ is taken from the isotropic distribution (i.e. distribution with pdf function constant on each sphere).
+That completes the proof.
+\end{proof}
+
+\subsection{Proof of Lemma \ref{mse-lemma}}
+\begin{proof}
+Denote: $\mathbf{z}=\mathbf{x}+\mathbf{y}$ and $\Delta=\mathbf{x}-\mathbf{y}$.
+Note that by using standard trigonometric identities (and the fact that the variance of the sum of independent random variables is the sum of variances of those random variables), we can get the following for $\omega \sim \mathcal{N}(0, \mathbf{I}_{d})$:
+\begin{equation}
+\mathrm{MSE}(\widehat{\mathrm{SM}}^{\mathrm{trig}}_{m}(\mathbf{x}, \mathbf{y})) = \frac{1}{m}\exp(\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}) \mathrm{Var}(\cos(\omega^{\top}\Delta)).     
+\end{equation}
+Using the fact that (see: Lemma 1 in \citep{ort}; note that in that lemma they use notation: $z$ for what we denote as: $\|\Delta\|$):
+\begin{equation}
+\mathrm{Var}(\cos(\omega^{\top}\Delta))=\frac{1}{2}(1-\exp(-\|\Delta\|^{2}))^{2},    
+\end{equation}
+we obtain:
+\begin{align}
+\begin{split}
+\mathrm{MSE}(\widehat{\mathrm{SM}}^{\mathrm{trig}}_{m}(\mathbf{x}, \mathbf{y})) = \frac{1}{2m}\exp(\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2})(1-\exp(-\|\Delta\|^{2}))^{2} = \\
+\frac{1}{2m} \exp(\|\mathbf{z}\|^{2})\mathrm{SM}^{-2}(\mathbf{x},\mathbf{y})(1-\exp(-\|\Delta\|^{2}))^{2},
+\end{split}
+\end{align}
+which completes the first part of the proof.
+To obtain the formula for: $\mathrm{MSE}(\widehat{\mathrm{SM}}^{\mathrm{+}}_{m}(\mathbf{x}, \mathbf{y}))$
+notice first that:
+\begin{equation}
+\label{neat-fact}
+\mathbb{E}_{\omega \sim \mathcal{N}(0, \mathbf{I}_{d})}[\exp(\omega^{\top}\mathbf{z})] = \exp(\frac{\|\mathbf{z}\|^{2}}{2}).    
+\end{equation}
+The above immediately follows from the fact that positive random feature maps provide unbiased estimation of the softmax-kernel, thus the following is true:
+\begin{equation}
+\mathrm{SM}(\mathbf{x}, \mathbf{y}) = \exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})\mathbb{E}_{\omega \sim \mathcal{N}(0, \mathbf{I}_{d})}[\exp(\omega^{\top}\mathbf{z})].    
+\end{equation}
+
+Therefore we obtain:
+\begin{align}
+\begin{split}
+\mathrm{MSE}(\widehat{\mathrm{SM}}^{\mathrm{+}}_{m}(\mathbf{x}, \mathbf{y})) = \frac{1}{m} \exp(-(\|\mathbf{x}\|^{2} + \|\mathbf{y}\|^{2}))\mathrm{Var}(\exp(\omega^{\top}\mathbf{z})) = \\
+\frac{1}{m} \exp(-(\|\mathbf{x}\|^{2} + \|\mathbf{y}\|^{2}))
+\left(\mathbb{E}[\exp(2\omega^{\top}\mathbf{z})] - (\mathbb{E}[\exp(\omega^{\top}\mathbf{z})])^{2}\right) = \\ 
+\frac{1}{m} \exp(-(\|\mathbf{x}\|^{2} + \|\mathbf{y}\|^{2}))
+(\exp(2\|\mathbf{z}\|^{2}) - \exp(\|\mathbf{z}\|^{2})),
+\end{split}  
+\end{align}
+where the last equality follows from Equation \ref{neat-fact}.
+Therefore we have:
+\begin{align}
+\begin{split}
+\mathrm{MSE}(\widehat{\mathrm{SM}}^{\mathrm{+}}_{m}(\mathbf{x}, \mathbf{y})) = \frac{1}{m} \exp(-(\|\mathbf{x}\|^{2} + \|\mathbf{y}\|^{2})) \exp(\|\mathbf{z}\|^{2})(\exp(\|\mathbf{z}\|^{2}) - 1) = \\  
+\frac{1}{m}\exp(\|\mathbf{z}\|^{2})\mathrm{SM}^{2}(\mathbf{x}, \mathbf{y})(1-\exp(-\|\mathbf{z}\|^{2})).
+\end{split}
+\end{align}
+
+Finally, 
+\begin{align}
+\begin{split}
+\mathrm{MSE}(\widehat{\mathrm{SM}}_{m}^{\mathrm{hyp+}}(\mathbf{x}, \mathbf{y})) = \frac{1}{4m}\exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})^{2}(\mathrm{Var}(\exp(\omega^{\top}\mathbf{z}))
++\mathrm{Var}(\exp(-\omega^{\top}\mathbf{z})) + \\
+2\mathrm{Cov}(\exp(\omega^{\top}\mathbf{z})), \exp(-\omega^{\top}\mathbf{z})))) = 
+\frac{1}{4m}\exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})^{2}(2\mathrm{Var}(\exp(\omega^{\top}\mathbf{z}))+\\2\mathrm{Cov}(\exp(\omega^{\top}\mathbf{z})), \exp(-\omega^{\top}\mathbf{z}))))) = 
+\frac{1}{2m}\exp(-(\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}))\\
+(\mathrm{Var}(\exp(\omega^{\top}\mathbf{z}))+ 1 - (\mathbb{E}[\exp(\omega^{\top}\mathbf{z})])^{2}) = 
+\frac{1}{2m}\exp(-(\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}))\\
+(\exp(2\|\mathbf{z}\|^{2})-\exp(\|\mathbf{z}\|^{2})+1-\exp(\|\mathbf{z}\|^{2})) = 
+\frac{1}{2m}\exp(-(\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}))(\exp(\|\mathbf{z}\|^{2})-1)^{2} \\
+=\frac{1}{2}(1-\exp(-\|\mathbf{z}\|^{2}))\mathrm{MSE}(\widehat{\mathrm{SM}}^{\mathrm{+}}_{m}(\mathbf{x}, \mathbf{y})).
+\end{split}
+\end{align}
+In the chain of equalities above we used the fact that random variables $\mathrm{exp}(\omega^{\top}\mathbf{z})$ and 
+$\mathrm{exp}(-\omega^{\top}\mathbf{z})$ have the same distribution. This is true since $\omega$ and $-\omega$ have the same distribution ($\omega$ is Gaussian).
+That completes the proof.
+\end{proof}
+
+\subsection{Proof of Theorem \ref{reg-theorem}}
+\begin{proof}
+Let $\mathbf{x}, \mathbf{y} \in \mathbb{R}^{d}$ be respectively a query/key.
+Note that from the definition of $\mathrm{SMREG}(\mathbf{x}, \mathbf{y})$ we have
+for $\mathbf{z} = \mathbf{x}+\mathbf{y}$:
+\begin{equation}
+\mathrm{SMREG}(\mathbf{x}, \mathbf{y}) = 
+\exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})
+\sum_{k=0}^{\infty}\frac{1}{(2k)!}\|\mathbf{z}\|^{2k}d^{k}\mathbb{E}_{\omega \sim \mathcal{N}(0, \mathbf{I}_{d})}[(\frac{\omega}{\|\omega\|_{2}}\mathbf{e}_{1})^{2k}],
+\end{equation}
+where $\mathbf{e}_{1} \overset{\mathrm{def}}{=} (1,0,...,0)^{\top} \in \mathbb{R}^{d}$. To obtain the above we used the fact that $\mathcal{N}(0, \mathbf{I}_{d})$ is isotropic (that in particular implies zeroing of the even terms in the Taylor expansion).
+
+Let us denote: $A(k, d) \overset{\mathrm{def}}{=} \mathbb{E}_{\omega \sim \mathcal{N}(0, \mathbf{I}_{d})}[(\frac{\omega}{\|\omega\|_{2}}\mathbf{e}_{1})^{2k}]$. It turns out that:
+\begin{equation}
+A(2k, d) = \frac{(2k-1)!!}{(d+2k-2)(d+2k-4) \cdot ... \cdot d}.    
+\end{equation}
+The proof of that fact can be found in the supplement of \citep{geom}, yet we provide it below for completeness and the convenience of the Reader:
+\begin{lemma}
+Expression $A(2k, d)$ satisfies the following for $k \in \mathbb{N}$ :
+\begin{equation}
+A(2k, d) = \frac{(2k-1)!!}{(d+2k-2)(d+2k-4) \cdot ... \cdot d}.     
+\end{equation}
+\end{lemma}
+\begin{proof}
+Note first that for $d \geq 2$ the density function $p_{d}(\theta)$ of the angle between a vector $\mathbf{r} \in \mathbb{R}^{d}$ chosen uniformly at random from the unit sphere and $\mathbf{e}_{1}$ is given by the following formula:
+\begin{equation}
+p_{d}(\theta) = \frac{\sin^{d-2}(\theta)}{\int_{0}^{\pi}\sin^{d-2(\theta)}d\theta}.    
+\end{equation}
+Let us denote: $F(k, d) \overset{\mathrm{def}}{=} \int_{0}^{\pi}\cos^{k}(\theta)\sin^{d}(\theta)d\theta$.
+Using partial integration, we get:
+\begin{align}
+\begin{split}
+\int_{0}^{\pi}\cos^{k}(\theta)\sin^{d}(\theta)d\theta=
+\int_{0}^{\pi}\cos^{k-1}(\theta)\sin^{d}(\theta)(\sin(\theta))^{\prime}d\theta= \\
+\cos^{k-1}(\theta)\sin^{d+1}(\theta)|^{\pi}_{0} - 
+\int_{0}^{\pi}\sin(\theta)
+(
+(k-1)\cos^{k-2}(\theta)(-\sin(\theta))\sin^{d}(\theta)+\\
+d\cos^{k}(\theta)\sin^{d-1}(\theta)
+)d\theta.
+\end{split}
+\end{align}
+Thus we conclude that: $F(k, d) = \frac{k-1}{d+1}F(k-2, d+2)$.
+Therefore we have: 
+\begin{equation}
+F(2k, d) = \frac{(2k-1)!!}{(d+1)(d+3)\cdot...\cdot(d+2k-1)}
+\int_{0}^{\pi}\sin^{d+2k}(\theta) d\theta.
+\end{equation}
+We again conduct partial integration and get:
+\begin{align}
+\begin{split}
+\int_{0}^{\pi}\sin^{d}(\theta)d\theta = -\frac{1}{d}\sin^{d-1}(\theta)\cos(\theta)|^{\pi}_{0} + \\
+\frac{d-1}{d}\int_{0}^{\pi}\sin^{d-2}(\theta)d\theta = 
+\frac{d-1}{d}\int_{0}^{\pi}\sin^{d-2}(\theta)d\theta.
+\end{split}
+\end{align}
+Therefore we conclude that:
+\begin{align}
+\begin{split}
+A(2k, d) = \frac{1}{\frac{d-3}{d-2}\frac{d-5}{d-4}\cdot ...}
+\frac{(2k-1)!!}{(d-1)(d+1)\cdot...\cdot(d+2k-3)}
+\frac{d+2k-3}{d+2k-2}\frac{d+2k-5}{d+2k-4} \cdot ....
+= \\ \frac{(2k-1)!!}{(d+2k-2)(d+2k-4) \cdot ... \cdot d},
+\end{split}
+\end{align}
+which completes the proof.
+\end{proof}
+Applying the above lemma, we get:
+\begin{align}
+\begin{split}
+\mathrm{SMREG}(\mathbf{x}, \mathbf{y}) = 
+\exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})
+\sum_{k=0}^{\infty}\frac{1}{(2k)!}
+\|\mathbf{z}\|^{2k}d^{k}\frac{(2k-1)!!}{(d+2k-2)(d+2k-4)\cdot...\cdot d} \\ = 
+\exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})
+\sum_{k=0}^{\infty} \frac{w^{k}}{k!}f(k, d),
+\end{split}
+\end{align}
+where $w = \frac{\|\mathbf{z}\|^{2}}{2}$
+and $f(k, d) = \frac{d^{k}}{(d+2k-2)(d+2k-4)\cdot...\cdot d}$.
+
+Thus we obtain:
+\begin{equation}
+\frac{\mathrm{SMREG}(\mathbf{x}, \mathbf{y})}{\mathrm{SM}(\mathbf{x}, \mathbf{y})} = 
+e^{-w}\sum_{k=0}^{\infty} \frac{w^{k}}{k!}f(k, d).
+\end{equation}
+Note first that for $k \geq 1$ we have: $f(k, d) \leq 1$, thus:
+\begin{equation}
+\mathrm{SMREG}(\mathbf{x}, \mathbf{y}) \leq \mathrm{SM}(\mathbf{x}, \mathbf{y}).    
+\end{equation}
+We also have for $l=d^{\frac{1}{3}}$:
+\begin{align}
+\begin{split}
+\frac{\mathrm{SMREG}(\mathbf{x}, \mathbf{y})}{\mathrm{SM}(\mathbf{x}, \mathbf{y})} = 
+e^{-w}\sum_{k=0}^{l} \frac{w^{k}}{k!}f(k, d) +  
+e^{-w}\sum_{k=l+1}^{\infty} \frac{w^{k}}{k!}f(k, d) \geq \\
+f(l, d) e^{-w}\sum_{k=0}^{l} \frac{w^{k}}{k!} +
+e^{-w}\sum_{k=l+1}^{\infty} \frac{w^{k}}{k!}f(k, d) \geq
+f(l, d)(1 - e^{-w}\sum_{k=l+1}^{\infty} \frac{w^{k}}{k!}) = \\
+f(l, d)(1-\mathbb{P}[\mathrm{Po}(w) > l]),
+\end{split}
+\end{align}
+where $\mathrm{Po}(w)$ stands for the random variable of Poisson distribution with parameter $w$.
+Therefore we get for $t = \ln(\frac{l}{w})$:
+\begin{align}
+\begin{split}
+\frac{\mathrm{SMREG}(\mathbf{x}, \mathbf{y})}{\mathrm{SM}(\mathbf{x}, \mathbf{y})} \geq 
+(1-\frac{2l-2}{d})^{l}(1-\mathbb{P}[\mathrm{Po}(w) > l]) \geq \\
+\exp(l \ln(1-\frac{2l-2}{d}))(1-\mathbb{P}[t\mathrm{Po}(w) \geq tl]) = \\
+\exp\left(l \sum_{i=1}^{\infty}(-1)^{i}\frac{(\frac{2l-2}{d})^{i}}{i}\right)(1-\mathbb{P}[\exp(t\mathrm{Po}(w)-tl) \geq 1]) \geq \\
+\exp(-\frac{2}{d^{\frac{1}{3}}}+o(\frac{1}{d^{\frac{1}{3}}}))
+(1-\exp(-tl)\mathbb{E}[\exp(t\mathrm{Po}(w))])
+= \\
+\exp(-\frac{2}{d^{\frac{1}{3}}}+o(\frac{1}{d^{\frac{1}{3}}}))
+(1-\exp(-w-l(t-1))),
+\end{split} 
+\end{align}
+where the last equality is implied by the formula for the Laplace Transform for the Poisson random variable:
+\begin{equation}
+\mathbb{E}[\exp(t\mathrm{Po}(w))] = \exp(w(\exp(t)-1)).    
+\end{equation}
+Notice that: 
+$w = \frac{\|\mathbf{z}\|^{2}}{2} = \frac{\ln(\mathrm{SM}(\mathbf{x},\mathbf{x}))+\ln(\mathrm{SM}(\mathbf{y},\mathbf{y})) + 2\ln(\mathrm{SM}(\mathbf{x}, \mathbf{y}))}{2} \leq 2\ln(C)$.
+We conclude that:
+\begin{equation}
+\frac{\mathrm{SMREG}(\mathbf{x}, \mathbf{y})}{\mathrm{SM}(\mathbf{x}, \mathbf{y})} \geq  
+(1-\frac{2}{d^{\frac{1}{3}}}+o(\frac{1}{d^{\frac{1}{3}}}))(1-C^{-2}(\frac{d^{\frac{1}{3}}}{2e \cdot \ln(C)})^{-d^{\frac{1}{3}}})
+=1 - \frac{2}{d^{\frac{1}{3}}} + o(\frac{1}{d^{\frac{1}{3}}}).
+\end{equation}
+That completes the proof.
+\end{proof}
+
+\subsection{Proofs of Theorem \ref{var-theorem},Theorem \ref{ort-theorem} \& Beautiful Functions}
+
+We will provide here much more general theoretical results which will imply  Theorem \ref{ort-theorem} and Theorem \ref{var-theorem}. We need the following definition:
+
+\begin{definition}
+\label{beauty-definition}
+We say that function $F:\mathbb{R}^{n} \rightarrow \mathbb{R}$ is beautiful if $F$ can be expressed as:
+\begin{equation}
+F_{\Omega,g}(\mathbf{z}) = 
+\mathbb{E}_{\omega \sim \Omega}[g(\omega^{\top}\mathbf{z})], 
+\end{equation}
+for a probabilistic isotropic distribution $\Omega$, and where $g:\mathbb{R} \rightarrow \mathbb{R}$ is an entire function
+with non-negative power-series coefficients 
+(i.e. $g(x) = \sum_{i=0}^{\infty} a_{i}x^{i}$ for every $x \in \mathbb{R}$ and with $a_{i} \geq 0$ for $i=0,1,...$).
+In the formula above we assume that the expectation on the RHS exists.
+\end{definition}
+
+Interestingly, beautiful functions can be used to define softmax and consequently, Gaussian kernels (both standard and regularized), leading to our PRF mechanism presented in the main body of the paper, as we explain below.
+
+\begin{remark}
+\label{imp_remark}
+If one takes $\Omega = \mathcal{N}(0,\mathbf{I}_{d})$(note that $\mathcal{N}(0, \mathbf{I}_{d})$ is isotropic) and $g: x \rightarrow \exp(x)$ (such $g$ is clearly entire with nonnegative power-series coefficient) then the following is true for $\mathbf{z} = \mathbf{x}+\mathbf{y}$:
+\begin{equation}
+\label{beauty_to_sm}
+\mathrm{SM}(\mathbf{x}, \mathbf{y}) = \exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})F_{\Omega,g}(\mathbf{z}).   
+\end{equation}
+Similarly: $\mathrm{SMREG}(\mathbf{x}, \mathbf{y}) = \exp(-\frac{\|\mathbf{x}\|^{2}+\|\mathbf{y}\|^{2}}{2})F_{\Omega_{\mathrm{reg}},g}(\mathbf{z})$, where $\Omega_{\mathrm{reg}}$ stands for the distribution corresponding to Haar measure on the sphere of radius $\sqrt{d}$ (which is clearly isotropic). 
+Therefore general concentration results for Monte Carlo estimators of beautiful functions immediately imply corresponding results for the (standard and regularized) softmax (and thus also Gaussian) kernel.
+\end{remark}
+
+We will consider two estimators of the beautiful functions from Definition \ref{beauty-definition} that directly lead (through Remark \ref{imp_remark}) to: PRF-based approximation of the softmax-kernel and its enhanced version with orthogonal features. Standard Monte Carlo estimator samples independently $\omega_{1}^{\mathrm{iid}},...,\omega_{m}^{\mathrm{iid}} \overset{\mathrm{iid}}{\sim} \Omega$, where $m$ stands for the number of samples and then computes:
+\begin{equation}
+\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z}) \overset{\mathrm{def}}{=}
+\frac{1}{m} \sum_{i=1}^{m} g((\omega_{i}^{\mathrm{iid}})^{\top}\mathbf{z}).
+\end{equation}
+Orthogonal Monte Carlo estimator samples $\omega_{1}^{\mathrm{ort}},...,\omega_{m}^{\mathrm{ort}}$ ($m \leq d$) in such a way that marginally we have: $\omega_{i}^{\mathrm{ort}} \sim \Omega$, but $(\omega_{i}^{\mathrm{ort}})^{\top}\omega_{j}^{\mathrm{ort}}=0$ for $i \neq j$ (such an orthogonal ensemble can be always created if $\Omega$ is isotropic, as we already mentioned in the main body of the paper). We define:
+\begin{equation}
+\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z}) \overset{\mathrm{def}}{=}
+\frac{1}{m} \sum_{i=1}^{m} g((\omega_{i}^{\mathrm{ort}})^{\top}\mathbf{z}).
+\end{equation}
+
+\subsubsection{Orthogonality universally improves concentration}
+
+Denote by $M_{Z}(\theta) = \mathbb{E}[e^{\theta Z}]$ a moment generating function of the random variable $Z$.
+Note first that estimators of beautiful functions based on standard Monte Carlo procedure using independent vectors $\omega_{i}^{\mathrm{iid}}$ guarantee strong concentration bounds since 
+independent $\omega_{i}$s provide a way to obtain exponentially small upper bounds on failure probabilities through moment generating functions.
+We summarize this classic observation which is a standard application of Markov's Inequality below. \\
+
+\begin{lemma}
+\label{iid-lemma}
+Consider an estimator $\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})$ of the beautiful function $F$ evaluated at $\mathbf{z}$. Then the following holds for any $a > F(\mathbf{z})$, $\theta > 0$:
+\begin{equation}
+\mathbb{P}[\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z}) > a] \leq \exp(\theta m a) M_X (\theta)^m,
+\end{equation}
+where $X = g(\mathbf{w}^{\top}\mathbf{z})$, $\mathbf{w} \sim \mathcal{D}$.
+\end{lemma}
+
+The above result provides us with exponentially small (in Legendre Transform) upper bounds on tail probabilities for the standard estimator.
+Below we provide our two main theoretical results. 
+
+\begin{theorem}[orthogonality provides smaller tails]
+\label{general-ort-theorem}
+If $F_{\Omega, g}$ is a beautiful function then the following holds for $m \leq d$, $X$ as in Lemma \ref{iid-lemma} and any $a>F(\mathbf{z})$, $\theta > 0$: 
+\begin{equation}
+\mathbb{P}[\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) > a] \leq \exp(-\theta m a) \left( M_X (\theta)^m - \frac{\theta^4 m (m - 1)}{4 d^2 (d + 2)} a_0^{M - 2} a_1^2 \| \*z \|^4 (\mathbb{E} \| \omega \|^2)^2 \right).
+\end{equation}
+\end{theorem}
+
+This result shows that features obtained from the ensembles of pairwise orthogonal random vectors provide exponentially small bounds on tail probabilities and that these bounds are strictly better than for estimators using unstructured features. Furthermore, the result is \textbf{universal}, i.e. holds for any dimensionality $d$, not just asymptotically for $d$ large enough.
+
+We also obtain similar result regarding mean squared errors (MSEs) of the considered estimators:
+
+\begin{theorem}
+\label{general-var-theorem}
+If $F_{\Omega, g}$ is a beautiful function then the following holds for $m \leq d$: 
+\begin{equation}
+\mathrm{MSE}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) \leq 
+\mathrm{MSE}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})) - (1-\frac{1}{m})\frac{2}{d+2}\left(F_{\Omega,g}(\mathbf{z}) - a_0 \right)^2.
+\end{equation}
+\end{theorem}
+As before, an orthogonal estimator leads to better concentration results and as before, this is the case for any $d>0$, not only asymptotically for large enough $d$.
+
+\textbf{Note that from what we have said above, Theorem \ref{var-theorem} and Theorem \ref{ort-theorem} follow immediately from Theorem \ref{general-var-theorem} and Theorem \ref{general-ort-theorem} respectively.} 
+
+Thus in the remainder of this section we will prove Theorem \ref{general-var-theorem} and Theorem \ref{general-ort-theorem}.
+
+\subsubsection{Proof of Theorem \ref{general-ort-theorem}}
+
+\begin{proof}
+Note that by the analogous application of Markov's Inequality as in Lemma \ref{iid-lemma}, we get:
+\begin{align}
+\begin{split}
+\mathbb{P}[\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) > a] \leq   
+\frac{\mathbb{E}[e^{\theta (X_{1}^{\mathrm{ort}}+...+X_{m}^{\mathrm{ort}})}]}{e^{\theta ma}},
+\end{split}    
+\end{align}
+where we have:
+$X_{i}^{\mathrm{ort}} = g((\omega_{i}^{\mathrm{ort}})^{\top}\mathbf{z})$.
+We see that it suffices to show that for any $\theta > 0$ the following holds: 
+$\mathbb{E}[e^{\theta (X_{1}^{\mathrm{ort}}+...+X_{m}^{\mathrm{ort}})}] < \mathbb{E}[e^{\theta (X_{1}^{\mathrm{iid}}+...+X_{m}^{\mathrm{iid}})}]$.
+We have: 
+\begin{align}
+\begin{split}
+\mathbb{E}[e^{\theta (X_{1}^{\mathrm{ort}}+...+X_{m}^{\mathrm{ort}})}] = \mathbb{E}[\sum_{j=0}^{\infty} \frac{(\theta \sum_{i=1}^{m} X_{i}^{\mathrm{ort}})^{j}}{j!}] 
+= \mathbb{E}[\sum_{j=0}^{\infty}\frac{\theta^{j}}{j!}(\sum_{i=1}^{m}X^{\mathrm{ort}}_{i})^{j}]=\\
+\sum_{j=0}^{\infty}\frac{\theta^{j}}{j!} \mathbb{E}[(\sum_{i=1}^{m} X^{\mathrm{ort}}_{i})^{j}]=
+\sum_{j=0}^{\infty}\frac{\theta^{j}}{j!}
+\mathbb{E}[\sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} (X_{1}^{\mathrm{ort}})^{j_{1}} \cdot ... \cdot (X_{m}^{\mathrm{ort}})^{j_{m}}],
+\end{split}
+\end{align}
+where $\mathcal{S}_{j} = \{(j_{1},...,j_{m}) \in \mathbb{N} \times ...\times \mathbb{N}:j_{1},...,j_{m} \geq 0, j_{1}+...+j_{m}=j\}$.
+
+
+Thus we have:
+\begin{equation}
+\mathbb{E}[e^{\theta (X_{1}^{\mathrm{ort}}+...+X_{m}^{\mathrm{ort}})}] = \sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \mathbb{E}[(X_{1}^{\mathrm{ort}})^{j_{1}} \cdot ... \cdot (X_{m}^{\mathrm{ort}})^{j_{m}}].  
+\end{equation}
+
+Similarly, we get:
+\begin{equation}
+\mathbb{E}[e^{\theta (X_{1}^{\mathrm{iid}}+...+X_{m}^{\mathrm{iid}})}] = \sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \mathbb{E}[(X_{1}^{\mathrm{iid}})^{j_{1}} \cdot ... \cdot (X_{m}^{\mathrm{iid}})^{j_{m}}].    
+\end{equation}
+
+Therefore we get:
+\begin{align}
+\begin{split}
+\Delta = \mathbb{E}[e^{\theta (X_{1}^{\mathrm{iid}}+...+X_{m}^{\mathrm{iid}})}] - \mathbb{E}[e^{\theta (X_{1}^{\mathrm{ort}}+...+X_{m}^{\mathrm{ort}})}] \\
+=
+\sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \left(\mathbb{E}[(X_{1}^{\mathrm{iid}})^{j_{1}} \cdot ... \cdot (X_{m}^{\mathrm{iid}})^{j_{m}}] - \mathbb{E}[(X_{1}^{\mathrm{ort}})^{j_{1}} \cdot ... \cdot (X_{m}^{\mathrm{ort}})^{j_{m}}]\right)
+\end{split}
+\end{align}
+
+
+
+Note first that using the fact that $f$ is entire, we can rewrite each $X_{i}^{\mathrm{ort}}$ as:
+\begin{equation}
+\label{x_ort_formula}
+X_{i}^{\mathrm{ort}} = \sum_{s=0}^{\infty} a_{s}((\omega_{i}^{\mathrm{ort}})^{\top}\mathbf{z})^{s},
+\end{equation}
+
+where $f(x) = \sum_{s=0}^{\infty} a_{s}x^{s}$
+and $a_{0},a_{1},... \geq 0$.
+Similarly,
+\begin{equation}
+\label{x_iid_formula}
+X_{i}^{\mathrm{iid}} = \sum_{s=0}^{\infty} a_{s}((\omega_{i}^{\mathrm{iid}})^{\top}\mathbf{z})^{s}.
+\end{equation}
+
+By plugging in the above formulae for $X_{i}^{\mathrm{ort}}$ and $X_{i}^{\mathrm{iid}}$ int the formula for $\Delta$ and expanding power-expressions, we obtain:
+\begin{align}
+\begin{split}
+\Delta = \sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \sum_{(d_{1},...,d_{m}) \in \mathcal{D}(j_{1},...,j_{m})} \widehat{c}_{j_1, \dots, j_m}(d_{1},\dots,d_{m}) \widehat{\Delta}(d_{1},...,d_{m}),
+\end{split}    
+\end{align}
+for some ordered subsets of indices (with potentially repeating entries) $\mathcal{D}(j_{1},...,j_{m})$ and some nonnegative $\widehat{c}_{j_1, \dots, j_m}(d_{1},\dots,d_{m})$ (exact formula for those can be given but we do not need it to complete the proof and since it is technical, it would unnecessarily complicate the proof so we skip it)
+and $\widehat{\Delta}(d_{1},...,d_{m})$ defined as:
+\begin{align}
+\begin{split}
+\label{imp-ineq}
+\widehat{\Delta}(d_{1},...,d_{m}) = \mathbb{E}[((\omega_{1}^{\mathrm{iid}})^{\top}\mathbf{z})^{d_{1}} \cdot ... \cdot ((\omega_{m}^{\mathrm{iid}})^{\top}\mathbf{z})^{d_{m}}] - 
+\mathbb{E}[((\omega_{1}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{1}} \cdot ... \cdot ((\omega_{m}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{m}}].
+\end{split}
+\end{align}
+
+Our next goal is to re-write the formula for $\widehat{\Delta}(d_{1},...,d_{m})$. Denote:
+\begin{equation}
+Y = ((\omega_{1}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{1}} \cdot ... \cdot ((\omega_{m}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{m}}.    
+\end{equation}
+
+Observe that $Y$ has the same distribution as $Y^{\prime}$ defined as:
+
+\begin{equation}
+Y^{\prime} = (\mathbf{e}_{1}^{\top}\frac{\mathbf{g}}{\|\mathbf{g}\|_{2}}\|\mathbf{z}\|_{2})^{d_{1}} \cdot ... \cdot (\mathbf{e}_{m}^{\top}\frac{\mathbf{g}}{\|\mathbf{g}\|_{2}}\|\mathbf{z}\|_{2})^{d_{m}} \cdot
+(\|\omega_{1}^{\mathrm{ort}}\|_{2})^{d_{1}} \cdot ... \cdot
+(\|\omega_{m}^{\mathrm{ort}}\|_{2})^{d_{m}},
+\end{equation}
+
+where $\mathbf{g}$ is a Gaussian vector taken from the $\mathcal{N}(0,\mathbf{I}_{d})$ distribution, independently from: $\|\omega_{1}^{\mathrm{ort}}\|_{2},...,\|\omega_{m}^{\mathrm{ort}}\|_{2}$. 
+
+This comes from the fact that for a fixed $\mathbf{z}$ one can think about the set:
+$\frac{\omega_{1}^{\mathrm{ort}}}{\|\omega_{1}^{\mathrm{ort}}\|_{2}},...,\frac{\omega_{m}^{\mathrm{ort}}}{\|\omega_{m}^{\mathrm{ort}}\|_{2}}$ as a random rotation of the system of $m$ canonical basis vectors: $\mathbf{e}_{1},...,\mathbf{e}_{m}$.
+Thus instead of applying a random rotation to: $\mathbf{e}_{1},...,\mathbf{e}_{m}$, one can equivalently randomly rotate vector $\mathbf{z}$. Randomly rotated vector $\mathbf{z}$ has the same distribution as: $\frac{\mathbf{g}}{\|\mathbf{g}\|_{2}}\|\mathbf{z}\|_{2}$. 
+
+
+
+Now note that lengths of vectors $\omega_{1}^{\mathrm{ort}},...,\omega_{m}^{\mathrm{ort}}$ are chosen independently.
+
+Therefore we obtain:
+\begin{align}
+\begin{split}
+\mathbb{E}[((\omega_{1}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{1}} \cdot ... \cdot ((\omega_{m}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{m}}] = \\ \mathbb{E}[(\|\omega_{1}^{\mathrm{ort}}\|_{2})^{d_{1}}] \cdot ... \cdot \mathbb{E}[(\|\omega_{m}^{\mathrm{ort}}\|_{2})^{d_{m}}] \cdot \mathbb{E}[(\mathbf{e}_{1}^{\top}\mathbf{v})^{d_{1}} \cdot ... \cdot (\mathbf{e}_{m}^{\top}\mathbf{v})^{d_{m}}]
+\|\mathbf{z}\|_{2}^{d_{1}+...+d_{m}},
+\end{split}
+\end{align}
+where $\mathbf{v} \sim \frac{\mathbf{g}}{\|\mathbf{g}\|_{2}}$.
+
+Denote $\mathbf{g}=(g_{1},...,g_{d})^{\top}$.
+Thus we obtain:
+\begin{align}
+\begin{split}
+\label{lhs}
+\mathbb{E}[((\omega_{1}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{1}} \cdot ... \cdot ((\omega_{m}^{\mathrm{ort}})^{\top}\mathbf{z})^{d_{m}}] = \\ \mathbb{E}[(\|\omega_{1}^{\mathrm{ort}}\|_{2})^{d_{1}}] \cdot ... \cdot \mathbb{E}[(\|\omega_{m}^{\mathrm{ort}}\|_{2})^{d_{m}}] \cdot 
+\|\mathbf{z}\|_{2}^{d_{1}+...+d_{m}} \mathbb{E}[\frac{g_{1}^{d_{1} \cdot ... \cdot}g_{m}^{d_{m}}}{\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{1}+...+d_{m}}}]
+\end{split}
+\end{align}
+
+Now let us focus on the second expression from the formula on $\widehat{\Delta}(d_{1},...,d_{m})$. We have:
+\begin{align}
+\begin{split}
+\label{rhs}
+\mathbb{E}[((\omega_{1}^{\mathrm{iid}})^{\top}\mathbf{z})^{d_{1}} \cdot ... \cdot ((\omega_{m}^{\mathrm{iid}})^{\top}\mathbf{z})^{d_{m}}] = \prod_{i=1}^{m} \mathbb{E}[((\omega_{i}^{\mathrm{iid}})^{\top}\mathbf{z})^{d_{i}}]   
+= \\ \mathbb{E}[(\|\omega_{1}^{\mathrm{iid}}\|_{2})^{d_{1}}] \cdot ... \cdot \mathbb{E}[(\|\omega_{m}^{\mathrm{iid}}\|_{2})^{d_{m}}] \cdot \|\mathbf{z}\|_{2}^{d_{1}+...+d_{m}} \cdot \prod_{i=1}^{m} \mathbb{E}[\frac{g_{i}^{d_{i}}}{\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{i}}}],
+\end{split}
+\end{align}
+
+where the first equality comes from the fact that
+different $\omega_{i}^{\mathrm{iid}}$s are independent and the second one is implied by the analogous analysis to the one conducted above.
+
+We will need the following lemma:
+
+\begin{lemma}
+\label{useful-lemma}
+For every $s \in \mathbb{N}_{+}$ such that $s \leq n$ and every $k_{1},...,k_{s} \in \mathbb{N}_{+}$ the following holds:
+\begin{equation}
+\mathbb{E}[\frac{g_{1}^{k_{1}} \cdot ... \cdot g_{s}^{k_{s}}}{\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{k_{1}+...+k_{s}}}] = \frac{\prod_{i=1}^{s}\mathbb{E}[g_{i}^{k_{i}}]}{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{k_{1}+...+k_{s}}]}.    
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+Take $\mathbf{r} = \frac{\mathbf{g}}{\|\mathbf{g}\|_{2}}\|\tilde{\mathbf{g}}\|_{2}$, where $\tilde{\mathbf{g}}$ is an independent copy of $\mathbf{g}$. Note that $\mathbf{r} \sim \mathbf{g}$.
+We have:
+\begin{align}
+\begin{split}
+\mathbb{E}[r_{1}^{k_{1}}] \cdot ... \cdot     
+\mathbb{E}[r_{s}^{k_{s}}] = 
+\mathbb{E}[r_{1}^{k_{1}} \cdot ... \cdot r_{s}^{k_{s}}]
+= \mathbb{E}[\frac{g_{1}^{k_{1}} \cdot ... \cdot g_{s}^{k_{s}}}{\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{k_{1}+...+k_{s}}}]
+\cdot \mathbb{E}[\|\tilde{\mathbf{g}}\|_{2}^{k_{1}+...+k_{s}}],
+\end{split}    
+\end{align}
+where the first equality comes from the independence of different elements of $\mathbf{z}=(z_{1},...,z_{n})^{\top}$
+and the second equality is implied by the fact that $\tilde{\mathbf{g}}$ is independent from $\mathbf{g}$.
+
+Therefore we have:
+\begin{equation}
+ \mathbb{E}[\frac{g_{1}^{k_{1}} \cdot ... \cdot g_{s}^{k_{s}}}{\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{k_{1}+...+k_{s}}}] = \frac{\mathbb{E}[r_{1}^{k_{1}}] \cdot ... \cdot     \mathbb{E}[r_{s}^{k_{s}}]}{\mathbb{E}[\|\tilde{\mathbf{g}}\|_{2}^{k_{1}+...+k_{s}}]}.   
+\end{equation}
+That completes the proof since $\mathbf{z} \sim \mathbf{g}$ and $\tilde{\mathbf{g}} \sim \mathbf{g}$.
+\end{proof}
+
+Note that by Lemma \ref{useful-lemma}, we can rewrite the right expression from the formula on 
+$\widehat{\Delta}(d_1,..., d_m)$
+as: 
+\begin{equation}
+\mathbb{E}[(\|\omega_{1}^{\mathrm{ort}}\|_{2})^{d_{1}}] \cdot ... \cdot \mathbb{E}[(\|\omega_{m}^{\mathrm{ort}}\|_{2})^{d_{m}}] \cdot \\
+\|\mathbf{z}\|_{2}^{d_{1}+...+d_{m}}\frac{\prod_{i=1}^{m}\mathbb{E}[g_{i}^{d_{i}}]}{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{1}+...+d_{m}}]}.
+\end{equation}
+The left expression from the formula on 
+$\widehat{\Delta}(d_1,..., d_m)$ can be rewritten as:
+\begin{align}
+\begin{split}
+L(d_{1},...,d_{m}) = \mathbb{E}[(\|\omega_{1}^{\mathrm{iid}}\|_{2})^{d_{1}}] \cdot ... \cdot \mathbb{E}[(\|\omega_{m}^{\mathrm{iid}}\|_{2})^{d_{m}}] \cdot 
+\|\mathbf{z}\|_{2}^{d_{1}+...+d_{m}} \\
+\frac{\prod_{i=1}^{m}\mathbb{E}[g_{i}^{d_{i}}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{1}}] \cdot ...\cdot \mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{m}}]}.
+\end{split}
+\end{align}
+
+Since marginal distributions of $\omega_{i}^{\mathrm{ort}}$ and $\omega_{i}^{\mathrm{iid}}$ are the same, we can rewrite $\widehat{\Delta}(d_{1},...,d_{n})$ as:
+\begin{equation}
+\widehat{\Delta}(d_{1},...,d_{m})=
+L(d_{1},...,d_{m})(1 - \tau(d_{1},...,d_{m})),
+\end{equation}
+where $\tau(d_{1},...,d_{m})$ is defined as:
+\begin{equation}
+\tau(d_{1},...,d_{m}) = \frac{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{1}}] \cdot ...\cdot \mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{m}}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{d_{1}+...+d_{m}}]}    \label{eq:taudef} 
+\end{equation}
+We need now few observations regarding $\widehat{\Delta}(d_{1},...,d_{m})$.
+Note firsr that since odd moments of the Gaussian scalar distribution $\mathcal{N}(0, 1)$ are zero, $\widehat{\Delta}(d_{1},...,d_{m})$ is zero if at least of of $d_{i}$ is odd. Furthermore, $\widehat{\Delta(d_{1},...,d_{m})}$ is trivially zero if all but at most one $d_{i}$ are zero.
+
+With our new notation, $\Delta$ can be rewritten as:
+\begin{gather*}
+\Delta = \sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \sum_{(d_{1},...,d_{m}) \in \mathcal{D}(j_{1},...,j_{m})} \widehat{c}_{j_1, \dots, j_m}(d_{1},\dots,d_{m}) \\
+\times L(d_{1},...,d_{m})(1-\tau(d_{1},...,d_{m})),
+\end{gather*}
+
+Note also that we have:
+\begin{gather*}
+e^{\theta(X_{1}^{\mathrm{iid}}+...+X_{m}^{\mathrm{iid}})} = \sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},...,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \sum_{(d_{1},...,d_{m}) \in \mathcal{D}(j_{1},...,j_{m})} \widehat{c}_{j_1, \dots, j_m}(d_{1},\dots,d_{m}) \\
+\times  L(d_{1},...,d_{m}).
+\end{gather*}
+
+Therefore (see: our observations on $\widehat{\Delta}(d_{1},...,d_{m})$) to complete the proof it suffices to show that: $\tau(d_{1},...,d_{m}) \leq \frac{d}{d+2}$ if at least two: $d_{i}$, $d_{j}$ for $i \neq j$ are nonzero and all $d_{i}$ are even.
+\begin{lemma}
+\label{tau-lemma}
+The following holds if for some $i \neq j$ we have: $d_{i}, d_{j} > 0$ and all $d_{i}$ are even:
+\begin{equation}
+\tau(d_{1},...,d_{m}) \leq \frac{d}{d+2}.    
+\end{equation}
+\end{lemma}
+\begin{proof}
+Note that $\tau(d_{1},...,d_{m})$ can be rewritten as:
+\begin{equation}
+\label{multi-d}
+\tau(d_{1},...,d_{m}) = \frac{\prod_{i=1}^{m} \mu_{d}(d_{i})}{\mu_{d}(\sum_{i=1}^{m} d_i)},    
+\end{equation}
+where $\mu_{d}(j)$ stands for the $j^{th}$ moment of the $\chi$-distribution with $d$ degrees of freedom.
+Note that $\mu_{d}(j) = 2^{\frac{j}{2}}
+\frac{\Gamma(\frac{d+j}{2})}{\Gamma(\frac{d}{2})}$,
+where $\Gamma$ is the so-called \textit{Gamma-function}.
+
+Using the fact that: $\Gamma(n) = (n-1)!$ and $\Gamma(n+\frac{1}{2})=\frac{(2n-1)!!}{2^{n}}\sqrt{\pi}$ for $n \in \mathbb{N}_{+}$, it is easy to see 
+that for a fixed $d$, the RHS of the Equality \ref{multi-d} is maximized when $d_{i}=d_{j}=2$ and $d_{k}=0$ for some $i \neq j$ and $k \notin \{i,j\}$. Furthermore, straightforward calculations show that in that case the value of the RHS from Equality \ref{multi-d} is $\frac{d}{d+2}$. That completes the proof of the Lemma.
+\end{proof}
+
+
+By $\mathcal{D}' (j_1, \dots, j_m)$ denote a subset of $\mathcal{D} (j_1, \dots, j_m)$ formed by only keeping $d_1, \dots, d_m$ such that for some $i \neq j$, $d_i, d_j > 0$ and all $d_i$ are even. As we have shown above, $\widehat{\Delta}(d_{1},\dots,d_{m}) = 0$ when $(d_1, \dots, d_m) \notin \mathcal{D}' (j_1, \dots, j_m)$. Otherwise,
+\begin{equation*}
+    \widehat{\Delta}(d_{1},\dots,d_{m}) \geq \frac{2}{d + 2} \Lambda (d_{1},\dots,d_{m}) \geq 0 .
+\end{equation*}
+Hence, since all terms in the sum
+\begin{gather}
+\Delta = \sum_{j=0}^{\infty} \frac{\theta^{j}}{j!} \sum_{(j_{1},\dots,j_{m}) \in \mathcal{S}_{j}} \binom{j}{j_{1},\dots,j_{m}} \sum_{(d_{1},\dots,d_{m}) \in \mathcal{D}(j_{1},\dots,j_{m})} \widehat{c}_{j_1, \dots, j_m}(d_{1},\dots,d_{m}) \\
+\times \widehat{\Delta}(d_{1},\dots,d_{m}). \label{eq:doublesum}
+\end{gather}
+are nonnegative, we'll get a lower bound on $\Delta$ by only taking a subset of these terms. For this subset, we take $j = 4$, a subset of $\mathcal{S}_4$ with only two nonzero $j_{k_1} = j_{k_2} = 2$ for some $k_1 \neq k_2$ (there are $\binom{m}{2}$ combinations of such $j_1, \dots, j_m$). Then, we take only those $d_1, \dots, d_m$ from $\mathcal{D} (j_1, \dots, j_m)$ which correspond to $s = 1$ in (\ref{x_iid_formula}) for $k_1, k_2$ and $s = 0$ for all other $k$'s. Hence, $d_{k_1} = d_{k_2} = 2$ and all other $d_k$'s are zero and the corresponding weight from the second sum in (\ref{eq:doublesum}) would be $a_1^2 a_0^{m - 2}$. For $d_1, \dots, d_m$ in such set, we'll have $\tau (d_1, \dots, d_m) \leq \frac{d}{d + 2}$ by Lemma \ref{tau-lemma} and, hence, $\widehat{\Delta}(d_{1},\dots,d_{m}) \geq \frac{2}{d + 2} \Lambda(d_{1},\dots,d_{m})$. As the result, we get the following lower bound on $\Delta$:
+\begin{align*}
+    \Delta &\geq \frac{2 \theta^4}{ 4! (d + 2)}  \binom{m}{2} \binom{4}{2, 2, 0, \dots, 0} a_1^2 a_0^{m - 2} \Lambda (2, 2, 0, \dots, 0) \\
+    &= \frac{\theta^4 m (m - 1)}{4 (d + 2)} a_1^2 a_0^{m - 2} \Lambda(2, 2, 0, \dots, 0) \\
+    &= \frac{\theta^4 m (m - 1)}{4 (d + 2)} a_1^2 a_0^{m - 2} \| \*z \|^4 \left( \mathbb{E} \| \bs{\omega} \|^2 \right)^2 \frac{(\mathbb{E} (\*g_1^2))^2}{(\mathbb{E} \| \*g \|^2)^2} .
+\end{align*}
+Since $\*g \sim \mathcal{N} (0, 1)^d$, $\mathbb{E} \*g_1^2 = 1$ and $\mathbb{E} \| \*g \|^2 = d \mathbb{E} \*g_1^2 = d$. This results in
+\begin{equation}
+    \Delta \geq \frac{\theta^4 m (m - 1)}{4 d^2 (d + 2)} a_1^2 a_0^{m - 2} \| \*z \|^4 \left( \mathbb{E} \| \omega \|^2 \right)^2 \label{eq:deltalb}
+\end{equation}
+which concludes the proof.
+
+
+\end{proof}
+\subsubsection{Proof of Theorem \ref{general-var-theorem}}
+\begin{proof}
+We will use the notation from the proof of Theorem \ref{general-ort-theorem}.
+Since both estimators: $\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})$ and
+$\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})$ are unbiased, we have:
+$\mathrm{MSE}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) = \mathrm{Var}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z}))$ and
+$\mathrm{MSE}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})) = \mathrm{Var}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z}))$.
+We have:
+\begin{align}
+\begin{split}
+\mathrm{Var}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})) = 
+\mathbb{E}[(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})-\mathbb{E}[\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})])^{2}] =
+\mathbb{E}[(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z}))^{2}]-
+F^{2}(\mathbf{z}).
+\end{split}
+\end{align}
+
+Similarly,
+\begin{align}
+\begin{split}
+\mathrm{Var}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) = 
+\mathbb{E}[(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z}))^{2}]-
+F^{2}(\mathbf{z}).
+\end{split}
+\end{align}
+
+We have: 
+\begin{align}
+\begin{split}
+\mathbb{E}[(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z}))^{2}]
+= \frac{1}{m^{2}}\sum_{i=1}^{m}\mathbb{E}[(X_{i}^{\mathrm{iid}})^{2}]
++\frac{1}{m^{2}}\sum_{i \neq j} \mathbb{E}[X^{\mathrm{iid}}_{i}X^{\mathrm{iid}}_{j}].
+\end{split}
+\end{align}
+
+Similarly, we get:
+\begin{align}
+\begin{split}
+\mathbb{E}[(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z}))^{2}]
+= \frac{1}{m^{2}}\sum_{i=1}^{m}\mathbb{E}[(X_{i}^{\mathrm{ort}})^{2}]
++\frac{1}{m^{2}}\sum_{i \neq j} \mathbb{E}[X^{\mathrm{ort}}_{i}X^{\mathrm{ort}}_{j}].
+\end{split}
+\end{align}
+
+Therefore, since marginal distributions of $X_{i}^{\mathrm{iid}}$ and $X_{i}^{\mathrm{ort}}$ are the same,  we have:
+\begin{align}
+\begin{split}
+\label{mse-diff}
+\mathrm{MSE}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})) - \mathrm{MSE}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) = 
+{m \choose 2} \cdot 2 \cdot \frac{1}{m^{2}}
+(\mathbb{E}[X^{\mathrm{iid}}_{1}X^{\mathrm{iid}}_{2}]-
+\mathbb{E}[X^{\mathrm{ort}}_{1}X^{\mathrm{ort}}_{2}])\\
+=(1-\frac{1}{m})(\mathbb{E}[X^{\mathrm{iid}}_{1}X^{\mathrm{iid}}_{2}]-
+\mathbb{E}[X^{\mathrm{ort}}_{1}X^{\mathrm{ort}}_{2}])
+\end{split}
+\end{align}
+Plugging in the formula for $X^{\mathrm{ort}}_{i}$ and $X^{\mathrm{iid}}_{i}$ from Equation \ref{x_ort_formula} and Equation \ref{x_iid_formula}, and using our analysis from the proof of Theorem \ref{ort-theorem} we obtain:
+\begin{align}
+\begin{split}
+ \mathrm{MSE}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})) - \mathrm{MSE}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) =   
+ (1-\frac{1}{m})\sum_{t,u=0}^{\infty}a_{t}a_{u}\|\mathbf{z}\|_{2}^{t+u}
+ \mathbb{E}[\|\omega\|_{2}^{t}] \mathbb{E}[\|\omega\|_{2}^{u}] \cdot \\
+\frac{\mathbb{E}[r^{t}]\mathbb{E}[r^{u}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{t}]
+\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{u}]}
+(1-\tau(t, u)). \label{eq:vardec}
+\end{split} 
+\end{align}
+for $\omega \sim \Omega$ and $r \sim \mathcal{N}(0, 1)$.
+
+Based on the definition of $\tau$ (\ref{eq:taudef}), if $t = 0$ or $u = 0$, $\tau (t, u) = 1$ and the whole corresponding term in the sum (\ref{eq:vardec}) is zero. Also, if $t$ is odd, $\mathbb{E}(r^t) = 0$ and, again, the corresponding term in the sum (\ref{eq:vardec}) is zero. Same holds for $u$ from (\ref{eq:vardec}). Based on the analysis from Theorem \ref{general-ort-theorem}'s proof and $F_{\Omega,g}(\mathbf{z})$'s definition we have:
+\begin{equation*}
+    F_{\Omega,g}(\mathbf{z})  = \sum_{t=0}^{\infty}a_{t}\|\mathbf{z}\|_{2}^{t}
+ \mathbb{E}[\|\omega\|_{2}^{t}] \cdot 
+\frac{\mathbb{E}[r^{t}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{t}]} = \sum_{t=0}^{\infty}a_{2 t}\|\mathbf{z}\|_{2}^{2 t}
+ \mathbb{E}[\|\omega\|_{2}^{2 t}] \cdot 
+\frac{\mathbb{E}[r^{2 t}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{2 t}]}
+\end{equation*}
+where in the second transition we use the fact that $\mathbb{E}[r^{t}] = 0$ for odd $t$.
+
+
+Hence, we can rewrite (\ref{eq:vardec}) by excluding terms which are definitely zero and using Lemma \ref{tau-lemma}:
+\begin{align}
+\begin{split}
+ \mathrm{MSE}(\widehat{F}^{\mathrm{iid}}_{m}(\mathbf{z})) - \mathrm{MSE}(\widehat{F}^{\mathrm{ort}}_{m}(\mathbf{z})) \geq (1-\frac{1}{m})\frac{2}{d+2}\sum_{t,u=1}^{\infty}a_{2 t}a_{2 u}\|\mathbf{z}\|_{2}^{2 t+2u}
+ \mathbb{E}[\|\omega\|_{2}^{2 t}] \mathbb{E}[\|\omega\|_{2}^{2 u}] \cdot \\
+\frac{\mathbb{E}[r^{2 t}]\mathbb{E}[r^{2 u}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{2 t}]
+\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{2 u}]}\\
+= (1-\frac{1}{m})\frac{2}{d+2}   
+\left(\sum_{t=1}^{\infty}a_{2 t}\|\mathbf{z}\|_{2}^{2 t}
+ \mathbb{E}[\|\omega\|_{2}^{2 t}] \cdot 
+\frac{\mathbb{E}[r^{2 t}]}
+{\mathbb{E}[\sqrt{g_{1}^{2}+...+g_{d}^{2}}^{2 t}]}\right)^{2} \\
+= (1-\frac{1}{m})\frac{2}{d+2}\left(F_{\Omega,g}(\mathbf{z}) - a_0\right)^2.
+\end{split}    
+\end{align}
+That completes the proof.
+\end{proof}
+
+\subsection{Proof of Theorem \ref{thm:uniform}}
+
+We showed in the main body of the paper that in contrast to other methods approximating the attention matrix $\mathbf{A}$, our algorithm provides strong concentration guarantees. This is the case also for trigonometric random features, yet, as discussed in the main body of the paper, due to attention renormalization and higher variance of the estimation of small entries of the attention matrix, trigonometric mechanism is sub-optimal.
+We show here that $m_{\mathrm{opt}}$, the optimal number of random projections for the trigonometric orthogonal mechanism for accurate estimation of the attention matrix does not depend on $L$ but only on $d$. In fact, we prove that if we take $m_{\mathrm{opt}} = \Theta(d\log(d))$, then with $O(L d^2\log(d))$-time, we can approximate $\mathbf{A}$ up to any precision, regardless of the number of tokens $L$. In order to provide those guarantees, we leverage recent research on the theory of negative dependence for ORFs \citep{Lin2020DemystifyingOM}.
+
+We prove the more general version of Theorem \ref{thm:uniform} from the main body of the paper: 
+
+\begin{theorem}[Uniform convergence for the trigonometric mechanism]
+\label{uniform_convergence}
+Define entries of the attention matrix $\mathbf{A}$ as follows: $\mathbf{A}_{i,j}=g(\mathbf{q}_{i}^{\top})\mathrm{K}(\frac{1}{d^{\frac{1}{4}}}\mathbf{q}_{i}^{\top},\frac{1}{d^{\frac{1}{4}}}\mathbf{k}_{j}^{\top})h(\mathbf{k}_{j}^{\top})$ for some
+$g,h:\mathbb{R}^{d} \rightarrow \mathbb{R}$ and where $\mathrm{K}$ is a radial basis function (RBF) kernel \citep{geom} with corresponding spectral distribution $\Omega$ (e.g. Gaussian kernel for which $\Omega=\mathcal{N}(0,\mathbf{I}_{d})$). Assume that the rows of matrices $\mathbf{Q}$ and $\mathbf{K}$ are taken from a ball $B(R)$ of radius $R$, centered at $0$ (i.e. norms of queries and keys are upper-bounded by $R$). 
+Define $l=Rd^{-\frac{1}{4}}$ and take $g^{*} = \max_{\mathbf{x} \in B(l)}|g(\mathbf{x})|$ and
+$h^{*} = \max_{\mathbf{x} \in B(l)}|h(\mathbf{x})|$.
+Then for any $\epsilon>0$, $\delta=\frac{\epsilon}{g^{*}h^{*}}$
+and the number of random projections $m = \Omega(\frac{d}{\delta^{2}}\log(\frac{4\sigma R}{\delta d^{\frac{1}{4}}}))$ for $\sigma=\mathbb{E}_{\omega \sim \Omega}[\omega^{\top}\omega]$ the following holds:
+$
+\|\widehat{\mathbf{A}}-\mathbf{A}\|_{\infty} \leq \epsilon     
+$
+with any constant probability,
+where $\widehat{\mathbf{A}}$ approximates generalized attention matrix via orthogonal trigonometric random features.
+\end{theorem}
+
+The result holds in particular for regular softmax-attention for which $\mathrm{K}$ is a Gaussian kernel and $g(\mathbf{x}) = h(\mathbf{x}) =  \exp(\frac{\|\mathbf{x}\|^{2}}{2})$. In that case $m_{\mathrm{opt}}=\Omega(\frac{d}{\delta^{2}}\log(\frac{4d^{\frac{3}{4}} R}{\delta}))$ since $\sigma = d$.
+
+\begin{proof}
+Let $\mathbf{D}_{\mathbf{Q}}$ be a diagonal matrix with entries of the form: $g(\mathbf{q}_{i}^{\top})$ and let $\mathbf{D}_{\mathbf{K}}$ be a diagonal matrix with entries of the form: $h(\mathbf{k}_{i}^{\top})$. Denote 
+$\mathbf{B}=[\mathrm{K}(\frac{1}{d^{\frac{1}{4}}}\mathbf{q}_{i}^{\top},\frac{1}{d^{\frac{1}{4}}}\mathbf{k}_{j}^{\top})]_{i,j} \in \mathbb{R}^{L \times L}$. Denote by $\widehat{\mathbf{A}}$ and approximation of the attention matrix obtained from trigonometric orthogonal random features and by $\widehat{\mathbf{B}}$ an approximation of matrix $\mathbf{B}$ that those random features provide.
+We rely on Theorem 3 from \citep{Lin2020DemystifyingOM}.
+Note that we can apply it in our case, since for RBF kernels the corresponding functions $f_{i}$ satisfy $f_{1}(x) = \sin(x)$, $f_{2}(x) = \cos(x)$ (thus in particular are bounded). Also, it is not hard to observe (see for instance analysis in  Claim 1 from \citep{fourierapprox}) that we can take: $L_{f}=1$ (for $L_{f}$ as in Theorem 3 from \citep{Lin2020DemystifyingOM}). 
+Using Theorem 3 from \citep{Lin2020DemystifyingOM}, we conclude that:
+\begin{equation}
+\|\widehat{\mathbf{B}}-\mathbf{B}\|_{\infty} \leq \delta    
+\end{equation}
+with any constant probability as long as
+$m = \Omega(\frac{d}{\delta^{2}})\log(\frac{\sigma \cdot  \mathrm{diam}(\mathcal{M})}{\delta})$,
+where $\sigma=\mathbb{E}[\omega^{\top}\omega]$ and $\mathcal{M}$ is the diameter of the smallest ball $\mathcal{M}$ containing all vectors of the form $\mathbf{z} = \frac{\mathbf{Q}_{i}}{d^{\frac{1}{4}}}-\frac{\mathbf{K}_{j}}{d^{\frac{1}{4}}}$. 
+Since $\|\mathbf{Q}_{i}\|_{2}, \|\mathbf{K}_{j}\|_{2} \leq R$, we conclude that $\|\mathbf{z}\|_{2} \leq \frac{2R}{d^{\frac{1}{4}}}$ and thus one can take $\mathrm{diam}(\mathcal{M})=\frac{4R}{d^{\frac{1}{4}}}$.
+We have:
+\begin{equation}
+\|\widehat{\mathbf{A}}-\mathbf{A}\|_{\infty} = \|\mathbf{D}_{\mathbf{Q}}(\widehat{\mathbf{B}}-\mathbf{B})\mathbf{D}_{\mathbf{K}}\|_{\infty} \leq 
+\|\mathbf{D}_{\mathbf{Q}}\|_{\infty}
+\|\widehat{\mathbf{B}}-\mathbf{B}\|_{\infty}
+\|\mathbf{D}_{\mathbf{K}}\|_{\infty} \leq \delta g^{*}h^{*}
+\end{equation}
+Taking $\delta = \frac{\epsilon}{g^{*}h^{*}}$ completes the proof.
+\end{proof}
+
+\subsection{Discussion of Theorem \ref{thm:uniform}} \label{sec:ball}
+
+As a consequence of Theorem~\ref{thm:uniform}, the number $m$ of random projections required to approximate the attention matrix within $\epsilon$ error is a function of data dimensionality $d$, the parameter $\epsilon$ and the radius $R$ of the ball within which the queries and keys live:
+\[ m = \Psi(\epsilon, d, R). \]
+The dependence on $d$ and $\epsilon$ is fairly easy to understand: with a larger dimensionality $d$ we need more random projeections (on the order of magnitude $d\log(d)$) to get an approximation within $\epsilon$ error. The dependence on $R$ means that the length of queries and keys cannot grow at a fixed $m$ if we want to retain the quality of the approximation.
+In particular, this means that FAVOR cannot approximate hard attention on sequences of unlimited length with a fixed $m$. When the sequence length increases, even the standard attention requires longer and longer vectors to make the softmax concentrated enough to pick single elements. Nevertheless, as seen in our experiments, this limitation does not manifest itself in practice at the lengths we experimented with.

@@ -1,0 +1,160 @@
+\section{Record-replay}\label{sec:recordreplay}
+This section presents a record-replay technique for SCOOP programs. The technique is an adaptation of Choi and
+Srinivasan's~\cite{choi-srinivasan:1998:replay_for_concurrent_programs} approach, developed for
+Java multithreading. Their notion
+of logical thread schedules helps keep the size of the log file
+small. \sectionreference{sec:logical-schedules} presents the SCOOP-adaptation of logical
+thread schedules, called logical processor schedules. \sectionreference{sec:recording logical processor schedules} and \sectionreference{sec:replaying logical processor schedules} show how the SCOOP runtime records and replays them.
+
+\subsection{Logical processor schedules}\label{sec:logical-schedules}
+As demonstrated in \sectionreference{sec:related-work}, a number of effective approaches to the problem of deterministic replay of multithreaded programs exist. For executions on uniprocessor systems, the approach of Russinovich and Cogswell~\cite{russinovich-cogswell:1996:replay_for_concurrent_programs} has been shown to outperform techniques that try to record how threads interact. They propose to log thread scheduler information and to enforce the same schedule when a run is replayed.
+This approach also works well in our case. To minimize the overhead from capturing
+\emph{physical processor schedules} -- the equivalent of physical thread schedules in the case of
+SCOOP -- we adapt the notion of \emph{logical thread schedules} from~\cite{choi-srinivasan:1998:replay_for_concurrent_programs}. This section describes this adaptation.
+
+Consider a share market application with investors, markets, issuers, and shares. The markets and the investors are handled by different processors. Listing~\ref{lst:investor class} shows the class for the investors. Each investor has a feature to buy a share. To execute it, the investor must wait for the lock on the market and for the precondition to be satisfied.
+\begin{lstlisting}[caption=Investor class, label=lst:investor class, language=SCOOP]
+class INVESTOR feature
+	id: INTEGER
+	
+	buy (market: separate MARKET; issuer_id: INTEGER)
+			-- Buy a share of the issuer on the market.
+		require
+			market.can_buy (id, issuer_id)
+		do
+			market.buy (id, issuer_id)
+		end
+end
+\end{lstlisting}
+The following feature initiates a transaction that involves two investors and one market with shares from two issuers:
+\begin{lstlisting}[language=SCOOP]
+do_transaction (first_investor, second_investor: separate INVESTOR; base_issuer_id: INTEGER)
+		-- Make the two investors buy two shares from two consecutive issuers on the market.
+	local
+		next_issuer_id: INTEGER	
+	do
+		first_investor.buy (market, base_issuer_id)
+		next_issuer_id := base_issuer_id + 1
+		second_investor.buy (market, next_issuer_id)
+	end
+\end{lstlisting}
+
+\figurereference{fig:market example possible physical processor schedules} depicts a number of possible physical processor schedules for this example. The difference between schedules $a$ and $b$ is that in $a$, the application sets the local variable \lstinline[language=SCOOP]!next_issuer_id! after the first investor buys its share from the market, whereas in $b$ the variable is set before this event. In schedule $c$, the second investor buys its share before the first investor does.
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.95 \textwidth]{figures/market_example_possible_physical_processor_schedules}
+  \caption{Three possible physical processor schedules for the market example}
+  \label{fig:market example possible physical processor schedules}
+\end{figure}
+Schedules $a$ and $b$ give rise to the same behavior on the market, whereas schedule $c$ causes the transaction to be reversed: the second investors gets to buy its share first. The reason is that changes in the update of local variables do not influence shared objects, whereas the order of \emph{critical events} does. In SCOOP, the only critical events occur in the synchronization step, i.e., when the scheduler approves a locking request. We regard two physical processor schedules as equivalent if they have the same order of locking requests. A \emph{logical processor schedule} denotes an equivalence class of physical processor schedules, i.e., physical processor schedules where the scheduler approves the locking requests in the same order. \sectionreference{sec:recording logical processor schedules} describes the implementation of logical processor schedules.
+
+\subsection{Recording logical processor schedules}\label{sec:recording logical processor schedules}
+A logical processor schedule consists of one interval list per processor. An \emph{interval list} is a sequence of intervals that keeps track of a processor's approved locking requests. The scheduler uses a \emph{global counter} with value $counter_{g}$ to number the approved locking requests. An \emph{interval} $[l, u]$ is defined by a lower global counter value $l$ and an upper global counter value $u$, such that the locking requests with numbers in $[l, u]$ belong to the same processor and no locking request with a number in an adjacent interval belongs to the same processor.
+
+Once the recorder is activated, the scheduler executes \algorithmreference{alg:record}. To detect when a new interval should start, the scheduler maintains for each processor a \emph{local counter} with value $counter_{l}$ and a \emph{local counter base} with value $base_{l}$. The local counter base of a processor $p$ stores the value of the global counter at the point where the scheduler started recording an interval for $p$. The local counter counts $p$'s locking requests that got approved from the moment where the scheduler started recording the interval for $p$. Processor $p$'s current interval is then given as $[base_{l}[p] + 1, base_{l}[p] + counter_{l}[p]]$.
+
+\begin{algorithm}[!ht]
+\eventhandler{\textlangle Initialize\textrangle}{\tcp*[h]{The program starts.}}{
+	$counter_{g}$ := $0$; \tcp*[h]{The global counter.}\\
+	\ForAll{$p \in processors$}{
+		$counter_{l}[p]$ := $\undefinedvalue$; \tcp*[h]{The local counters.}\\
+		$base_{l}[p]$ := $\undefinedvalue$; \tcp*[h]{The local counter bases.}\\
+		$intervals[p]$ := $()$; \tcp*[h]{The interval lists.}\\
+	}
+}
+
+\eventhandler{\textlangle Approved \textbar \thinspace $p$\textrangle}{\tcp*[h]{The scheduler approved $p$'s request.}}{
+	\uIf{$counter_{l}[p] = \undefinedvalue$}{
+			$base_{l}[p]$ := $counter_{g}$\;
+			$counter_{l}[p]$ := $1$\;
+			$counter_{g}$ := $counter_{g} + 1$\;
+		}
+	\uElseIf{$counter_{l}[p] \neq \undefinedvalue \wedge counter_{g} = base_{l}[p] + counter_{l}[p]$}{
+			$counter_{l}[p]$ := $counter_{l}[p] + 1$\;
+			$counter_{g}$ := $counter_{g} + 1$\;
+		}
+	\ElseIf{$counter_{l}[p] \neq \undefinedvalue \wedge counter_{g} \neq base_{l}[p] + counter_{l}[p]$}{
+			$intervals[p]$ := $intervals[p] \bullet [base_{l}[p] + 1, base_{l}[p] + counter_{l}[p]]$\;
+			$base_{l}[p]$ := $counter_{g}$\;
+			$counter_{l}[p]$ := $1$\;
+			$counter_{g}$ := $counter_{g} + 1$\;
+		}	
+}
+
+\eventhandler{\textlangle Terminate\textrangle}{\tcp*[h]{The program terminates.}}{
+	\ForAll{$p \in processors$}{
+		\If{$counter_{l}[p] \neq \undefinedvalue$}{
+			$intervals[p]$ := $intervals[p] \bullet [base_{l}[p] + 1, base_{l}[p] + counter_{l}[p]]$\;
+			write ($p$, $intervals[p]$)\;
+		}
+	}
+}
+\caption{Record\label{alg:record}}
+\end{algorithm}
+
+Whenever the scheduler approves a locking request $r$ of a processor $p$, it goes through the following checks. If $p$'s local counter is undefined, then $p$ does not have an interval yet, and thus $r$ belongs to a new interval for $p$. Hence, the scheduler starts recording a new interval for $p$. 
+
+If $p$'s local counter is defined and $counter_{g} = base_{l}[p] + counter_{l}[p]$, then the scheduler is currently recording an interval for $p$, and $r$ belongs to this interval. This can be seen as follows. If the scheduler would have approved locking requests of any other processor $q$ since it started recording $p$'s interval, then the scheduler would have incremented the global counter, but not $p$'s local counter. Thus the equation would not hold. Hence, the scheduler did not approve locking request of other processors and thus $r$ belongs to $p$'s current interval. 
+
+If $p$'s local counter is defined and $counter_{global} \neq base_{local} + counter_{local}$, then the scheduler is currently recording an interval for $p$, and $r$ belongs to a new interval. This can be seen as follows. If the scheduler would not have approved locking requests of any other processor $q$, since it started recording $p$'s current interval, then only $p$ would have incremented the global counter and its local counter. Thus the equation would hold. Hence, the scheduler must have approved one or more locking requests of other processors and thus $r$ belongs a new interval on $p$. In this case, the scheduler finishes $p$'s current interval and adds $r$ to a new interval. 
+
+At the end of the program execution, the scheduler checks for each processor whether there is any pending interval, in which case it adds the interval to the respective interval list.
+
+Consider again the market example. Assume the investor class has an additional feature \lstinline[language=SCOOP]!buy_alternative!, which allows an investor to buy a share if possible; if it is not possible, a backup share is bought. For this reason, each investor has a backup market and an identifier of a backup issuer.
+\begin{lstlisting}[language=SCOOP]
+buy_alternative (market: separate MARKET; issuer_id: INTEGER)
+		-- Try to buy a share of the issuer on the market.
+		-- If this fails, buy some backup share on the backup market.
+	do
+		if market.can_buy (id, issuer_id) then
+			market.buy (id, issuer_id)
+		else
+			buy (backup_market, backup_issuer_id)
+		end
+	end
+\end{lstlisting}
+Consider the setup in \figurereference{fig:market example object structure}.
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=\textwidth]{figures/market_example_object_structure}
+  \caption{Object structure for the market example}
+  \label{fig:market example object structure}
+\end{figure}
+Assume that a new transaction asks each investor to buy at least one share of the software company by calling \lstinline[language=SCOOP]!buy! and then \lstinline[language=SCOOP]!buy_alternative!. The schedule in \figurereference{fig:market example physical processor schedule} leads to a deadlock because the two investors hold a lock on one market while trying to lock the other market; however, not all possible schedules exhibit the problem.
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\textwidth]{figures/market_example_physical_processor_schedule}
+  \caption{A physical processor schedule of the market example in detail. The numbers next to the scheduler lifeline indicate the approved locking requests.}
+  \label{fig:market example physical processor schedule}
+  \vspace*{1cm}
+\end{figure}
+The proposed technique produces the following logical processor schedule: application: $[1, 1]$, first investor: $[2, 2] \bullet [6, 6]$, second investor: $[4, 4] \bullet [8, 8]$, Zurich market: $[3, 3] \bullet [7, 7]$, and New York market: $[5, 5] \bullet [9, 9]$. \sectionreference{sec:replaying logical processor schedules} shows how to replay this logical processor schedule to reproduce the deadlock.
+
+
+\subsection{Replaying logical processor schedules}\label{sec:replaying logical processor schedules}
+To replay a logical processor schedule, the scheduler once again uses a global counter $counter_{g}$; this time the global counter represents the number of the locking request that the scheduler wants to approve next. To replay, the scheduler executes \algorithmreference{alg:replay}.
+
+\begin{algorithm}[!ht]
+\eventhandler{\textlangle Initialize\textrangle}{\tcp*[h]{The program starts.}}{
+	$counter_{g}$ := $1$; \tcp*[h]{The global counter.}\\
+	\ForAll{$p \in processors$}{
+		$intervals[p]$ := read ($p$); \tcp*[h]{The interval lists.}\\
+	}
+}
+
+\eventhandler{\textlangle Check \textbar \thinspace $p$\textrangle}{\tcp*[h]{The scheduler checks on $p$'s request.}}{
+	\uIf{$\exists [l, u] \in intervals[p] \colon l \leq counter_{g} \leq u$}{
+		$counter_{g}$ := $counter_{g} + 1$\;
+		\triggerinstruction{\textlangle Ok \textrangle}; \tcp*[h]{The request is next.}\\
+	}
+	\Else{
+		\triggerinstruction{\textlangle NotOk \textrangle}; \tcp*[h]{The request is not next.}\\
+	}
+}
+\caption{Replay\label{alg:replay}}
+\end{algorithm}
+
+To begin, the scheduler gets ready to approve the first locking request.
+Whenever the scheduler is about to approve a locking request $l$ of a processor $p$, the scheduler first checks whether $l$ is next. To do so, the scheduler consults $p$'s interval list and checks whether it contains an interval with $counter_{g}$. If the interval list contains such an interval, then the scheduler approves the locking request and gets ready to approve the next locking request, i.e., it increments the global counter. If the interval list does not contain such an interval then the scheduler tries another locking request.
+
+To replay the logical processor schedule from \sectionreference{sec:recording logical processor schedules}, the scheduler initializes the global counter to $1$. As soon as the application sends a locking request, the scheduler approves and increments the global counter to $2$. The first two calls on the investors cause them to each send a locking request. The scheduler lets the first investor proceed and sets the global counter to $3$. The second investor must wait because its interval list does not contain the current global counter value. The first investor calls the Zurich market, whose locking request the scheduler approves right away. Now the global counter is at $4$, and the scheduler lets the second investor and the New York market proceed. As a consequence, the global counter reaches $6$. In the meantime, the application performed two more calls to the investors. In sequence, the scheduler approves the locking requests of the first investor, the Zurich market, the second investor, and the New York market. The deadlock is guaranteed.

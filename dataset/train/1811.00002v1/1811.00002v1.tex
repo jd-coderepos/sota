@@ -1,0 +1,69 @@
+WaveGlow is a generative model that generates audio by sampling from a distribution. To use a neural network as a generative model, we take samples from a simple distribution, in our case, a zero mean spherical Gaussian with the same number of dimensions as our desired output, and put those samples through a series of layers that transforms the simple distribution to one which has the desired distribution. In this case, we model the distribution of audio samples conditioned on a mel-spectrogram. 
+
+\begin{gather}
+\boldsymbol{z} \sim \mathcal{N}(\boldsymbol{z};0,\boldsymbol{I}) \\
+\boldsymbol{x} = \boldsymbol{f}_0 \circ \boldsymbol{f}_1 \circ \ldots \boldsymbol{f}_k(\boldsymbol{z})
+\end{gather}
+
+We would like to train this model by directly minimizing the negative log-likelihood of the data. If we use an arbitrary neural network this is intractable.  Flow-based networks~\cite{dinh2014nice,dinh2016density,kingma2018glow} solve this problem by ensuring the neural network mapping is invertible.  By restricting each layer to be bijective, the likelihood can be calculated directly using a change of variables:
+
+\begin{gather}
+\log{p_\theta(\boldsymbol{x})} = \log{p_\theta(\boldsymbol{z})} + \sum_{i=1}^{k} \log
+|\det(\boldsymbol{J}(\boldsymbol{f}_i^{-1}(\boldsymbol{x})))| \\
+\boldsymbol{z} = \boldsymbol{f}_k^{-1} \circ \boldsymbol{f}_{k-1}^{-1} \circ \ldots \boldsymbol{f}_0^{-1}(\boldsymbol{x})
+\end{gather}
+
+In our case, the first term is the log-likelihood of the spherical Gaussian.  This term penalizes the $l_2$ norm of the transformed sample.  The second term arises from the change of variables, and the $\boldsymbol{J}$ is the Jacobian. The log-determinant of the Jacobian rewards any layer for increasing the volume of the space during the forward pass.  This term also keeps a layer from just multiplying the $\boldsymbol{x}$ terms by zero to optimize the $l_2$ norm.  The sequence of transformations is also referred to as a normalizing flow~\cite{rezende2015variational}.
+
+Our model is most similar to the recent Glow work~\cite{kingma2018glow}, and is depicted in figure~\ref{fig:network_diagram}. For the forward pass through the network, we take groups of 8 audio samples as vectors, which we call the "squeeze" operation, as in~\cite{kingma2018glow}. We then process these vectors through several "steps of flow". A step of flow here consists of an invertible $1\times 1$ convolution followed by an affine coupling layer, described below.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.35\textwidth]{figure-1.pdf}
+    \caption{WaveGlow network}
+    \label{fig:network_diagram}
+\end{figure}
+\subsection{Affine Coupling Layer}
+Invertible neural networks are typically constructed using coupling layers~\cite{dinh2014nice, dinh2016density, kingma2018glow}.  In our case, we use an affine coupling layer~\cite{dinh2016density}.  Half of the channels serve as inputs, which then produce multiplicative and additive terms that are used to scale and translate the remaining channels:  
+
+\begin{gather}
+\boldsymbol{x}_a, \boldsymbol{x}_b =  split(\boldsymbol{x}) \\
+(\log \boldsymbol{s}, \boldsymbol{t}) = WN(\boldsymbol{x}_a, \mathit{mel\textnormal{-}spectrogram}) \\
+\boldsymbol{x}_b\prime = \boldsymbol{s} \odot \boldsymbol{x}_b + \boldsymbol{t} \\
+\boldsymbol{f}_{coupling}^{-1}(\boldsymbol{x}) = concat(\boldsymbol{x}_a, \boldsymbol{x}_b\prime)
+\end{gather}
+
+Here $WN()$ can be any transformation.  The coupling layer preserves invertibility for the overall network, even though $WN()$ does not need to be invertible. This follows because the channels used as the inputs to $WN()$, in this case $\boldsymbol{x}_a$, are passed through unchanged to the output of the layer. Accordingly, when inverting the network, we can compute $\boldsymbol{s}$ and $\boldsymbol{t}$ from the output $\boldsymbol{x}_a$, and then invert $\boldsymbol{x}_b\prime$ to compute $\boldsymbol{x}_b$, by simply recomputing $WN(\boldsymbol{x}_a, \mathit{mel\textnormal{-}spectrogram})$. In our case, $WN()$ uses layers of dilated convolutions with gated-$\tanh$ nonlinearities, as well as residual connections and skip connections.  This $WN$ architecture is similar to WaveNet~\cite{van2016wavenet} and Parallel WaveNet~\cite{van2018parallel}, but our convolutions have 3 taps and are not causal.  The affine coupling layer is also where we include the mel-spectrogram in order to condition the generated result on the input.  The upsampled mel-spectrograms are added before the gated-$\tanh$ nonlinearites of each layer as in WaveNet~\cite{van2016wavenet}.
+
+With an affine coupling layer, only the $\boldsymbol{s}$ term changes the volume of the mapping and adds a change of variables term to the loss. This term also serves to penalize the model for non-invertible affine mappings.
+\begin{equation}
+\log |\det(\boldsymbol{J}(\boldsymbol{f}_{coupling}^{-1}(\boldsymbol{x})))| = \log |\boldsymbol{s}|
+\end{equation}
+
+\subsection{1x1 Invertible Convolution}
+In the affine coupling layer, channels in the same half never directly modify one another.  Without mixing information across channels, this would be a severe restriction. Following Glow~\cite{kingma2018glow}, we mix information across channels by adding an invertible 1x1 convolution layer before each affine coupling layer.  The $W$ weights of these convolutions are initialized to be orthonormal and hence invertible. The log-determinant of the Jacobian of this transformation joins the loss function due to the change of variables, and also serves to keep these convolutions invertible as the network is trained.
+
+\begin{gather}
+    \boldsymbol{f}_{conv}^{-1} = \boldsymbol{W} \boldsymbol{x} \\
+    \log |\det(\boldsymbol{J}(\boldsymbol{f}_{conv}^{-1}(\boldsymbol{x})))| = \log |\det{\boldsymbol{W}}|
+\end{gather}
+
+After adding all the terms from the coupling layers, the final likelihood becomes:
+\begin{equation}
+\begin{split}
+    \log{p_\theta(\boldsymbol{x})} =& -\frac{\boldsymbol{z}(\boldsymbol{x})^{T}\boldsymbol{z}(\boldsymbol{x})}{2\sigma^2} \\
+    &+ \sum_{j=0}^{\#coupling}\log \boldsymbol{s}_j(\boldsymbol{x},\mathit{mel\textnormal{-}spectrogram}) \\
+    &+ \sum_{k=0}^{\#conv} \log \det |\boldsymbol{W}_k|
+\end{split}
+\end{equation}
+
+Where the first term comes from the log-likelihood of a spherical Gaussian.  The $\sigma^2$ term is the assumed variance of the Gaussian distribution, and the remaining terms account for the change of variables.
+
+\subsection{Early outputs}
+Rather than having all channels go through all the layers, we found it useful to output 2 of the channels to the loss function after every 4 coupling layers.  After going through all the layers of the network, the final vectors are concatenated with all of the previously output channels to make the final $\boldsymbol{z}$.  Outputting some dimensions early makes it easier for the network to add information at multiple time scales, and helps gradients propagate to earlier layers, much like skip connections.  This approach is similar to the multi-scale architecture used in~\cite{kingma2018glow,dinh2016density}, though we do not add additional squeeze operations, so vectors get shorter throughout the network.  
+
+\subsection{Inference}
+Once the network is trained, doing inference is simply a matter of randomly sampling $\boldsymbol{z}$ values from a Gaussian and running them through the network. As suggested in~\cite{kingma2018glow}, and earlier work on likelihood-based generative models~\cite{parmar2018image}, we found that sampling $\boldsymbol{z}$s from a Gaussian with a lower standard deviation from that assumed during training resulted in slightxly quality higher audio. During training we used $\sigma=\sqrt{0.5}$, and during inference we sampled $\boldsymbol{z}$s from a Gaussian with standard deviation 0.6.  Inverting the 1x1 convolutions is just a matter of inverting the weight matrices.  The inverse is guaranteed by the loss.  The mel-spectrograms are included at each of the coupling layers as before, but now the affine transforms are inverted, and these inverses are also guaranteed by the loss.
+\begin{equation}
+\boldsymbol{x}_a = \frac{\boldsymbol{x}_a\prime - \boldsymbol{t}}{\boldsymbol{s}}
+\end{equation}
