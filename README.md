@@ -48,7 +48,9 @@ originally downloaded in LaTeX format from arXiv.
 Of the 5207 papers in the train set, only 625 papers reported their code links as a mention within the paper's text. Similarly, of the 2242 papers in the test set, only 215 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
 -->
 
-There are 9,352+100 total papers in the train+validation sets,respectively. 
+There are 9,352+100 total papers in the train+validation sets,respectively. Furthermore, note each `annotations.json` file either contains (task, dataset, metric, score) annotations for all papers reporting model scores. Otherwise `annotations.json` contains the value "unanswerable." This is for those papers that do not report any model scores and therefore leaderboards cannot be populated from them. Models trained on our dataset should, in a first step, distinguish papers with leaderboards and those without, then for the former set of papers, extract their leaderboard tuples as annotations. The train dataset has 5,274 papers with leaderboard annotations and the remaining 4,078 papers without leaderboard annotations and therefore annotated as "unasnwerable." The validation dataset has 50 papers with leaderboard and 50 papers without leaderboard annotations.
+
+Below are provided some detailed statistics relevant to the leaderboard annotations in our dataset offering a glimpse into the corpus. 
 
 ### Dataset statistics
 
@@ -60,7 +62,7 @@ There are 9,352+100 total papers in the train+validation sets,respectively.
 | Unique (Task, Dataset, Metric) triples | 8,723 |
 | Avg. (Task, Dataset, Metric) triples occurrences per paper | 5.47 |
 
-Ten most common Tasks, Datasets, and Metrics in the **Train set**:
+Ten most common Tasks, Datasets, and Metrics in the **Train+Validation set**:
 <table>
   <tr>
     <td> <b>#</b> </td>
