@@ -16,11 +16,15 @@ The repository is organized as follows:
 ```
 [dataset]/	
      |--- [train]/
-	     |--- [article-counter-folder]/
-		 |    |--- [article-id].tei.xml
-		 |    |--- annotations.txt
-		 |    |--- code-link.txt	  # optional	
+	     |--- [article-id-folder]/
+		 |    |--- [article-id].tex
+		 |    |--- annotations.json	
 	     |___ ...
+     |--- [validation]/
+	     |--- [article-id-folder]/
+		 |    |--- [article-id].tex
+		 |    |--- annotations.json	
+	     |___ ...		 
 ```
 <!--     |--- [test1-few-shot]/		# hidden
 	     |--- [article-counter-folder]/
@@ -35,29 +39,26 @@ The repository is organized as follows:
 			 |    |--- code-link.txt		   # optional	 
 			 |___ ...-->
 
-The `code-link.txt` file is optional and if a code link was found in the paper, this annotation file is created; if not, it is not part of the folder. The SOTA shared task does not use the code link annotations in its evaluations.
-
 The dataset dump originates from [paperswithcode.com](https://paperswithcode.com/).
 
 Each folder in the respective dump corresponds to a scholarly article
-originally downloaded in `pdf` format from arXiv, whose contents were then
-scrapped as `txt` data encoded in the [TEI](https://en.wikipedia.org/wiki/Text_Encoding_Initiative) XML format.
+originally downloaded in LaTeX format from arXiv.
 
 <!--
 Of the 5207 papers in the train set, only 625 papers reported their code links as a mention within the paper's text. Similarly, of the 2242 papers in the test set, only 215 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
 -->
 
-There are 5,207 papers with leaderboard annotations in the train set.
+There are 9,352+100 total papers in the train+validation sets,respectively. 
 
 ### Dataset statistics
 
-| Parameter | Train (counts) |
+| Parameter | train+validation (counts) |
 | --- | --- |
-| Unique Tasks | 825 |
-| Unique Datasets | 2,979 |
-| Unique Metrics | 1,434 |
-| Unique (Task, Dataset, Metric) triples | 6,805 |
-| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.59 |
+| Unique Tasks | 1,171 |
+| Unique Datasets | 3,759 |
+| Unique Metrics | 2,259 |
+| Unique (Task, Dataset, Metric) triples | 8,723 |
+| Avg. (Task, Dataset, Metric) triples occurrences per paper | 5.47 |
 
 Ten most common Tasks, Datasets, and Metrics in the **Train set**:
 <table>
@@ -78,117 +79,117 @@ Ten most common Tasks, Datasets, and Metrics in the **Train set**:
   </tr>
   <tr>
 		<td>1</td>
-		<td>Atari Games</td>
-		<td>2089</td>
-		<td>COCO test-dev</td>
-		<td>1408</td>
-		<td>Accuracy</td>
-		<td>3771</td>
+		<td>atari games</td>
+		<td>1196</td>
+		<td>coco test-dev</td>
+		<td>476</td>
+		<td>accuracy</td>
+		<td>2521</td>
 	</tr>
 	<tr>
 		<td>2</td>
-		<td>Image Classification</td>
-		<td>1813</td>
-		<td>ImageNet</td>
-		<td>1264</td>
-		<td>Score</td>
-		<td>2146</td>
+		<td>image classification</td>
+		<td>786</td>
+		<td>imagenet</td>
+		<td>466</td>
+		<td>score</td>
+		<td>1258</td>
 	</tr>
 	<tr>
 		<td>3</td>
-		<td>Object Detection</td>
-		<td>1550</td>
-		<td>COCO minival</td>
-		<td>641</td>
-		<td>F1</td>
-		<td>1055</td>
+		<td>link prediction</td>
+		<td>716</td>
+		<td>cifar-10</td>
+		<td>328</td>
+		<td>f1</td>
+		<td>1061</td>
 	</tr>
 	<tr>
 		<td>4</td>
-		<td>Image Super-Resolution</td>
-		<td>924</td>
-		<td>CIFAR-10</td>
-		<td>561</td>
-		<td>PSNR</td>
-		<td>981</td>
+		<td>object detection</td>
+		<td>610</td>
+		<td>chebi-20</td>
+		<td>205</td>
+		<td>psnr</td>
+		<td>516</td>
 	</tr>
 	<tr>
 		<td>5</td>
-		<td>Link Prediction</td>
-		<td>840</td>
-		<td>Human3.6M</td>
-		<td>333</td>
-		<td>Top 1 Accuracy</td>
-		<td>655</td>
+		<td>image super-resolution</td>
+		<td>610</td>
+		<td>chebi-20</td>
+		<td>205</td>
+		<td>psnr</td>
+		<td>516</td>
 	</tr>
 	<tr>
 		<td>6</td>
-		<td>Node Classification</td>
-		<td>567</td>
-		<td>DAVIS 2016</td>
-		<td>305</td>
-		<td>SSIM</td>
-		<td>629</td>
+		<td>question answering</td>
+		<td>450</td>
+		<td>human3.6m</td>
+		<td>196</td>
+		<td>ssim</td>
+		<td>387</td>
 	</tr>
 	<tr>
 		<td>7</td>
-		<td>Few-Shot Image Classification</td>
-		<td>562</td>
-		<td>CIFAR-100</td>
-		<td>246</td>
-		<td>AP</td>
-		<td>474</td>
+		<td>semantic segmentation</td>
+		<td>427</td>
+		<td>fb15k-237</td>
+		<td>193</td>
+		<td>ap</td>
+		<td>367</td>
 	</tr>
 	<tr>
 		<td>8</td>
-		<td>Neural Architecture Search</td>
-		<td>562</td>
-		<td>FB15k-237</td>
-		<td>220</td>
-		<td>FID</td>
-		<td>413</td>
+		<td>neural architecture search</td>
+		<td>399</td>
+		<td>iconqa</td>
+		<td>188</td>
+		<td>fid</td>
+		<td>346</td>
 	</tr>
 	<tr>
 		<td>9</td>
-		<td>Question Answering</td>
-		<td>562</td>
-		<td>DAVIS 2017 (val)</td>
-		<td>219</td>
-		<td>MAP</td>
-		<td>402</td>
+		<td>visual question answering (vqa)</td>
+		<td>397</td>
+		<td>wn18rr</td>
+		<td>161</td>
+		<td>miou</td>
+		<td>325</td>
 	</tr>
 	<tr>
 		<td>10</td>
-		<td>Semi-Supervised Video Object Segmentation</td>
-		<td>556</td>
-		<td>WN18RR</td>
-		<td>204</td>
-		<td>mIoU</td>
-		<td>401</td>
+		<td>node classification</td>
+		<td>387</td>
+		<td>snli</td>
+		<td>143</td>
+		<td>mae</td>
+		<td>276</td>
 	</tr>
 </table>
 
-Ten most common (Task, Dataset, Metric) triples in Train Set:
+Ten most common (Task, Dataset, Metric) triples in Train+Validation Set:
 
 | (Task, Dataset, Metric) | Count |
 | --- | --- |
-| (Image Classification, ImageNet, Top 1 Accuracy) | 425 |
-| (Image Classification, ImageNet, Number of params) | 243 |
-| (Image Classification, ImageNet, Top 5 Accuracy) | 200 |
-| (Object Detection, COCO test-dev, box AP) | 178 |
-| (Image Classification, CIFAR-10, Percentage correct) | 166 |
-| (Object Detection, COCO test-dev, AP50) | 137 |
-| (Image Classification, CIFAR-100, Percentage correct) | 137 |
-| (Object Detection, COCO test-dev, AP75) | 134 |
-| (Object Detection, COCO test-dev, APM) | 134 |
-| (Object Detection, COCO test-dev, APS) | 133 |
+| (image classification, imagenet, top 1 accuracy) | 146 |
+| (image classification, cifar-10, percentage correct) | 81 |
+| (image classification, cifar-100, percentage correct) | 70 |
+| (visual reasoning, winoground, text score) | 68 |
+| (visual reasoning, winoground, image score) | 68 |
+| (object detection, coco test-dev, box map) | 64 |
+| (3d human pose estimation, human3.6m, average mpj...) | 64 |
+| (neural architecture search, imagenet, top-1 error) | 134 |
+| (visual reasoning, winoground, group score) | 60 |
+| (natural language inference, snli, % test accuracy) | 51 |
 
 Since each paper is accompanied with an annotations file, this section concludes with statistics for each of the four types in the tuple, what proportion of those can actually be found in the accompanying full-text.
 
-- for Tasks, 75.86% of the annotation labels can be found in the accompanying paper full-text.
-- for Datasets, 44.52% of the annotation labels can be found in the accompanying paper full-text.
-- for Metrics, 47.8% of the annotation labels can be found in the accompanying paper full-text.
-- for Scores, 49.51% of the annotations can be found in the accompanying paper full-text.
+- for Tasks, 63,53% of the annotation labels can be found in the accompanying paper full-text.
+- for Datasets, 47,32% of the annotation labels can be found in the accompanying paper full-text.
+- for Metrics, 48.4% of the annotation labels can be found in the accompanying paper full-text.
+- for Scores, 67.95% of the annotations can be found in the accompanying paper full-text.
 
 <!--
 ### Rough Timeline:
