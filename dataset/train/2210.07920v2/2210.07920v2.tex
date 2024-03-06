@@ -1,0 +1,565 @@
+\documentclass{article}
+
+
+
+\PassOptionsToPackage{sort&compress,numbers}{natbib}
+
+
+
+
+\usepackage[final]{neurips_2022}
+
+
+
+
+
+\usepackage[utf8]{inputenc} \usepackage[T1]{fontenc}    \usepackage{hyperref}       \usepackage{url}            \usepackage{booktabs}       \usepackage{amsfonts}       \usepackage{nicefrac}       \usepackage{microtype}      \usepackage{xcolor}         
+
+\usepackage{grffile}
+\usepackage{amsmath}
+
+\usepackage{multirow}
+\usepackage{arydshln}
+\usepackage{tabularx}
+\usepackage{xspace}
+\usepackage{todonotes}
+\usepackage{wrapfig}
+
+\definecolor{olivegreen}{rgb}{0.10, 0.6, 0.10}
+
+\newcommand\ie{\emph{i.e.}}
+\newcommand\eg{\emph{e.g.}}
+\newcommand\etal{\textrm{et al.}}
+\newcommand\real{\mathbb{R}}
+\newcommand\methodname{MOVE\xspace}
+
+
+\bibliographystyle{unsrtnat}
+
+\title{MOVE: Unsupervised Movable Object \\
+Segmentation and Detection}
+
+
+
+\author{
+    Adam Bielski \\
+    University of Bern \\
+    \texttt{adam.bielski@unibe.ch}
+    \And
+    Paolo Favaro \\
+    University of Bern \\
+    \texttt{paolo.favaro@unibe.ch}
+}
+
+
+
+\begin{document}
+
+
+\maketitle
+
+
+\begin{abstract}
+
+We introduce MOVE, a novel method to segment objects without any form of supervision.
+MOVE exploits the fact that foreground objects can be shifted locally relative to their initial position and result in realistic (undistorted) new images. This property allows us to train a segmentation model on a dataset of images without annotation and to achieve state of the art (SotA) performance on several evaluation datasets for unsupervised salient object detection and segmentation. In unsupervised single object discovery, MOVE gives an average CorLoc improvement of 7.2\% over the SotA, and in unsupervised class-agnostic object detection it gives a relative AP improvement of 53\% on average.
+Our approach is built on top of self-supervised features (e.g. from DINO or MAE), an inpainting network (based on the Masked AutoEncoder) and adversarial training.
+\end{abstract}
+
+
+\section{Introduction}
+
+Image segmentation and object detection are today mature and essential components in vision-based systems with applications in a wide range of fields including automotive \cite{chen2015deepdriving}, agriculture \cite{Chiu_2020_CVPR}, and medicine \cite{smistad2015medical}, just to name a few.
+A major challenge in building and deploying such components at scale is that they require costly and time-consuming human annotation. This has motivated efforts in self-supervised learning (SSL) \cite{caron2021emerging,chen2021mocov3,wang2021dense}. The aim of SSL is to learn general-purpose image representations from large unlabeled datasets that can be fine-tuned to different downstream tasks with small annotated datasets. While SSL methods have also been fine-tuned for image segmentation since their inception, it is only with the recent state of the art (SotA) methods, such as DINO \cite{caron2021emerging} and Dense Contrastive Learning \cite{wang2021dense}, that a clear and strong link to object segmentation has been observed. This has led to several methods for salient object detection built on top of SSL features \cite{amir2021deep,wang2022freesolo,yin2021transfgu,LOST,wang2022self,Shin2022selfmask}. 
+
+Most prior work based on SSL features defines some form of clustering by either using attention maps \cite{amir2021deep,wang2022freesolo,yin2021transfgu} or similarity graphs \cite{LOST,wang2022self,Shin2022selfmask}.
+In this work, we take a quite different direction. Rather than directly clustering the features, we train a network to map them to a segmentation mask. As supervision signal we use the \emph{movability} of objects, \ie, whether they can be locally shifted in a realistic manner. We call our method \methodname. This property holds for objects in the foreground, as they occlude all other objects in the scene. This basic idea has already been exploited in prior work with relative success \cite{Remez_2018_ECCV,Ostyakov2018,bielski2019emergence,arandjelovic2019object,yang_loquercio_2019,savarese2020information,katircioglu2021videobginpaint}. Nonetheless, here we introduce a novel formulation based on movability that yields a significant performance boost across several datasets for salient object detection.
+
+\begin{figure*}[t]
+  \centering
+\includegraphics[scale=.2,trim=0cm 0cm 9.5cm 0cm, clip]{figures/example_pipeline/pipeline2large.pdf}
+\caption{Exploiting inpainting and movability. (a) Input image. (b) Examples of predicted segmentation masks: correct (top), larger (middle) and smaller (bottom). (c) Inpainted backgrounds in the three corresponding cases. (d) Composite image obtained by shifting the foreground object in the three cases. (e) It can be observed that when the mask is incorrect (it includes parts of the background or it does not include all of the background), the background inpainting combined with shifting reveals repeated patterns and mismatching background texture, when compared to the original input image or composite images obtained without shifting.}\label{fig:shiftability}
+\end{figure*}
+
+
+In our approach, it is not necessary to move objects far from their initial location or to other images \cite{Ostyakov2018,arandjelovic2019object} and thus we do not have to handle the context mismatch. It is also not necessary to employ models to generate entire scenes \cite{bielski2019emergence,yang2017lr}, which can be challenging to train. Our working principle exploits observations also made by \cite{yang_loquercio_2019,savarese2020information,katircioglu2021videobginpaint}. They point out that the correct mask maximizes the inpainting error both for the background and the foreground. However, rather than using the reconstruction error as a supervision signal, we rely on the detection of artifacts generated through shifting, which we find to provide a stronger guidance.
+
+Suppose that, given a single image (Figure~\ref{fig:shiftability}~(a)), we predict a segmentation mask (one of the 3 cases in Figure~\ref{fig:shiftability}~(b)). With the mask we can remove the object and inpaint the background (Figure~\ref{fig:shiftability}~(c)). Then, we can also extract the foreground object, randomly shift it locally, and paste it on top of the inpainted background (Figure~\ref{fig:shiftability}~(d)). 
+When the mask does not accurately follow the outline of a foreground object (e.g., as in the middle and bottom rows in Figure~\ref{fig:shiftability}), we can see duplication artifacts (of the foreground or of the background). We exploit these artifacts as supervision signal to detect the correct segmentation mask.
+As inpainter we use a publicly available Masked AutoEncoder (MAE) \cite{he2021masked} trained with an adversarial loss.\footnote{\url{https://github.com/facebookresearch/mae/blob/main/demo/mae_visualize.ipynb}}
+Our segmenter uses a pre-trained SSL ViT as backbone (e.g., DINO \cite{caron2021emerging} or the MAE encoder \cite{he2021masked}). We then train a neural network head based on an upsampling Convolutional Neural Network (CNN).
+Following \cite{Shin2022selfmask}, we also further refine the segmenter by training a second segmentation network (SelfMask \cite{Shin2022selfmask}) with supervision from pseudo-masks generated by our trained segmenter.
+Even without these further refinements \methodname shows a remarkable performance on a wide range of datasets and tasks.
+In particular, in unsupervised single object discovery on VOC07, VOC12 and COCO20K it improves the SotA CorLoc between \% and \%, and in unsupervised class agnostic object detection on COCOval2017 it improves the  by \% (a relative improvement of \%), the  by \% (relative \%) and the  by \% (relative \%).
+
+
+
+
+\begin{figure}[t]
+  \centering
+\includegraphics[width=\textwidth]{figures/new_composer_discriminator-v3.pdf}
+\caption{Synthetic and real images used to learn how to segment foreground objects. 
+We obtain the predicted mask and inpainted background from our segmenter and MAE respectively. We train the segmenter in an adversarial manner so that the composite image with a shifted foreground (left, top row) looks real. A discriminator is trained to distinguish two types of real (right) from two types of fake (left) images. The fake images consist of the composite image with a shift and a copy-paste image, obtained by placing the shifted foreground on top of the input image. The set of real images consists of composite images without a shift and the real images. The real images are first autoencoded with MAE to match the artifacts of the inpainted background.
+\label{fig:composer}}
+
+\end{figure}
+
+
+
+
+\begin{figure}[t]
+  \centering
+\includegraphics[scale=.21,trim=0 0cm 0cm 0cm, clip]{figures/segmenter_inpainter_cr.pdf}
+\caption{(Left) The segmenter is built on top of SSL features from a \textit{frozen} encoder. To define the inpainting region for the background, the predicted mask is shifted and combined with the unshifted mask (bottom left). For better visualization purposes we highlight the edge of the shifted mask, but this does not appear in the actual union of the masks. This mask union is then downsampled to the size of the tile grid via max pooling and denoted .
+(Right) The inpainter is based on a \textit{frozen} MAE. First, it takes all the tiles from the input image and feeds them to the MAE encoder. Second, it takes a convex combination between the encoder embeddings and the MSK learned embedding (but now frozen), where the convex combination coefficients are based on the downsampled mask . Finally, this combination is fed to the MAE decoder to generate the inpainted background.
+}
+\label{fig:segmenter}
+\end{figure}
+
+
+
+\section{Method}
+\label{sec:method}
+
+Our objective is to train a segmenter to map a real image , with  the height and  the width of the image, to a mask  of the foreground, such that we can synthesize a realistic image for any small shifts of the foreground. 
+The mask allows to cut out the foreground from  and to move it arbitrarily by some  shift (see Figure~\ref{fig:composer}, top-left). 
+However, when the shifted foreground is copied back onto the background, missing pixels remain exposed. Thus, we inpaint the background with a \textit{frozen} pre-trained MAE\footnote{The MAE \cite{he2021masked} we use is based on a ViT architecture and has been pre-trained in an adversarial fashion (as opposed to the standard training with an MSE loss) to output more realistic-looking details} and obtain  (see  Figure~\ref{fig:segmenter}). Moreover, there is a difference between the texture of , which is generated from a neural network, and the texture of the cut out foreground from , which is a real image. To ensure more similarity between these two textures, we synthesize  by extracting the foreground from the autoencoding (AE) of the input image  shifted by , which we call ,  and by pasting it onto the background .
+
+
+We enforce the realism of the synthesized images  by  using adversarial training, 
+i.e., by training the segmenter against a discriminator that distinguishes 
+two sets of \textit{real} (Figure~\ref{fig:composer}, right hand side) from two sets of \textit{fake} images (Figure~\ref{fig:composer} left hand side). 
+The synthetic \textit{real} image  is obtained by composing a zero-shifted foreground with the inpainted background; the second \textit{real} image  is instead simply the AE of .
+The two \textit{fake} images are obtained by composing a -shifted foreground with either the inpainted background  or , and obtain 
+ and  respectively.
+
+We introduce all the above synthetic images so that the discriminator pays attention only to artifacts due to incorrect masks from the segmenter. 
+Ideally, the segmenter should generate masks such that the fake image  looks as realistic as  for any small . However, the discriminator might distinguish these two images because of the background inpainting artifacts and not because of the artifacts due to an incorrect segmentation (which are exposed by random shifts). To avoid this undesired behavior, we also introduce the real image . This image has no segmentation artifacts for any mask, but has the same background inpanting artifacts as the fake images (although there is no shift in , the background inpainting creates artifacts beyond the boundaries of the segmentation mask). Finally, to guide the discriminator to detect repeated patterns (as those caused by incorrect masks, see Figure~\ref{fig:shiftability}), we also add a fake image , where the background has the original foreground. 
+
+The segmenter is trained only through the backpropagation from . The details of the segmentation network, the inpainting network and the adversarial training are explained in the following sections.
+
+
+
+
+
+\subsection{Segmenter}
+
+Following the recent trend of methods for unsupervised object segmentation \cite{amir2021deep,wang2022freesolo,yin2021transfgu,LOST,wang2022self,Shin2022selfmask,melas2022}, we build our method on top of SSL features, and, in particular, DINO \cite{caron2021emerging} or MAE \cite{he2021masked} features. 
+Thus, as a backbone, we adopt the Vision Transformer (ViT) architecture \cite{dosovitskiy2020image}. Following the notation in \cite{LOST}, we split an image  in tiles of size  pixels, for a total of  tiles (and we assume that  and  are such that  and  are integers). Each tile is then mapped through a trainable linear layer to an embedding of size  and an additional CLS token is included in the input set (see Figure~\ref{fig:segmenter} left). 
+
+
+
+The \emph{segmenter} network is a CNN that takes SSL features as input (e.g., from a pre-trained DINO or MAE encoder), upsamples them and then outputs a mask for the original input image. The final output is generated by using a sigmoid to ensure that the mask values are always between  and . We also ensure a minimum
+size of the support of the predicted mask by using 
+where  is the number of images in the training dataset,  is the predicted mask from image ,  is a pixel location within the image domain, and  is a threshold for the minimum
+mask coverage percentage respectively (in the range , where  implies that the mask is empty and  implies that the mask covers the whole image). 
+Since masks should only take binary values to clearly indicate a segment, we use a loss that encourages  to take either  or  values
+
+
+
+\subsection{Differentiable inpainting}
+The main task of \methodname is to predict a segmentation mask that can be used to synthesize a realistic image, where the foreground object is shifted on top of the inpainted background (see Figure~\ref{fig:shiftability}~(e) top and Figure~\ref{fig:composer} top left). 
+Figure~\ref{fig:segmenter} shows how we use the predicted high resolution mask for inpainting with MAE. Since MAE performs inpainting by masking or retaining entire patches of  pixels, it is necessary to also split the segmentation mask into a grid of tiles of  pixels and to map each tile to a single scalar between  and . We do that by using a max pooling operation within each tile and obtain a low-res mask , such that  does not contain any part of the predicted mask.
+To regularize the predicted mask , the mask losses ,
+ are also computed on max pool  and average pool downsampled masks (at a scale  of the original image resolution; for more details see the supplementary material).
+Then, we feed the entire set of image tiles to the MAE encoder and obtain embeddings . 
+Next, for , we compute the convex combination between the embeddings  and the learned MSK (masked) token from MAE by using the low res mask  as 
+
+Finally, we feed the new embeddings  in the MAE decoder and reassemble the output tiles back into the inpainted background image  (see Figure~\ref{fig:segmenter} bottom-right).
+Notice that we feed all the tiles as input to obtain a differentiable mapping that we can backpropagate on. Interestingly, we found that when no tile is masked at the input of the MAE encoder, the embeddings  do not store significant information about their neighbors (see the supplementary material). This is in contrast to the typical use of MAE, where only the subset of ``visible'' tiles is fed as input to the encoder. However, such tile selection operation would make the inpainting not differentiable.
+
+\subsection{Adversarial training}
+
+Figure~\ref{fig:composer} shows how we create the images used in the adversarial training. 
+First, we mask the input image with the predicted mask and compose with the inpainted background image, obtaining
+
+where ,  is a 2D shift, with  the maximum shift range (relative to the image size).
+To make the inpainting artifacts in the no-shift composite image  more comparable to those in the shifted composite image, we define the background inpainting region as the union between the predicted mask and its shifted version (see Figure~\ref{fig:segmenter}). Thus,
+
+To improve the discriminator's ability to focus on repeated patterns artifacts, we additionally create \emph{fake} images with a predicted shifted foreground pasted on top of the autoencoded image, obtaining .
+
+The adversarial loss for the discriminator can be written as
+
+where samples for ``real'' images  are the set  and samples for synthetic images  are the set , with uniform random samples  and  denotes the expectation.
+To speed up the convergence, we also use the projected discriminator method  \cite{Sauer2021NEURIPS}.
+For the segmenter, we use instead the standard loss computed on the composite shifted images
+
+
+Finally, with ,
+ nonnegative hyperparameters, our optimization is the adversarial minimization 
+
+
+
+
+
+
+
+
+\section{Implementation}
+\label{sec:implementation}
+
+
+Except for the ablation studies,  in all our experiments we use a self-supervised DINO \cite{caron2021emerging} ViT-S/8 transformer pre-trained on ImageNet \cite{imagenet} as an SSL feature extractor. 
+We take the output of the penultimate transformer block of DINO as the feature tokens with  and feed them to the segmenter.
+Our segmenter is a small upsampling convolutional neural network. It assembles the DINO features into a grid of size  and processes them with 3 upsampling blocks, so that the output matches the input image resolution. Each upsampling block first performs a  nearest upsampling, followed by a  convolutional layer with padding, batch normalization \cite{ioffe2015batch} and a LeakyReLU activation function (see the supplementary material for details). We add an additional block without upsampling and a linear projection to 1 channel, representing the mask.
+Our inpainting network is a ViT-L/16 transformer pre-trained on ImageNet as a Masked Autoencoder (MAE) \cite{he2021masked} with an adversarial loss to increase the details of the reconstructed images. For the discriminator we use the Projected Discriminator \cite{Sauer2021NEURIPS} in its standard setting, but we only use \textit{color} differentiable augmentation.
+For the training we use random resized crops of size  with a scale in range  and aspect ratio .
+We set the minimum mask area , the minimum loss coefficient  and we linearly ramp up the binarization loss coefficient  from  to  over the first  segmenter iterations.
+We use the shift range . We train the segmenter by alternatively minimizing the discriminator loss and the segmenter losses. Both are trained with a learning rate of  and an Adam \cite{kingmaAdam} optimizer with betas  for the discriminator and  for the segmenter. We implemented our experiments in PyTorch \cite{pytorch}. We train our model for  epochs with a batch size of  on a single NVIDIA GeForce 3090Ti GPU with 24GB of memory.
+
+
+
+
+
+
+    
+
+
+
+\section{Experiments}
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Unsupervised saliency segmentation}
+\label{sec:exp-saliency}
+
+\begin{table*}[!t]
+  \centering
+  \small
+\caption{ {Comparison to the unsupervised saliency detection methods on 3 benchmarks} \label{tab:salient-comp}
+}
+\vspace{1em}
+\small
+        \begin{tabularx}{\linewidth}{@{}X 
+        @{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{\hspace{.5em}}c@{}}
+        \toprule
+        \multirow{2}{*}{Model}
+         &\multicolumn{3}{c}{DUT-OMRON~\cite{yang2013saliency}}
+         &\multicolumn{3}{c}{DUTS-TE~\cite{wang2017learningDUTS}}
+         &\multicolumn{3}{c}{ECSSD~\cite{shi2015hierarchical}}\\   \cmidrule{2-10}
+         &\small Acc &\scriptsize IoU&\scriptsize max
+         &\small Acc &\scriptsize IoU&\scriptsize max
+         &\small Acc &\scriptsize IoU&\scriptsize max\\
+        \midrule
+        HS~\cite{yan2013hierarchical}
+        &.843&.433&.561
+        &.826&.369&.504
+        &.847&.508&.673\\
+        wCtr~\cite{zhu2014saliency}
+        &.838&.416&.541
+        &.835&.392&.522
+        &.862&.517&.684\\
+        WSC~\cite{li2015weighted}
+        &.865&.387&.523
+        &.862&.384&.528
+        &.852&.498&.683\\
+        DeepUSPS~\cite{nguyen2019deepusps}
+        &.779&.305&.414
+        &.773&.305&.425
+        &.795&.440&.584\\
+        SelfMask pseudo~\cite{Shin2022selfmask}
+        &.811&.403&-
+        &.845&.466&-
+        &.893&.646&-\\
+        BigBiGAN~\cite{voynov2020big}
+        &.856&.453&.549
+        &.878&.498&.608
+        &.899&.672&.782\\
+        E-BigBiGAN~\cite{voynov2020big}
+        &.860&.464&.563
+        &.882&.511&.624
+        &.906&.684&.797\\
+        Melas-Kyriazi et al.~\cite{melaskyriazi2021finding}
+        & .883 & .509 & -
+        & .893 & .528 & - 
+        &.915 & .713 & -\\
+        LOST~\cite{LOST}
+        &.797&.410&.473
+        &.871&.518&.611
+        &.895&.654&.758\\
+        Deep Spectral~\cite{melas2022}
+        &-&.567&-
+        &-&.514&-
+        &-&.733&-\\
+        TokenCut~\cite{wang2022self}
+        &.880&.533&.600
+        &.903&.576&.672
+        &.918&.712&.803\\
+        FreeSOLO~\cite{wang2022freesolo}
+        &.909 & .560 & .684
+        &.924 & .613 & .750
+        &.917 & .703 & .858\\
+        \bf \methodname (Ours)
+        &\textbf{.923}&\textbf{.615}&\textbf{.712}
+        &\textbf{.950}&\textbf{.713}&\textbf{.815}
+        &\textbf{.954}&\textbf{.830}&\textbf{.916}\\ \midrule
+        LOST~\cite{LOST} + Bilateral 
+        &.818&.489&.578
+        &.887&.572&.697
+        &.916&.723&.837\\
+        
+        
+
+        TokenCut~\cite{wang2022self} + Bilateral &.897&.618&.697
+        &.914&.624&.755
+        &.934&.772&.874\\
+        
+
+        \bf \methodname (Ours) + Bilateral &\textbf{.931}&\textbf{.636}&\textbf{.734}
+        &\textbf{.951}&\textbf{.687}&\textbf{.821}
+        &\textbf{.953}&\textbf{.801}&\textbf{.916}\\ \midrule
+        SelfMask on pseudo ~\cite{Shin2022selfmask}
+        &.923&.609&.733
+        &.938&.648&.789
+        &.943&.779&.894\\ SelfMask on pseudo ~\cite{Shin2022selfmask} + Bilateral&\textbf{.939}&\textbf{.677}&\textbf{.774}
+        &.949&.694&.819
+        &.951&.803&.911\\ \bf SelfMask on \methodname (Ours)
+        &.933&.666&.756
+        &\textbf{.954}&\textbf{.728}&\textbf{.829}
+        &\textbf{.956}&\textbf{.835}&\textbf{.921}\\ \bf SelfMask on \methodname (Ours) + Bilateral 
+        &.937&.665&.766
+        &.952&.687&.827
+        &.952&.800&.917\\ \bottomrule
+        \end{tabularx}
+        \raggedright
+        \footnotesize{
+        We found that SelfMask's  metric was computed with an optimal threshold for each image instead of the entire dataset as in other methods; we re-evaluated their model for a fair comparison} 
+\end{table*} 
+\begin{figure*}[t]
+  \centering
+   \includegraphics[width=\textwidth]{figures/saliency-results-camera-ready.jpg}
+\caption{Qualitative evaluation of \methodname on ECSSD, DUTS-TE and DUT-OMRON. First row: input image; second row: \methodname; third row: SelfMask on \methodname; last row: ground truth. Best viewed in color. For more examples and a gray scale version see the supplementary material.}\label{fig:saliency-results}
+\end{figure*}
+
+\textbf{Datasets.} We train our main model using the train split of the DUTS dataset (DUTS-TR) \cite{wang2017learningDUTS}, containing  images of scenes and objects of varying sizes and appearances. We emphasize that we only use the images without the corresponding ground truth. For comparison, we evaluate our approach on three saliency detection datasets: the test set of DUTS ( images), DUT-OMRON \cite{yang2013saliency} ( images) and ECSSD \cite{shi2015hierarchical} ( images). We report three standard metrics: pixel mask accuracy (Acc), intersection over union (IoU), , where  for ; the  is the score for the single optimal threshold on a whole dataset. Additionally, we report the IoU on the test split \cite{chen2019unsupervisedRedo} of CUB-200-2011 (CUB-Birds) \cite{WahCUB_200_2011} dataset.\\
+
+
+
+\noindent\textbf{Evaluation. } 
+We train our segmenter in an adversarial manner as specified in sections~\ref{sec:method} and \ref{sec:implementation} and evaluate it on the test datasets. We compare with other methods in Table~\ref{tab:salient-comp}. Note that without any type of post-processing of our predicted masks, we surpass all other methods by a significant margin. 
+We also follow \cite{wang2022self,Shin2022selfmask} and further refine our masks with a bilateral solver \cite{barron2016fast}. 
+\begin{wraptable}{r}{5cm}
+  \caption{Comparison of unsupervised segmentation methods on the CUB-200-2011 test set. MOVE was trained on the CUB-200-2011 train set, while MOVE was trained on DUTS-TR}
+  \label{tab:cub-birds}
+  \centering
+  \small
+  \vspace{0.3cm}
+  \begin{tabularx}{5cm}{@{}l@{\hspace{1.6cm}}c@{}}
+\toprule
+\textbf{Method} & \textbf{IoU} \\
+\midrule
+PerturbGAN \cite{bielski2019emergence} & 0.360  \\
+ReDO \cite{chen2019unsupervisedRedo} & 0.426  \\
+IEM \cite{savarese2020information} & 0.551 \\
+Melas-Kyriazi \cite{melaskyriazi2021finding} & 0.664 \\
+Voynov \cite{voynov2020big} & 0.683 \\
+Voynov-E \cite{voynov2020big} & 0.710 \\
+Deep Spectral \cite{melas2022} & 0.769 \\
+\textbf{MOVE} & \textbf{0.814} \\
+\textbf{MOVE} & \textbf{0.858} \\
+\bottomrule
+  \end{tabularx}
+\end{wraptable}
+Since the bilateral solver only marginally improves or even decreases the quality of our segmentation, we conclude that our predicted masks are already very accurate. Using the bilateral solver might also inadvertently discard correct, but fragmented segmentations, as we show in the supplementary material. Next, we extract the predicted unsupervised masks from the DUTS-TR dataset and use them as pseudo ground-truth to train a class-agnostic segmenter. We use the same architecture (a MaskFormer \cite{cheng2021per}) and training scheme as SelfMask \cite{Shin2022selfmask}. We then evaluate again on the saliency prediction datasets. Without additional pre-processing our method surpasses or is on par with the SotA across all metrics and datasets. 
+While additional processing with the bilateral solver seems to benefit SelfMask \cite{Shin2022selfmask}, it mostly hurts the performance of our method. Figure~\ref{fig:saliency-results} shows qualitative results of our method.
+Finally, we evaluate our method on the test set of CUB-Birds dataset. Additionally, we train our model on the train split of CUB-Birds dataset and run the same evaluation. We present the comparison with other methods in Table~\ref{tab:cub-birds} and show that we achieve SotA performance. 
+
+\subsection{Single-object discovery}
+
+\textbf{Datasets.} We evaluate our trained model (see section~\ref{sec:exp-saliency}) on 3 typical single-object discovery benchmarks: the train split of COCO20K \cite{lin2014microsoft,vo2020toward} and the trainval splits of VOC07 \cite{pascal-voc-2007} and VOC12 \cite{pascal-voc-2012}. Following \cite{cho2015unsupervised,deselaers2010localizing,siva2013looking,vo2019unsupervised,vo2020toward,vo2021large,LOST,wang2022self}, we report the \textit{Correct Localization} metric (CorLoc), \ie, the percentage of images, where the  of a predicted single bounding box with at least one of the ground truth ones.\\
+\noindent\textbf{Evaluation.} Since our method tends to produce a single segmentation mask for multiple objects in the scene, we separate the objects by detecting connected components via OpenCV \cite{opencv_library}. We then convert the separate masks to bounding boxes and choose the biggest one as our prediction for the given image. In Table~\ref{tab:single-ob-discovery}, we compare \methodname with other unsupervised methods and we show that just by using processed masks from our method we achieve SotA results on all three datasets, outperforming even methods that used their bounding boxes to train a Class Agnostic Detector (CAD). We show qualitative results for object detection in Figure~\ref{fig:detection-results}.
+We also follow the practice of \cite{LOST,wang2022self} and use our predicted  bounding boxes as pseudo-ground truth for training the CAD on each of the evaluation datasets. To train the detector, we use either the largest or all the bounding boxes (\textit{Multi}) that we obtained from the connected components analysis and after filtering those that have an area smaller than  of the image. For the evaluation we take the bounding box with the highest prediction confidence, as done in \cite{LOST,wang2022self}. We use the exact same architecture and training scheme as our competitors for a fair comparison. Training with a single bounding box improves the performance of our method, while training with multiple ones gives it a significant additional boost.\\
+\begin{table}
+\caption{{Comparisons for unsupervised single object discovery}. We compare \methodname to SotA object discovery methods on VOC07~\cite{pascal-voc-2007}, VOC12 ~\cite{pascal-voc-2012} and COCO20K~\cite{lin2014microsoft,vo2020toward} datasets. Models are evaluated with the CorLoc metric. +CAD indicates training a second stage class-agnostic detector with unsupervised ``pseudo-boxes'' labels. (\textcolor{olivegreen}{}) indicates an improvement of  over prior sota}
+\label{tab:single-ob-discovery}  
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}Xc@{\hspace{3em}}c@{\hspace{3em}}c@{}}
+    \toprule Method &  VOC07~\cite{pascal-voc-2007} & VOC12 ~\cite{pascal-voc-2012}& COCO20K~\cite{lin2014microsoft,vo2020toward}  \\
+    \midrule
+    Selective Search~\cite{uijlings2013selective, LOST} & 18.8 & 20.9 & 16.0 \\
+    EdgeBoxes~\cite{zitnick2014edge, LOST} & 31.1 & 31.6 & 28.8 \\
+    Kim et al.~\cite{kim2009unsupervised, LOST}&  43.9 & 46.4& 35.1 \\
+    Zhange et al.~\cite{zhang2020object, LOST}&  46.2 & 50.5 & 34.8 \\
+    DDT+~\cite{wei2019unsupervised, LOST}&  50.2 & 53.1 & 38.2 \\
+    rOSD~\cite{vo2020toward, LOST} &  54.5 & 55.3 & 48.5 \\
+    LOD~\cite{vo2021large, LOST}&53.6 & 55.1 & 48.5 \\
+    DINO-seg~\cite{caron2021emerging,LOST}&   45.8 & 46.2 & 42.1 \\
+    FreeSOLO~\cite{wang2022freesolo} &  56.1 & 56.7 & 52.8 \\
+    LOST~\cite{LOST}& 61.9 & 64.0 & 50.7 \\
+    Deep Spectral \cite{melas2022} & 62.7 & 66.4 & 52.2 \\
+    TokenCut \cite{wang2022self}& 68.8 & 72.1 &  58.8 \\ 
+    \bf\methodname (Ours) & \hspace{3em}\bf76.0 (\textcolor{olivegreen}{ \bf7.2  }) & \hspace{3em}\bf78.8 (\textcolor{olivegreen}{ \bf6.7 }) & \hspace{3em}\bf66.6 (\textcolor{olivegreen}{ \bf7.8 }) \\ \midrule
+    LOD + CAD\cite{LOST} & 56.3 & 61.6 & 52.7 \\
+    rOSD + CAD~\cite{LOST} &  58.3 & 62.3 & 53.0 \\
+    LOST + CAD~\cite{LOST} &  65.7 & 70.4 & 57.5 \\
+    TokenCut + CAD~\cite{wang2022self} & 71.4 & 75.3 &  62.6 \\
+    \bf\methodname (Ours) + CAD & 77.1 & 80.3 & 69.1\\
+    \bf\methodname (Ours) Multi + CAD & \hspace{3em}\bf 77.5 (\textcolor{olivegreen}{ \bf 6.1}) & \hspace{3em}\bf 81.5 (\textcolor{olivegreen}{ \bf 6.2}) & \hspace{3em}\bf 71.9 (\textcolor{olivegreen}{ \bf 9.3}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+\begin{figure*}[t]
+  \centering
+   \includegraphics[width=\textwidth]{figures/detection-with-gt-camera-ready.jpg}
+\caption{Qualitative evaluation of object detection of \methodname on VOC07, VOC12 and COCO20k. \textcolor{red}{Red} is the ground truth,
+\colorbox{black}{\textcolor{yellow}{yellow}} is our prediction.
+For more examples see the supplementary material.}\label{fig:detection-results}
+\end{figure*}
+\begin{wraptable}{r}{7.5cm}
+    \vspace{-0.5cm}
+  \caption{Unsupervised class-agnostic object detection on MS COCO \texttt{val2017}. Compared results are taken directly from FreeSOLO \cite{wang2022freesolo}}
+\label{tab:det_val}
+  \centering
+  \small
+  \vspace{0.2cm}
+  \begin{tabularx}{7.5cm}{@{}l@{\hspace{1.5em}}c@{\hspace{.85em}}c@{\hspace{.85em}}c@{\hspace{.85em}}c@{\hspace{.85em}}c@{\hspace{.85em}}c@{}}
+\toprule
+Method  &  AP & AP  & AP & AR & AR & AR \\ 
+\midrule
+Sel. Search~\cite{uijlings2013selective}  & 0.5 & 0.1 & 0.2 & 0.2 & 1.5 & 10.9\\
+DETReg~\cite{bar2021detreg}   & 3.1 & 0.6 & 1.0 & 0.6 & 3.6 & 12.7 \\
+FreeSOLO~\cite{wang2022freesolo}  &  12.2 & 4.2   & 5.5 & 4.6 & 11.4 & 15.3 \\
+\bf \methodname (Ours) &  \textbf{19.0} & \textbf{6.5} & \textbf{8.2} & \textbf{5.7} & \textbf{13.6} & \textbf{15.9}  \\
+\bottomrule
+\end{tabularx}
+\end{wraptable}
+\textbf{Unsupervised class-agnostic object detection.} We evaluate our unsupervised object detection model trained on COCO20K with CAD post-training and compare it with SotA on unsupervised class-agnostic object detection. In Table~\ref{tab:det_val}, we evaluate \methodname on COCOval2017 and report Average Precision (AP) and Average Recall (AR), as in \cite{wang2022freesolo}. \methodname yields a remarkable relative improvement over the AP SotA of \% on average.
+
+
+
+
+
+
+
+    
+    
+
+
+
+
+
+\subsection{Ablation study}
+\label{sec:ablation}
+
+We perform ablation experiments on the validation split (500 images) of HKU-IS \cite{hkuisDataset} to validate the relative importance of the components of our segmentation approach. For the ablation we train each model for 80 epochs on DUTS-TR. We report the IoU in Table~\ref{tab:ablation-table}.
+Our baseline model trained with 3 different seeds gives a mean IoU  with . Thus we only report results for a single run in all experiments. \\
+\begin{wraptable}{r}{6cm}
+    \vspace{-.5cm}
+  \caption{Ablation study. Models evaluated on HKU-IS-val}
+  \label{tab:ablation-table}
+  \centering
+  \small
+  \vspace{0.2cm}
+  \begin{tabularx}{6cm}{@{}lc@{}}
+      \toprule
+    Setting & IoU\\
+    \midrule
+    \textbf{Baseline (shift \nicefrac{2~}{16})} & \textbf{0.819} \\
+    no min. mask & 0.000 \\
+    no binarization loss & 0.774 \\
+    no pooled mask losses & 0.811 \\
+    no shift & 0.000 \\
+    shift \nicefrac{1~}{16} & 0.751 \\
+    shift \nicefrac{3~}{16} & 0.799 \\
+    shift \nicefrac{4~}{16} & 0.704 \\
+    disc. fake inputs: composed & 0.789 \\
+    disc. real inputs:  + comp. w/o shift & 0.740  \\
+    disc. real inputs: comp. w/o shift & 0.031  \\
+    disc. real inputs:  & 0.000  \\
+    non-diff inpainter & 0.314 \\
+    MSE MAE & 0.817 \\
+    MAE feature extractor & 0.783 \\
+    ImageNet100 dataset & 0.815\\
+\bottomrule
+  \end{tabularx}
+\end{wraptable}
+\textbf{Mask losses.} We validate the importance of the mask losses: minimum mask area, binarization and losses on downsampled max-pooled and avg-pooled masks. We find that the minimum area loss is necessary for our method to work, otherwise there is no incentive to produce anything other than empty masks.
+Removing the binarization loss or mask losses on the downsampled masks makes the masks  noisier, which negatively affects the results. \\
+\textbf{Shift range. } We evaluate different ranges of the random shift . A small range  makes it more challenging for the discriminator to detect inconsistencies at the border of objects.
+Larger shifts may cause objects to go out of the image boundaries () and thus reduce the feedback at the object boundary to the segmenter.
+For  (no-shift) the only possible discriminator inputs are composed images without a shift as fake and autoencoded images as real. There is no incentive to produce any meaningful masks in this case. \\
+\textbf{Discriminator inputs.} In our baseline model, we feed both composed images with no-shift and real images autoencoded with MAE as real samples and composed images with a shift and autoencoded images with copy-pasting of a predicted masked object as fake samples for the discriminator training.
+We test the case \textsc{disc. real  + comp. w/o shift }, where we feed to the discriminator real images without autoencoding. In this case, the discriminator can detect the artifacts of MAE instead of focusing on inconsistencies resulting from an incorrect mask. In \textsc{disc. real } we only feed the autoencoded images as real. Here, the discriminator can focus on the mismatch from the inpainting artifacts and encourages the segmenter to output empty masks, where no inpainting is done. If we only feed the composite non-shifted images (\textsc{disc. real comp w/o shift}), the artifacts resulting from an incorrect masks cannot be fixed, because there is no reference of what the real images look like. In \textsc{disc. fake inputs: composed} we only feed the composed image as fake to the discriminator and omit the real image with a copy-pasted predicted masked object, which slightly degrades the performance. \\
+\textbf{Non-differentiable inpainter.} We evaluate the use of hard thresholded downsampled masks as input to the background inpainter. In this case the only feedback for the masks comes from the composition of the images. We find it to be insufficient for the segmenter to learn any meaningful masks.\\
+\textbf{Inpainter model.} We substitute the MAE trained with a GAN loss with a MAE that was trained only to reconstruct missing patches with a Mean Squared Error (MSE) loss.
+Since this model was trained to only reconstruct the missing patches and not the entire image, we construct the inpainted background by composing the inpainted part with the real image: ; . Consequently, we do not use autoencoding when creating the discriminator inputs. We find this model to perform competitively.\\
+\textbf{Feature extractor.} We train the model using the features provided by MAE encoder instead of a separate DINO model. In this case we adapted the segmenter architecture and added one more upsampling block, since MAE takes patches of size  (instead DINO has ). We find that with these features we are able to train a competitive segmenter. \\
+\textbf{ImageNet100 dataset.} We train our model on the ImageNet100 dataset \cite{tian2020contrastive}, with  images from  randomly selected ImageNet \cite{imagenet} classes. Since this dataset is much bigger than DUTS-TR, we adapt our segmenter by adding an additional convolutional layer in each upsampling block (see section~\ref{sec:implementation}) and train the model for  epochs. The results are comparable to the DUTS-TR dataset.
+
+
+\section{Prior Work}
+
+In the past decade, research on object segmentation and detection has seen remarkable progress when full supervision is available \cite{He2017MaskR,hu2018learning,carion2020end}.
+To limit the cost of annotation several methods explored different forms of weak supervision
+\cite{Khoreva_2017_CVPR,zhou2019objects}
+or ways to avoid labeling altogether 
+\cite{Ji2018,kanezaki2018,Ostyakov2018,Remez_2018_ECCV}.
+\methodname falls in the latter category. Therefore, we focus our review of prior work on unsupervised methods for object segmentation and the related task of object detection.\\
+\noindent\textbf{Unsupervised Object Detection and Category Discovery.} 
+Unsupervised object detection and category discovery are extremely challenging tasks that have recently seen a surge of efforts \cite{bar2021detreg,rambhatla2021pursuit,zheng2022towards}
+thanks to the capabilities of modern deep learning models.
+Recently, features based on deep learning have shown significant progress in object detection \cite{bar2021detreg}, even with just some noisy (unsupervised) guidance \cite{uijlings2013selective}. 
+More in general, one limitation of unsupervised object detection is that it only provides a coarse localization of the objects. As we have shown with \methodname, it is possible to obtain much more information without supervision.\\ \noindent\textbf{Unsupervised Object Segmentation.} 
+Object segmentation can be formulated as a pixel-wise image partitioning task \cite{Ji2018,ouali2020autoregressive,Xia2017WNetAD,kanezaki2018}
+or through the generation of layered models from which a segmenter is trained as a byproduct \cite{wang2022freesolo,Zhang_2018_CVPR,nguyen2019deepusps,burgess2019monet}.
+The use of SSL features has spawned several methods with significant performance on real datasets, which we discuss in the following paragraphs.\\
+\noindent\textbf{SSL-Based Methods.} 
+Due to the success of SSL methods and the emergence of segmentation capabilities, several recent methods for unsupervised object segmentation have been built on top of SSL features.
+In particular, SelfMask \cite{Shin2022selfmask} proposes a clustering approach that can use multiple SSL features and evaluates all possible combinations of DINO \cite{caron2021emerging}, SwAV \cite{caron2020unsupervised} and MOCOV2 \cite{he2020momentum}. They find that combining features from all three SSL methods yields the best results for segmentation. FreeSOLO \cite{wang2022freesolo} instead finds that DenseCL features \cite{wang2021dense} work best. More in general, some methods use a weak (unsupervised) guidance and losses robust to the coarse pseudo-labels \cite{wang2022freesolo}, but the majority is based on directly clustering SSL features \cite{melas2022,amir2021deep,yin2021transfgu,ziegler2022leopart,LOST,wang2022self}. In contrast to these methods, we show that movability can provide a robust supervision signal.\\
+\noindent\textbf{Generative Methods.} 
+A wide range of methods also exploits generative models to create layered image representations \cite{van2018case,kwak2016generating,bielski2019emergence,yang2017lr,eslami2016attend,he2021ganseg,yang_loquercio_2019,savarese2020information}.
+A general scheme is to train a network to generate a background, a foreground and its mask. These components can then be combined to generate an image and then, in a second stage, one can train a segmenter that learns to map a synthetic image to its corresponding foreground mask. In alternative, the segmenter could be built during the training of the generative model as a byproduct.
+Some methods rely on the assumption that a dataset of only backgrounds is available \cite{benny2020onegan,Ostyakov2018}.
+The use of shifts to define segments has also been used before \cite{Remez_2018_ECCV,bielski2019emergence,arandjelovic2019object}. However, \methodname does not require the training of a generative model, which can be a challenge on its own.
+
+
+
+
+
+
+
+\section{Limitations and Societal Impact}
+\label{sec:limitation}
+
+\noindent\textbf{Limitations. }As mentioned in the introduction, movability alone may not suffice in identifying an object unambiguously. In fact, the method can segment any combination of multiple objects. To address this we use a post-processing algorithm to find connected components, but there is no guarantee that all objects have been segmented. Another issue is that shifts would not expose artifacts when the background is uniform (\eg, looking at the sky, underwater, with macrophotography).\\
+\noindent\textbf{Societal Impact. }An important aspect that is relevant to unsupervised learning methods in general is the potential to become biased if the training datasets are unbalanced. This clearly has a potentially negative impact on the segmentation of categories that are underrepresented and thus this work should be integrated with mechanisms to take the dataset imbalance into account.
+
+
+\section{Conclusions}
+
+We have introduced \methodname, a novel self-supervised method for object segmentation that exploits the synthesis of images where objects are randomly shifted. 
+\methodname improves the SotA in object saliency segmentation, unsupervised single object discovery, and unsupervised class agnostic object detection by significant margins. Our ablations show that movability is a strong supervision signal that can be robustly exploited as a pseudo-task for self-supervised object segmentation. We believe that our approach can be further scaled by exploring different architectures and larger datasets.
+
+
+
+
+
+
+
+
+
+
+
+\bibliography{unsupervisedsegmentation.bib}
+
+
+
+
+
+
+
+
+
+
+
+\end{document}

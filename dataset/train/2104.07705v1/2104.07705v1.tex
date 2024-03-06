@@ -1,0 +1,474 @@
+\pdfoutput=1
+
+
+\documentclass[11pt]{article}
+
+\usepackage{emnlp2021}
+
+\usepackage{times}
+\usepackage{latexsym}
+
+\usepackage[T1]{fontenc}
+
+
+\usepackage[utf8]{inputenc}
+
+\usepackage{microtype}
+\usepackage{float}
+\usepackage{array}
+\usepackage{mathtools}
+\usepackage[export]{adjustbox}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{natbib}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{arydshln}
+\usepackage{siunitx}
+
+\usepackage{subcaption}
+
+
+\graphicspath{ {./images/} }
+
+\renewcommand{\UrlFont}{\ttfamily\small}
+
+
+
+\newcommand\BibTeX{B\textsc{ib}\TeX}
+
+\newcommand{\peter}[1]{\textcolor{blue}{[\textbf{Peter}: #1]}}
+\newcommand{\moshe}[1]{\textcolor{cyan}{[\textbf{Moshe}: #1]}}
+\newcommand{\omer}[1]{\textcolor{red}{[\textbf{Omer}: #1]}}
+
+\newcommand{\bertbase}{BERT }
+\newcommand{\bertlarge}{BERT }
+
+
+
+\title{How to Train BERT with an Academic Budget} 
+
+\author{Peter Izsak \quad Moshe Berchansky \quad Omer Levy \\
+ Intel Labs \\
+{\tt \{peter.izsak,moshe.berchansky\}@intel.com} \4pt]
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+While large language models à la BERT are used ubiquitously in NLP, pretraining them is considered a luxury that only a few well-funded industry labs can afford.
+How can one train such models with a more modest budget?
+We present a recipe for pretraining a masked language model in 24 hours, using only 8 low-range 12GB GPUs.
+We demonstrate that through a combination of software optimizations, design choices, and hyperparameter tuning, it is possible to produce models that are competitive with \bertbase on GLUE tasks at a fraction of the original pretraining cost.
+
+
+
+
+
+
+
+
+
+
+\end{abstract} \section{Introduction} \label{sec:intro}
+
+Large language models, such as BERT~\cite{devlin-etal-2019-bert}, RoBERTa~\cite{Liu2019RoBERTaAR}, and GPT-3~\cite{gpt3}, have become the \textit{de facto} models used in many NLP tasks and applications.
+However, their pretraining phase can be prohibitively expensive for startups and academic research groups, limiting the research and development of model pretraining to only a few well-funded industry labs.
+How can one train a large language model with commonly-available hardware in reasonable time?
+
+We present a recipe for training a BERT-like masked language model in 24 hours, using only 8 Nvidia Titan-V GPUs (12GB each).
+Our approach combines multiple elements from recent developments: faster implementation \cite{deepspeed}, faster convergence through overparameterization \cite{Li2020TrainLT}, single-sequence training \cite{joshi-etal-2020-spanbert, Liu2019RoBERTaAR}, and more.
+Moreover, we conduct an extensive hyperparmeter search tailored to our resource budget, and find that synchronizing the learning rate warmup and decay schedule with our 24 hour budget greatly improves model performance.
+
+When evaluating on GLUE \cite{wang-etal-2018-glue}, our recipe produces models that are competitive with \bertbase{} -- a model that was trained on 16 TPUs for 4 days.
+Overall, our findings demonstrate that, with the right recipe, large language models can indeed be trained in an academic setting.\footnote{Our code is available at: \url{https://github.com/peteriz/academic-budget-bert}}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ \section{Problem Setup}
+\label{sec:problem}
+
+We investigate the task of pretraining a large language model under computational constraints.
+To simulate an academic computation budget, we limit the training time to 24 hours and the hardware to 8 low-range GPUs, specifically Nvidia Titan-V with 12GB memory each.
+When considering GB-hour as the currency, our setting is roughly equivalent to 3 days on a single 32GB Nvidia V100 GPU.
+Using the current prices of cloud services,\footnote{Information gathered from \url{https://cloud.google.com/compute/gpus-pricing} and \url{https://aws.amazon.com/ec2/instance-types/p3/} during April 2021.} we estimate the dollar-cost of each training run at around \400.
+
+Under these constraints, our goal is to pretrain a model that can benefit \textit{classification} tasks, such as the ones in GLUE \cite{wang-etal-2018-glue}.
+Therefore, we follow the standard practice and focus on BERT-style transformer encoders trained on the masked language modeling objective \cite{devlin-etal-2019-bert}.
+We also retain the standard pretraining corpus of English Wikipedia and the Toronto BookCorpus \cite{zhu2015aligning}, containing 16GB of text, tokenized into subwords using BERT's uncased tokenizer.
+ \section{Combining Efficient Training Methods}
+\label{sec:methods}
+
+To speed up our training process, we combine a variety of recent techniques for optimizing a masked language model.
+While all of these techniques were reported by previous work, this is the first time, to the best of our knowledge, that they are combined and evaluated as a unified framework.
+
+\subsection{Methods}
+\label{sec:methods-methods}
+
+\paragraph{Data}
+Since our focus is primarily on sentence classification tasks, we limit the sequence length to 128 tokens for the entire pretraining process.
+\citet{devlin-etal-2019-bert} also apply this practice to 90\% of the training steps, and extend the sequence to 512 tokens for the last 10\%.
+This increases sample efficiency by reducing padding, and also allows us to fit a larger model into memory (see \textit{Model}).
+In addition, we use single-sequence training without the next-sentence prediction objective, which was shown to benefit optimization by SpanBERT \cite{joshi-etal-2020-spanbert} and RoBERTa \cite{Liu2019RoBERTaAR}.
+To reduce the amount of time spent on computing performance on the validation set, we held out only 0.5\% of the data (80MB), and computed the validation loss once every 30 minutes.\footnote{In the 5\% of the training session (about 72 minutes) we compute the validation loss every 10 minutes.}
+
+\paragraph{Model}
+Recent work has found that larger models tend to achieve better performance than smaller models when trained for the same wall-clock time \cite{Li2020TrainLT}.
+We adopt these recommendations and train a \bertlarge model: 24 layers, 1,024 dimensions, 16 heads, and 4,096 hidden dimensions in the feed-forward layer.
+Note that the purpose of applying the ``train large'' approach is \textit{not} to compete with fully-trained extra-large models, but to train the best model we can -- regardless of size -- given the computational constraints in Section~\ref{sec:problem}. 
+
+\paragraph{Optimizer}
+We follow the optimization of RoBERTa \cite{Liu2019RoBERTaAR} and use AdamW \cite{Loshchilov2017FixingWD} with ~0.9, ~0.98, ~1e-6, weight decay of 0.01, dropout 0.1, and attention dropout 0.1.
+We experiment with various learning rates and warmups in Section~\ref{sec:hyperparameters}.
+
+\paragraph{Software}
+We chose the DeepSpeed software package \cite{deepspeed}, which includes various optimizations for training language models on multiple GPUs, such as I/O prefetching, mixed-precision training, and a transformer kernel for GPUs.
+We further modified parts of the implementation by replacing the masked language model prediction head with sparse token prediction, and using fused implementations for all linear-activation-bias operations and layer norms.
+
+\paragraph{I/O}
+To reduce the I/O bottleneck, we follow \citet{devlin-etal-2019-bert} and pre-mask 10 copies of the original corpus.
+This allows us to tensorize the entire training set and load it into RAM, rather than accessing the disk.
+While \citet{Liu2019RoBERTaAR} recommend dynamic masking, the benefits of applying it in our low-resource setting are marginal, and outweighed by the computational cost.
+Finally, we notice that the original data sharding implementation duplicates the corpus within each shard, resulting in highly homogeneous mini-batches; instead, we shuffle the entire dataset after the masking process to increase in-batch diversity.
+
+\begin{table}
+\centering
+\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+ & \textbf{~~~~bsz} & \textbf{steps} & \textbf{samples} & \textbf{days} \\ \midrule
+Google \bertbase                   & ~~~~256   & 1000k    & 256M  & ~~5.85  \\ 
+Google \bertlarge        & ~~~~128    & 2000k    & 256M   & 26.33 \\ \midrule 
+\multirow{5}{*}{Our \bertlarge{}}    & ~~~~128   & 2000k    & 256M     & 14.11 \\
+    & ~~~~256   & 1000k    & 256M     & ~~8.34 \\
+    & ~~4096     & ~~~~63k & 256M    & ~~2.74 \\
+    & ~~8192     & ~~~~31k & 256M     & ~~2.53 \\
+    & 16384      & ~~~~16k & 256M & ~~2.41   \\ \bottomrule
+\end{tabular}
+\caption{A speed comparison between our optimized framework and the official implementation of BERT. 
+Both implementations are run on our 8 GPU setting (12GB each), with the goal of covering 256 million training examples.
+We ignore the second phase of training in the official implementation, which extends the sequence length to 512 tokens and significantly prolongs the training time.
+\bertlarge does not fit in our GPUs with a batch sie of 256; we therefore measure according to the largest batch size we could fit (128), which requires twice as many steps to cover the same amount of training instances.
+}
+\label{tab:backend}
+\end{table}
+
+
+%
+ 
+
+\subsection{Combined Speedup}
+
+We compare our optimized framework to the official implementation code released by \citet{devlin-etal-2019-bert}.\footnote{\url{https://github.com/tensorflow/models/tree/master/official/nlp/bert}}
+Table~\ref{tab:backend} shows that using the official code to train a base model could take almost \textit{6 days} under the hardware assumptions described in Section~\ref{sec:problem}, and a large model might require close to \textit{a month} of non-stop computation.
+In contrast, our recipe significantly speeds up training, allowing one to train \bertlarge with the original number of steps (1M) in a third of the time (8 days), or converge in 2-3 days by enlarging the batch size.
+While larger batch sizes do not guarantee convergence to models of equal quality, they are generally recommended in the literature \cite{ott-etal-2018-scaling,Liu2019RoBERTaAR}, and present a more realistic starting point for our next phase (hyperparameter tuning) given our 24-hour constraint.
+
+
+
+ \section{Hyperparameter Search}
+\label{sec:hyperparameters}
+
+Calibrating hyperparameters is key to increasing model performance in deep learning and NLP \cite{levy-etal-2015-improving, Liu2019RoBERTaAR}.
+We retune core optimization hyperparameters to fit our low-resource setting, rather than the massive computation frameworks for which they are currently tuned.
+Our hyperparameter search yields a substantial improvement in masked language modeling loss after 24 hours of training.
+
+
+\subsection{Hyperparameters}
+
+We tune the following hyperparameters:
+
+\paragraph{Batch Size (bsz)}
+The number of examples (sequences up to 128 tokens) in each mini-batch.
+Since we only have a limited amount of memory on each GPU, this can be inflated arbitrarily through gradient accumulation, at the cost of more time per update.
+We try batch sizes of 4,096, 8,192, and 16,384 examples.
+These batch sizes are of a similar order of magnitude to the ones used by RoBERTa \cite{Liu2019RoBERTaAR}.
+
+\paragraph{Peak Learning Rate (lr)}
+We use a linear learning rate scheduler, which starts at 0, warms up to the peak learning rate, and then decays back to 0.
+We try peak learning rates of 5e-4, 1e-3, and 2e-3.
+
+\paragraph{Warmup Proportion (wu)}
+We use a proportional system to determine the number of steps the learning rate warms up.
+We try 0\%, 2\%, 4\%, and 6\%.
+These proportions are significantly smaller than the proportion originally used by BERT \cite{devlin-etal-2019-bert}.
+
+\paragraph{Total Days (days)}
+The total number of days it would take the learning rate scheduler to decay back to 0, as measured on our hardware. This is equivalent to setting the maximal number of steps.
+Together with the warmup proportion, this hyperparameter determines where along the learning rate schedule the training process will cease.
+For a value of 1 day, the learning process will end exactly when the learning rate decays back to 0.
+We try setting the schedule according to a total number of 1, 3, and 9 days.
+
+
+\subsection{Methodology}
+
+We optimize our model using masked language modeling (MLM) loss with each hyperparameter setting.
+While the grid of possible hyperparameter combinations spans 108 configurations, it is often easy to spot early on which runs are unlikely to reach top performance.
+After 3 hours, we prune configurations that did not reach a validation-set loss of 6.0 or less; this rule mainly removes diverging runs, such as configurations with 0\% warmup.
+After 12 hours, we keep only the top 50\% models with respect to validation loss, and resume their runs until they reach 24 hours.
+We report results based only on runs that completed 24 hours of training.
+
+
+\begin{figure*}[ht!]
+    \centering
+    \begin{subfigure}[b]{0.23\textwidth}
+        \includegraphics[width=\textwidth]{images/mlm_24hr_dist_batch.pdf}
+        \caption{Batch Size}
+        \label{fig:bs_dist}
+    \end{subfigure}
+    ~ \begin{subfigure}[b]{0.23\textwidth}
+        \includegraphics[width=\textwidth]{images/mlm_24hr_dist_lr.pdf}
+        \caption{Learning Rate}
+        \label{fig:lr_dist}
+    \end{subfigure}
+    ~ \begin{subfigure}[b]{0.23\textwidth}
+        \includegraphics[width=\textwidth]{images/mlm_24hr_dist_warmup.pdf}
+        \caption{Warmup Proportion}
+        \label{fig:warmup_proportion_dist}
+    \end{subfigure}
+    ~ \begin{subfigure}[b]{0.23\textwidth}
+        \includegraphics[width=\textwidth]{images/mlm_24hr_dist_days.pdf}
+        \caption{Total Days}
+        \label{fig:total_day_dist}
+    \end{subfigure}
+    
+    \caption{Distribution of the validation-set MLM loss after 24 hours of training, when varying across different hyperparameters.}
+    \label{fig:24_hour_sweep}
+\end{figure*}
+
+
+\subsection{Results}
+
+We first analyze the effect of each hyperparameter by plotting the distribution of validation-set MLM loss per value (Figure~\ref{fig:24_hour_sweep}).
+We observe a clear preference towards synchronizing the learning rate schedule with the actual amount of training time in the budget (1 day).
+As suggested by a previous work~\cite{Li2020BudgetedTR}, annealing the learning rate to 0 at the end of the schedule may help the training process converge to a better model.
+We also find the smaller batch size to have an advantage over larger ones, along with moderate-high learning rates.
+We suspect that the smaller batch size works better for our resource budget due to the trade-off between number of samples and number of updates, for which a batch size of 4,096 seems to be a better fit.
+Finally, there appears to be a preference towards longer warmup proportions; however, a closer look at those cases reveals that when the number of total days is larger (3 or 9), it is better to use a smaller warmup proportion (2\%), otherwise the warmup phase might take up a significantly larger portion of the \textit{actual} training time.
+
+
+Table~\ref{tab:best_24hr_configs} shows the best configurations by MLM loss.
+It is apparent that our calibrated models perform substantially better than models with BERT's default hyperparameters (which were tuned for 4 days on 16 TPUs).
+There is also relatively little variance in performance among the top models.
+We also observe, once again, that setting the number of training iterations to fit 1 day dominates the list.
+
+We select the best-performing model (Search \#1) for our downstream task evaluation, and name it \textbf{24hBERT}.
+For a final analysis, we compare the learning curve of our top model to that of prior configurations of BERT-style models.
+Figure~\ref{fig:bert_comparison_in_24hr} shows that 24hBERT converges significantly earlier and to a lower MLM loss.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Configuration} &
+\bf loss &
+\bf bsz &
+\bf lr &
+\bf wu &
+\bf days \\
+\midrule
+Search \#1 & 1.717 & 4096 & 2e-3 & 6\% & 1 \\
+Search \#2 & 1.717 & 4096 & 1e-3 & 2\% & 1 \\
+Search \#3 & 1.720 & 4096 & 1e-3 & 6\% & 1 \\
+Search \#4 & 1.722 & 8192 & 1e-3 & 6\% & 1 \\
+Search \#5 & 1.723 & 4096 & 2e-3 & 4\% & 1 \\
+\midrule
+\bertbase{}   & 2.050 & 256 & 1e-4 & 11.1\% & 3 \\
+\bertlarge{}  & 2.318 & 256 & 1e-4 & 11.1\% & 8.3 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameter configurations of the models with the lowest validation-set MLM loss recorded at the end of 24 hours. We compare different batch size \textit{(bsz)}, peak learning rates \textit{(lr)}, warmup proportions \textit{(wu)} and total days for training \textit{(days)} with BERT's original hyperparameters, using our combined optimized framework.
+}
+\label{tab:best_24hr_configs}
+\end{table}
+ 
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{images/bert_24hr_comparison}
+\caption{The validation-set MLM loss across training time, by different hyperparameter configurations.}
+\label{fig:bert_comparison_in_24hr}
+\end{figure}
+ \section{Downstream Evaluation} \label{sec:tasks_eval}
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{@{}lcccccccccc@{}}
+\toprule
+& \bf MNLI-m/mm & \bf QNLI & \bf QQP & \bf RTE & \bf SST-2 & \bf MRPC & \bf CoLA & \bf STS-B & \bf Avg. \\
+\#Examples & 393k & 105k & 364k & 2.5k & 67k & 3.7k & 8.5k & 7k &  \\
+\midrule 
+\bertbase    & 84.6/84.0 & 90.6 & 72.0 & 69.1 & 92.8 & 86.1 & 55.1 & 84.3 & 79.8 \\
+\bertlarge   & 86.0/85.2 & 92.6 & 72.0 & 72.9 & 94.5 & 89.1 & 60.9 & 87.0 & 82.2 \\
+24hBERT      & 84.4/83.8 & 90.6 & 70.7 & 57.7 & 93.0 & 87.5 & 57.1 & 82.0 & 78.5 \\
+\bottomrule
+\end{tabular}
+\caption{
+Performance on GLUE test sets.
+All models are fine-tuned using the same hyperparameter space.
+}
+\label{tab:glue_tasks}
+\end{table*}
+ 
+We test the performance of our optimized, calibrated 24hBERT model on the GLUE benchmark~\cite{wang-etal-2018-glue}.\footnote{See Appendix~\ref{appendix:c} for a full description of the tasks.}
+For fine-tuning, we follow the practice of \citet{Liu2019RoBERTaAR} and run a grid search over multiple hyperparameters and seeds (see Appendix~\ref{appendix:b} for a complete list).
+
+Table~\ref{tab:glue_tasks} shows the results on both validation and test sets of the various GLUE tasks.
+We observe that our 24hBERT model is able to perform on par with \bertbase on 3 major datasets (MNLI, QNLI, SST-2) and even outperform it on 2 tasks (MRPC, CoLA), but reach lower performance than \bertbase on 3 tasks (QQP, RTE, STS-B).
+The performance gap on RTE is especially large, and accounts for the difference in the average score.
+We suspect that BERT's next-sentence prediction objective, which we omit (Section~\ref{sec:methods}), is particularly helpful for bitext classification when only a few training examples (2.5k) are available.
+Overall, we find that our recipe produces a model that is largely competitive with \bertbase, but at a small fraction of its training cost.
+
+
+
+%
+ \section{Related Work}
+
+There are numerous works that aim to reduce the computation required for training BERT or similar models by using novel algorithmic approaches~\cite{clark-etal-2020-learning, Gong2019EfficientTO, yang2020progressively, zhang2020accelerating, Kitaev2020ReformerTE, Wu2019PayLA, Wynter2020OptimalSE}. 
+In contrast, our work explores the potential of optimizing a single BERT model. 
+We assume our finding could be applied to other language models trained on large corpora.
+As mentioned, many software optimization have already been shown in previous work \cite{Shoeybi2019MegatronLMTM, Narayanan2021EfficientLL, deepspeed, ott-etal-2019-fairseq}.
+A recent work~\cite{narang2021transformer} exploring modifications to the Transformer architecture found that most modifications do not meaningfully improve performance of end-tasks. 
+Despite their findings, we aim to combine methods that were proven to speed up the training process with little loss in accuracy.
+
+
+
+\section{Conclusions}
+
+We present a recipe for pretraining a masked language model in 24 hours using only 8 low-end GPUs. 
+We show that by combining multiple efficient training methods presented in recent work and carefully calibrating the hyperparameters it is possible to pretrain a model that is competitive to \bertbase on GLUE tasks.
+As with every recipe, our recommendations may need to be adapted to the hardware and time constraints at hand.
+We hope that our findings allow additional players to participate in language model research and development, and help democratize the art of pretraining.
+
+
+
+ 
+
+\bibliographystyle{acl_natbib}
+\bibliography{acl_anthology,references}
+
+\appendix
+
+
+\section{Pretraining Configuration Hyperparameters}
+\label{appendix:a}
+Table~\ref{tab:pretrain_hp} presents the full set of hyperparameter configurations we examine in Section~\ref{sec:hyperparameters}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\bf Hyperparameter  & \bf Our Model \\
+\midrule 
+Number of Layers & 24 \\
+Hidden size & 1024 \\
+FFN inner hidden size & 4096 \\
+Attention heads & 16 \\
+Attention head size & 64 \\
+Dropout & 0.1 \\
+Attention Dropout & 0.1 \\
+Learning Rate Decay & Linear \\
+Weight Decay & 0.01 \\
+Optimizer & AdamW \\
+Adam  & 1e-6 \\
+Adam  & 0.9 \\
+Adam  & 0.98 \\
+Gradient Clipping & 0.0 \\ \midrule
+Batch Size & \{4096, 8192, 16384\} \\
+Peak Learning Rate & \{5e-4, 1e-3, 2e-3\} \\
+Warmup Proportion & \{0\%, 2\%, 4\%, 6\%\} \\
+Max Steps & \{24hr, 72hr, 216hr\} \\
+\bottomrule
+\end{tabular}
+\caption{
+Hyperparameters used for pretraining our models.
+}
+\label{tab:pretrain_hp}
+\end{table}
+ 
+
+\section{Finetuning Hyperparameters}
+\label{appendix:b}
+Finetuning hyperparameter used for the GLUE Benchmark tasks are presented in Table~\ref{tab:glue_hp}. We run each configuration using 5 random seeds and select the median of the best configuration.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\bf Hyperparameter  & \bf RTE, SST, MRPC, CoLA, STS, WNLI & \bf MNLI, QQP, QNLI \\
+\midrule 
+Learning Rate & \{1e-5, 3e-5, 5e-5, 8e-5\} & \{5e-5, 8e-5\}\\
+Batch Size & \{16, 32\} & 32\\
+Weight Decay & 0.1 & 0.1 \\
+Max Epochs & \{3, 5, 10\} & \{3, 5\} \\
+Warmup Proportion & 0.06 & 0.06 \\
+\bottomrule
+\end{tabular}
+\caption{
+The hyperparameter space used for finetuning our model on GLUE benchmark tasks.
+}
+\label{tab:glue_hp}
+\end{table*}
+ 
+
+
+\section{GLUE Tasks}
+\label{appendix:c}
+
+The GLUE benchmark includes the following
+datasets, the descriptions of which were originally
+summarized by \citet{wang-etal-2018-glue}:
+
+\textbf{MNLI}: Multi-Genre Natural Language Inference
+is a large-scale, crowd-sourced entailment classification task \cite{williams2018broadcoverage}. Given a pair of
+sentences, we wish to predict whether the second sentence is an entailment, contradiction, or neutral with respect to the first one.
+
+\textbf{QQP}: Quora Question Pairs is a binary classification task, where the goal is to determine whether two
+questions asked on Quora are semantically equivalent or not \cite{qqpcite}.
+
+\textbf{QNLI}: Question Natural Language Inference is
+a version of the Stanford Question Answering
+Dataset \cite{rajpurkar2016squad}. It has been
+converted into a binary classification task \cite{wang-etal-2018-glue}. The positive examples are (question, sentence) pairs, which contain the answer, and the negative examples are from the same paragraph, yet do not contain the answer.
+
+\textbf{SST-2}: The Stanford Sentiment Treebank is a
+binary single-sentence classification task, consisting of sentences extracted from movie reviews. Their sentiment is based on human annotations \cite{socher-etal-2013-recursive}.
+
+\textbf{CoLA}: The Corpus of Linguistic Acceptability is
+a binary single-sentence classification task, where
+the goal is to predict whether an English sentence
+is linguistically “acceptable” or not \cite{warstadt-etal-2019-neural}.
+
+\textbf{STS-B}: The Semantic Textual Similarity Benchmark is a collection of sentence pairs, drawn primarily from news headlines, woth additional sources as well \cite{cer-etal-2017-semeval}. They were annotated with a score from 1 to 5, which denotes how similar the two sentences are, when semantic meaning is considered.
+
+\textbf{MRPC}: Microsoft Research Paraphrase Corpus
+consists of sentence pairs automatically extracted
+from online news sources. The human annotations are
+for whether the sentences in the pair are semantically equivalent \cite{dolan-brockett-2005-automatically}.
+
+\textbf{RTE}: Recognizing Textual Entailment is a binary entailment task similar to MNLI, but with significantly less training data \cite{10.1007/11736790_9, bar-haim-2006, 10.5555/1654536.1654538}.
+
+ 
+\end{document}

@@ -1,0 +1,507 @@
+\appendix
+\beginsupplement
+\noindent This appendix is structured as follows:
+\begin{itemize}
+    \item We first provide implementation details of our temporal propagation network (Section~\ref{sec:app:temporal-details}).
+    \item We then analyze the class-agnostic training data of the temporal propagation network (Section~\ref{sec:app:temporal-training-data}).
+    \item After that, we list additional details regarding our experimental settings and results (Section~\ref{sec:app:experimental-details}).
+    \item Next, we provide results on the small-vocabulary YouTube-VIS~\cite{yang2019video} dataset for reference (Section~\ref{sec:app:youtube-vis-results}).
+    \item Lastly, we present qualitative results (Section~\ref{sec:app:qualitive-details}).
+\end{itemize}
+
+\section{Implementation Details of Temporal Propagation}\label{sec:app:temporal-details}
+\subsection{Overview}
+Recall that the temporal propagation model~ takes a set of segmented frames (memory)  and a query image  as input, and segments the query frame with the objects in the memory. 
+For instance,  propagates the segmentation  from the first frame  to the second frame . 
+The memory  is a compact representation computed from all past segmented frames.
+
+In our implementation, we adopt the design of the internal memory  from the recent Video Object Segmentation (VOS) approach XMem~\cite{cheng2022xmem}. 
+VOS algorithms are initialized by a first-frame segmentation (in our case, the first in-clip consensus output), and segment new incoming query frames.
+XMem is an online algorithm that maintains an internal feature memory representation . For each incoming frame , it computes a query representation which is used to read from the feature memory. It then uses the memory readout  to segment the query frame. The segmentation result  is used to update the internal representation . 
+With an internal memory management mechanism~\cite{cheng2022xmem}, this design has a bounded GPU memory cost with respect to the number of processed frames which is suitable for processing long video sequences.
+
+We refer readers to~\cite{cheng2022xmem} for details regarding XMem. 
+We describe core details below for completeness. 
+We make a few technical modifications to XMem to increase robustness in our generalized setting, which we also document below. We  provide the full code at {\href{https://hkchengrex.github.io/Tracking-Anything-with-DEVA}{\nolinkurl{hkchengrex.github.io/Tracking-Anything-with-DEVA}}.}
+
+\subsection{Network Architecture}
+The temporal propagation network consists of four network modules: a \textit{key encoder}, a \textit{value encoder}, a \textit{mask decoder}, and a \textit{Convolutional Gated Recurrent Unit~(Conv-GRU)}~\cite{chung2014empirical}.
+
+The \textit{key encoder}, implemented with a ResNet-50~\cite{he2016deepResNet}, takes an image as input and produces multi-scale features at the first (stride 4), second (stride 8), and third (stride 16) stages. The fourth stage is discarded.
+The feature in the third stage is projected to a `key', which is used for querying during memory reading.
+After segmentation, if we decide to add the segmented query frame into the memory , we will re-use this `key' in the memory.
+
+The \textit{value encoder}, implemented with a ResNet-18~\cite{he2016deepResNet}, takes an image and a corresponding object mask as inputs and produces a `value' representation as part of the memory. 
+We discard the fourth stage and only use the stride-16 output feature in the third stage.
+Objects are processed independently (done in mini-batches during inference).
+
+The \textit{mask decoder} takes the memory readout  and multi-scale skip connections from the key encoder as inputs and produces an object mask. 
+It consists of three upsampling blocks. 
+Each upsampling block uses the output from the previous layer as input, upsamples it bilinearly by a factor of two, and fuses the upsampled result with the skip connection at the corresponding scale with a residual block with two  convolutions.
+A  convolution is used as the last output layer to generate a single-channel (stride 4) logit and bilinearly upsamples it by four times to the original resolution.
+Similar to the value encoder, objects are processed independently, which can be done in mini-batches during inference.
+Soft-aggregation~\cite{oh2019videoSTM} is used to combine logits for different objects as in~\cite{cheng2022xmem}.
+
+The \textit{Convolutional Gated Recurrent Unit~(Conv-GRU)}~\cite{chung2014empirical} takes the last hidden state and the output of every upsampling block in the mask decoder as input and produces an updated hidden state.
+ convolutions are used as projections in the Conv-GRU.
+
+\paragraph{Our Modifications.}
+Firstly, in XMem~\cite{cheng2022xmem}, the 1024\nobreakdash-channel third-stage feature from the key encoder is directly concatenated with the memory readout for mask decoding. For efficiency, we instead first project the 1024\nobreakdash-channel feature to 512 channels with a  convolutional layer before concatenating it with the memory readout. 
+Secondly, in each upsampling block of the mask decoder, XMem uses a  convolution to pre-process the skip-connected feature. We replace it with a  convolution.
+Moreover, XMem~\cite{cheng2022xmem} and prior works~\cite{oh2019videoSTM,cheng2021stcn} take the image, the target mask, and the sum of all non-target masks (excluding background) as input for the value encoder. We discard the `sum of all non-target masks' as we note that it becomes uninformative when there are many objects in the scene -- typical in open-world scenarios.
+We notice a moderate speed-up (22.625.8~FPS in DAVIS-2017~\cite{caelles2019}) from these modifications.
+
+\subsection{Feature Memory}
+\paragraph{Representation.}
+The feature memory consists of three parts: a sensory memory, a working memory, and a long-term memory. 
+The sensory memory is represented by the hidden state of the Conv\nobreakdash-GRU and contains positional information for temporal consistency that is updated every frame.
+Both the working memory and the long-term memory are attention-based and contain key-value pairs. The working memory is updated every  frames and has a maximum capacity of  frames. During each update, the `key' feature from the key encoder and the `value' feature from the value encoder will be appended to the working memory after segmentation of the current frame.
+When the working memory reaches its capacity, the oldest   frames will be consolidated into the long-term memory. Please refer to~\cite{cheng2022xmem} for details.
+
+\paragraph{Memory Reading.}
+The last hidden state of the Conv\nobreakdash-GRU is used as the memory readout of the sensory memory. For the working and long-term memory, we compute a query from the query frame and perform space-time memory reading~\cite{oh2019videoSTM} to read from both types of memory.
+For spatial dimensions , the memory readout for the sensory memory is  and the memory readout for the working/long-term memory is . In XMem,  and  and these two features are concatenated together as the final memory readout .
+
+\paragraph{Our Modifications.}
+For better temporal consistency, we expand the channel size  of the sensory memory to . 
+For efficiency, we use `addition' instead of the original `concatenation' to fuse the memory readout from the sensory memory with the working/long-term memory.
+Besides, we supervise the sensory memory with an auxiliary loss -- a  convolution is applied to the sensory memory to produce the weights and biases of a linear classifier on the stride 16 image feature (from the key encoder) for mask prediction. Cross-entropy loss with a weight of  is applied on this predicted mask and the network is trained end-to-end.
+
+\subsection{Inference Hyperparameters}
+Following~\cite{cheng2022xmem}, the sensory memory is updated every frame. A new memory frame is added to the working memory every -th frame. We synchronize  with our in-clip consensus frequency, such that every in-clip consensus result is added to the working memory. Following the default hyperparameters in~\cite{cheng2022xmem}, we set , , the maximum number of long-term memory elements to be , and use top- filtering~\cite{cheng2021mivos} with . 
+
+\subsection{Training}\label{sec:app:temporal-training}
+XMem is first pretrained on static image segmentation datasets~\cite{shi2015hierarchicalECSSD,wang2017DUTS,zeng2019towardsHRSOD,li2020fss,cheng2020cascadepsp} by synthesizing small video clips of three frames with affine and thin-spline deformations. It is then trained on two video datasets: YouTubeVOS~\cite{xu2018youtubeVOS} and DAVIS~\cite{perazzi2016benchmark} by sampling clips of length eight.
+
+\begin{figure*}
+\centering
+\begin{tabular}{c@{}c}
+
+\rotatebox[origin=c]{90}{\small AOT augmentation \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.9\linewidth]{imgs/aug/aot.png}
+}\\
+\vspace{-3.5mm}\\
+\rotatebox[origin=c]{90}{\small XMem augmentation \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.9\linewidth]{imgs/aug/xmem.png}
+}\\
+\vspace{-3.5mm}\\
+\rotatebox[origin=c]{90}{\small Our augmentation \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.9\linewidth]{imgs/aug/ours.png}
+}\\
+
+\end{tabular}
+ \caption{AOT~\cite{yang2021associating} and XMem~\cite{cheng2022xmem} use different crops and rotations within a sequence respectively. We fix both within a sequence to encourage the learning of positional information.}
+\label{fig:app-data-aug}
+\end{figure*}
+
+\begin{figure*}
+\centering
+\begin{tabular}{c@{\hspace{0cm}}c@{\hspace{-3pt}}c@{\hspace{-3pt}}c@{\hspace{-3pt}}c@{\hspace{-3pt}}c@{\hspace{-3pt}}c}
+
+\rotatebox[origin=c]{90}{\small Images \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/images/00000001.jpg}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/images/00000060.jpg}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/images/00000180.jpg}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/images/00000220.jpg}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/images/00000260.jpg}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/images/00000300.jpg}
+}\\
+\vspace{-3.5mm}\\
+
+
+
+\rotatebox[origin=c]{90}{\small Aggre. aug. \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000001.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/xd/00000060.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/xd/00000180.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/xd/00000220.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/xd/00000260.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/xd/00000300.png}
+}\\
+\vspace{-3.5mm}\\
+
+\rotatebox[origin=c]{90}{\small Stable aug. (ours) \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000001.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/ours/00000060.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/ours/00000180.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/ours/00000220.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/ours/00000260.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/ours/00000300.png}
+}\\
+\vspace{-3.5mm}\\
+
+\rotatebox[origin=c]{90}{\small GT \hspace{1mm}}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000001.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000060.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000180.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000220.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000260.png}
+}&
+\raisebox{-0.5\height}{
+    \includegraphics[width=0.15\linewidth]{imgs/ants/gt/00000300.png}
+}\\
+
+& \small Frame 1 & \small Frame 60 & \small Frame 180 & \small Frame 220 & \small Frame 260 & \small Frame 300 \\
+\end{tabular}
+ \caption{Comparison of methods tracking a group of ants with almost identical appearance.
+The variant with aggressive augmentation fails for the yellow, blue, and cyan ants toward the end while ours with stable data augmentation tracks all ants successfully.
+Ground-truth is annotated by us with an interactive image segmentation method, f-BRS~\cite{sofiiuk2020f}.
+Zoom in for details.}
+\label{fig:app-ants}
+\end{figure*}
+
+\paragraph{Our Modifications.}
+We make three major modifications to the training process for better robustness:
+\begin{enumerate}
+    \item We introduce the more challenging OVIS~\cite{qi2022occluded} data into training as we find models have already saturated and produced almost perfect segmentation results on DAVIS and YouTubeVOS during training.
+    \item We use a `stable' data augmentation pipeline which leads to better temporal consistency. 
+    Current state-of-the-art data augmentation pipelines use aggressive augmentation, applying different rotations~\cite{cheng2022xmem} or crops~\cite{yang2021associating} to frames within the same sequence. 
+    This encourages an invariant appearance model but harms the learning of temporal information. We instead use the same rotation and crop augmentation for a video sequence. Figure~\ref{fig:app-data-aug} visualizes the difference.
+    \item We clip the norm of the gradient at  during training. We find that this leads to faster convergence and more stable training.
+\end{enumerate}
+
+We use a batch size of 16, the same loss function (hard-mining cross-entropy loss with a warm-up and soft DICE loss) as XMem~\cite{cheng2022xmem}, and the AdamW~\cite{loshchilov2017decoupledAdamW} optimizer. During pre-training, we use a learning rate of 2-5 for 80,000 iterations. During main training, we use a learning rate of 1-5 for 150,000 iterations with a learning rate decay of  at the 120,000-th iteration and the 140,000-th iteration.
+
+\subsection{Video Object Segmentation Evaluation}
+We compare our temporal propagation model with state-of-the-art methods on three common video object segmentation benchmarks: DAVIS-2017 validation/test-dev~\cite{perazzi2016benchmark}, YouTubeVOS-2019 validation~\cite{xu2018youtubeVOS}, and MOSE validation~\cite{MOSE}. Table~\ref{tab:app:vos-1} tabulates our results.
+We resize all input  such that the shorter side is 480px and bilinearly upsample the output back to the original resolution following XMem~\cite{cheng2022xmem}. All frames in YouTubeVOS~\cite{xu2018youtubeVOS} are used by default.
+Our simple modifications bring noticeable improvements on all benchmarks. Though, we find that the overall framework is more important than these design choices (Section~\ref{sec:app:vps-ablation}).
+
+\begin{table*}[t]
+    \centering
+\begin{tabular}
+{l@{\hspace{10pt}}C{2.2em}@{}C{2.2em}@{}C{2.2em}@{\hspace{10pt}}C{2.2em}@{}C{2.2em}@{}C{2.2em}@{\hspace{10pt}}C{2.2em}@{}C{2.2em}@{}C{2.2em}@{\hspace{10pt}}C{2.2em}@{}C{2.2em}@{}C{2.2em}@{}C{2.2em}@{}C{2.2em}@{}R{2em}}
+\toprule
+& \multicolumn{3}{c}{MOSE}  & \multicolumn{3}{c}{\hspace{-12pt}DAVIS-17 val} & \multicolumn{3}{c}{\hspace{-12pt}DAVIS-17 test-dev} & \multicolumn{6}{c}{YouTubeVOS-2019 val} \\
+\cmidrule(lr{\dimexpr 4\tabcolsep+12pt}){2-5} \cmidrule(lr{\dimexpr 4\tabcolsep+12pt}){5-8} \cmidrule(lr{\dimexpr 4\tabcolsep+12pt}){8-11} \cmidrule(lr){11-16}
+Method & \mjf & \mj & \mf & \mjf & \mj & \mf & \mjf & \mj & \mf & \mg & \mjs & \mfs & \mju & \mfu & FPS \\
+\midrule
+STCN~\cite{cheng2021stcn} & 52.5 & 48.5 & 56.6 & 85.4 & 82.2 & 88.6 & 76.1 & 72.7 & 79.6 & 82.7 & 81.1 & 85.4 & 78.2 & 85.9 & 13.2 \\
+AOT-R50~\cite{yang2021associating} & 58.4 & 54.3 & 62.6 & 84.9 & 82.3 & 87.5 & 79.6 & 75.9 & 83.3 & 85.3 & 83.9 & 88.8 & 79.9 & 88.5 & 6.4 \\
+XMem~\cite{cheng2022xmem} & 56.3 & 52.1 & 60.6 & 86.2 & 82.9 & 89.5 & 81.0 & 77.4 & 84.5 & 85.5 & 84.3 & 88.6 & 80.3 & 88.6 & 22.6 \\
+DEVA (ours), w/o OVIS & 60.0 & 55.8 & 64.3 & 86.8 & 83.6 & 90.0 & 82.3 & 78.7 & 85.9 & 85.5 & 85.0 & 89.4 & 79.7 & 88.0 & \textbf{25.3} \\
+DEVA (ours), w/ OVIS & \textbf{66.5} & \textbf{62.3} & \textbf{70.8} & \textbf{87.6} & \textbf{84.2} & \textbf{91.0} & \textbf{83.2} & \textbf{79.6} & \textbf{86.8} & \textbf{86.2} & \textbf{85.4} & \textbf{89.9} & \textbf{80.5} & \textbf{89.1} & \textbf{25.3} \\
+\midrule
+\bottomrule
+\end{tabular}     \caption{Comparison of DEVA's temporal propagation module with state-of-the-art video object segmentation methods. FPS is measured on YouTubeVOS-2019 validation with a V100 GPU. All available frames in YouTubeVOS are used by default.}
+    \label{tab:app:vos-1}
+\end{table*}
+
+
+\subsection{Ablation Studies}
+\subsubsection{On VOS Tasks}
+We assess the effects of our modifications on the training process on VOS tasks which purely evaluate temporal propagation performance.
+In addition to the standard DAVIS~\cite{perazzi2016benchmark} dataset, we additionally convert the validation sets of OVIS~\cite{qi2022occluded} and UVO~\cite{wang2021unidentified} to the VOS format.
+Following DAVIS~\cite{perazzi2016benchmark}, we discard any segments that do not appear in the first frame and provide the first-frame ground-truth segmentation as input.
+These datasets are more diverse and allow for a more complete evaluation of temporal propagation performance.
+Table~\ref{tab:app:temporal-prop-ablation-vos} tabulates our findings.
+For a fair comparison, we also re-train the original XMem~\cite{cheng2022xmem} with additional OVIS~\cite{qi2022occluded} data.
+A qualitative comparison of aggressive \vs stable data augmentation is illustrated in Figure~\ref{fig:app-ants}.
+
+\begin{table}[h]
+\small
+    \centering
+\begin{tabular}{l@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c}
+\toprule
+Variant & DAVIS & OVIS  & UVO & FPS \\
+\midrule
+XMem~\cite{cheng2022xmem} & 86.1 & 69.0 & 82.7 & 22.6 \\
+XMem~\cite{cheng2022xmem} train w/ OVIS & 86.1 & 72.0 & 83.0 & 22.6 \\
+\midrule
+With all our modifications & \textbf{87.6} & \textbf{75.7} & \textbf{83.5} & \textbf{25.8} \\
+w/o stable data aug. & 87.5 & 73.6 & 83.2 & \textbf{25.8} \\
+w/o gradient clipping & 85.2 & 71.3 & 82.7  & \textbf{25.8} \\
+\midrule
+\bottomrule
+\end{tabular}     \caption{\mjf~performance comparisons of XMem~\cite{cheng2022xmem} and our different modifications on VOS tasks.}
+    \label{tab:app:temporal-prop-ablation-vos}
+\end{table}
+
+\begin{table*}[t]
+    \centering
+\begin{tabular}{lc@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c}
+\toprule
+\textbf{\textit{Varying Temporal Propagation Model}} & VPQ & VPQ & VPQ & VPQ & VPQ & VPQ & VPQ &  & STQ\\
+\midrule
+With standard XMem~\cite{cheng2022xmem} & 41.9 & 41.3 & 40.6 & 39.9 & 39.5 & 39.0 & 35.4 & 37.9 & 41.3 \\
+With our modified XMem~\cite{cheng2022xmem} & \textbf{42.1} & \textbf{41.5} & \textbf{40.8} & \textbf{40.1} & \textbf{39.7} & \textbf{39.3} & \textbf{36.1} & \textbf{38.3} & \textbf{41.5} \\
+\midrule
+\textbf{\textit{Varying Training Data of Temporal Propagation}} & VPQ & VPQ & VPQ & VPQ & VPQ & VPQ & VPQ &  & STQ\\
+\midrule
+Image pretraining + 100\% video training & \textbf{42.1} & \textbf{41.5} & \textbf{40.8} & \textbf{40.1} & \textbf{39.7} & \textbf{39.3} & \textbf{36.1} & \textbf{38.3} & \textbf{41.5} \\
+Image pretraining + 50\%  video training & 42.0 & 41.4 & 40.7 & 40.1 & 39.7 & 39.4 & 36.0 & 38.3 & 41.3 \\
+Image pretraining + 10\% video training & 40.7 & 40.1 & 39.3 & 38.5 & 38.1 & 37.7 & 34.6 & 36.8 & 40.1 \\
+\midrule
+Training on 100\% YouTube-VOS~\cite{xu2018youtubeVOS} only & 41.4 & 40.9 & 40.2 & 39.5 & 39.1 & 38.7 & 35.6 & 37.8 & 41.0 \\
+Training on 50\% YouTube-VOS~\cite{xu2018youtubeVOS} only & 40.5 & 39.4 & 38.0 & 36.6 & 35.6 & 34.4 & 31.3 & 34.4 & 37.8 \\
+
+
+
+
+\midrule
+\bottomrule
+\end{tabular}     \caption{Performance comparisons of our method with different temporal propagation model settings on the VIPSeg~\cite{miao2022large} validation set. 
+    For a fair comparison, all are semi-online with a Mask2Former-R50~\cite{cheng2022masked} image model input.}
+    \label{tab:app:temporal-prop-ablation-vipseg}
+\end{table*}
+
+\subsubsection{On Large-Scale Video Panoptic Segmentation}\label{sec:app:vps-ablation}
+Next, we assess whether these improvements in VOS tasks transfer to target tasks like video panoptic segmentation.
+We compare our final model with/without these modifications on a large-scale video panoptic segmentation dataset VIPSeg~\cite{miao2022large} with the Mask2Former-R50~\cite{cheng2022masked} backbone. 
+Table~\ref{tab:app:temporal-prop-ablation-vipseg} (top) tabulates our findings.
+Note, our method still works well even without our modifications to the temporal propagation network. 
+We find the overall framework to be more important than particular design choices within the temporal propagation model.
+
+\section{Training Data of Temporal Propagation}\label{sec:app:temporal-training-data}
+
+\subsection{Sensitivity to Training Data}
+We train the temporal propagation on class-agnostic image segmentation and mask propagation data as described in Section~\ref{sec:app:temporal-training}.
+We note that these datasets are cheap to access and amass as they do not require class-specific annotations. 
+Here, we evaluate the importance of large-scale training of the temporal propagation model.
+We vary the amount of class-agnostic video-level training data under two settings: 1) with full image pretraining, and all three mask propagation datasets (DAVIS~\cite{perazzi2016benchmark}, YouTubeVOS~\cite{xu2018youtubeVOS} and OVIS~\cite{qi2022occluded}), and 2) without image pre-taining and using YouTubeVOS as the only training data.
+Table~\ref{tab:app:temporal-prop-ablation-vos} (bottom) tabulates our findings on the VIPSeg~\cite{miao2022large} validation set. 
+The performance of our model decays gracefully with fewer training data.
+
+\subsection{Class Overlaps with VIPSeg}
+While we train the temporal propagation network in a class-agnostic setting, the segmented objects in the training set might have object categories that overlap with the target task (e.g., with the classes in VIPSeg~\cite{miao2022large}).
+Here, we investigate the effect of this overlap of temporal propagation training data with target task data on the final performance.
+
+For this, we train the temporal propagation network with only YouTubeVOS~\cite{xu2018youtubeVOS} data which has 65 object categories (other datasets that we use for training have no class annotation).
+We manually match these 65 categories with the classes in VIPSeg~\cite{miao2022large} to partition the classes of VIPSeg into three sets: `overlapping', `non-overlapping', or `ambiguous'.\footnote{The overlapping set includes flag, parasol\_or\_umbrella, car, bus, truck, bicycle, motorcycle, ship\_or\_boat, airplane, person, cat, dog, horse, cattle, skateboard, ball, box, bottle\_or\_cup, table\_or\_desk, mirror, and train (21 in total).
+The ambiguous set includes other\_animal, bag\_or\_package, toy, and textiles (4 in total).
+The remaining (99) classes in VIPSeg are in the non-overlapping set.}
+We then evaluate the final task performance on the overlapping and the non-overlapping sets separately, while ignoring the `ambiguous' set.
+We perform the same evaluation on an end-to-end method, Video-K-Net~\cite{li2022video}, as a measure of `baseline difficulty' for each set.
+Table~\ref{tab:app:class-overlap} tabulates our findings. 
+We observe no significant difference between the overlapping and non-overlapping set when accounting for the difficulty delta () observed in the baseline.
+This indicates that our class-agnostic training does not overfit to the object categories in the training set.
+
+\begin{table}[h]
+    \small
+    \centering
+\begin{tabular}{l@{\hspace{0mm}}c@{\hspace{2mm}}c@{\hspace{2mm}}c}
+\toprule
+Method &  &  &  \\
+\midrule
+Video-K-Net & 25.0 & 25.7 & +0.7 \\
+Ours & 38.1 & 38.6 & +0.5 \\
+\midrule
+\bottomrule
+\end{tabular}     \caption{Performance comparison on different classes of VIPSeg that overlap or do not overlap with the training data of temporal propagation.
+    As a baseline, we use Video-K-Net-R50~\cite{li2022video}. 
+    For ours, we use Mask2Former-R50 with a temporal propagation model that is only trained on YouTubeVOS~\cite{xu2018youtubeVOS} and evaluated in a semi-online setting.}
+    \label{tab:app:class-overlap}
+\end{table}
+
+\section{Detailed Experimental Settings and Results}\label{sec:app:experimental-details}
+
+\subsection{Large-Scale Video Panoptic Segmentation}\label{sec:app:expr-vipseg}
+Following the standard practice~\cite{miao2022large}, we use the 720p version of the VIPSeg~\cite{miao2022large} dataset. 
+We evaluate using its validation set (343 videos) and compute VPQ/STQ using the official codebase.
+During temporal propagation, we downsample the videos such that the shortest side is 480px and bilinearly upsample the result back to the original resolution following~\cite{cheng2022xmem}.
+
+Video Panoptic Segmentation (VPS) requires the prediction of class labels. 
+We obtain these labels from the image segmentation model and use online majority voting to determine the output label.
+Formally, we keep a list of class labels  for each object . 
+When an existing (propagated) segment  matches with a segment from the in-clip consensus , i.e., , we take the class label from the consensus  and append it to the list . 
+At the output of every frame, we determine the class label associated with segment  by performing majority voting in .
+Note, in accordance with VPS evaluation~\cite{kim2020video}, an object can only have one class label throughout the video.
+This means a change in class label necessitates a change in object id, which we also implemented.
+Thus, a change in class label might lead to lower association accuracy.
+An alternative algorithm would be to use the final major voting result to retroactively apply the class label in all frames, which would however not be strictly online/semi-online.
+
+\paragraph{Running time Analysis}
+Under our default semi-online setting, we use a clip size of 3 and perform merging every 5 frames (i.e., invoking the image model on 60\% of all frames).
+We report time on VIPSeg~\cite{miao2022large}, averaged across all frames, on an A6000 GPU.
+The mask propagation module takes 83ms per frame (VIPSeg has more objects per video than the standard VOS timing benchmark DAVIS-2017). 
+For every merge, pre-processing (spatial alignment and finding pairwise IoU) takes 211ms, and solving the integer program takes 15ms.
+For the image model (R50 backbone), both Video-K-Net~\cite{li2022video} and Mask2Former~\cite{cheng2022masked} take around 200ms per frame.
+Overall, our method runs at 4.0fps.
+Meanwhile, state-of-the-art Video-K-Net runs at 4.9fps. Ours is 18\% slower but has a 52\% higher .
+
+\subsection{Open-World Video Segmentation}
+We evaluate on the validation (993 videos) and test (1421 videos) sets of BURST~\cite{athar2023burst}. 
+As in Section~\ref{sec:app:expr-vipseg}, we downsample the videos during temporal propagation such that the shortest side is 480px and bilinearly upsample the result back to the original resolution following~\cite{cheng2022xmem}. For efficiency, we process only every three frames. Since the ground-truth is sparse (annotated every 24 or 30 frames), we can still perform a complete evaluation.
+
+For the Mask2Former~\cite{cheng2022masked} image model, we follow BURST~\cite{athar2023burst} and use the best-performing Swin-L checkpoint trained on COCO~\cite{lin2014microsoft} provided by the authors. 
+For the EntitySeg~\cite{qi2021open} image model, we also use the best available Swin-L model checkpoint trained on COCO~\cite{lin2014microsoft}.
+For overlapping predictions, we use the post-processing for panoptic segmentation in Mask2Former~\cite{cheng2022masked} to resolve them.
+
+We assess Open World Tracking Accuracy (OWTA) using official tools. OWTA is the geometric mean of Detection Recall (DetRe) and Association Accuracy (AssA). Please refer to~\cite{athar2023burst} for details. For completeness, we additionally report DetRe and AssA of baselines and our method in Table~\ref{tab:app:burst-deta-assa}.
+
+\begin{table*}
+\small
+    \centering
+\begin{tabular}{llccccccccc}
+\toprule
+& & \multicolumn{9}{c}{\textbf{Validation}} \\
+\cmidrule(lr){3-11}
+& & \multicolumn{3}{c}{\textbf{All}} & \multicolumn{3}{c}{\textbf{Common}} & \multicolumn{3}{c}{\textbf{Uncommon}} \\
+\cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(lr){9-11}
+Method & & DetRe & AssA & OWTA & DetRe & AssA & OWTA & DetRe & AssA & OWTA \\
+\midrule
+Mask2Former & w/ Box tracker~\cite{athar2023burst} & 66.9 & 55.8 & 60.9 & 78.7 & 57.1 & 60.9 & 20.1 & 30.5 & 24.0 \\
+Mask2Former & w/ STCN tracker~\cite{athar2023burst} & 67.0 & 62.6 & 64.6 & 78.8 & 64.1 & 71.0 & 20.0 & 33.3 & 25.0 \\
+OWTB~\cite{liu2022opening} & & 70.9 & 45.2 & 56.2 & 76.8 & 47.0 & 59.8 & 46.5 & 34.3 & 38.5 \\
+Mask2Former & w/ ours online & 72.1 & 67.5 & 69.5 & 80.2 & 69.9 & 74.6 & 39.8 & 46.4 & 42.3 \\
+Mask2Former & w/ ours semi-online & 71.8 & \textbf{68.5} & \textbf{69.9} & \textbf{80.3} & \textbf{70.7} & \textbf{75.2} & 37.9 & 46.8 & 41.5 \\
+EntitySeg & w/ ours online & 72.3 & 66.0 & 68.8 & 77.7 & 68.4 & 72.7 & \textbf{50.3} & 50.2 & 49.6 \\
+EntitySeg & w/ ours semi-online & \textbf{72.4} & 67.1 & 69.5 & 78.1 & 69.3 & 73.3 & 50.0 & \textbf{52.2} & \textbf{50.5} \\
+\midrule
+& & \multicolumn{9}{c}{\textbf{Test}} \\
+\cmidrule(lr){3-11}
+& & \multicolumn{3}{c}{\textbf{All}} & \multicolumn{3}{c}{\textbf{Common}} & \multicolumn{3}{c}{\textbf{Uncommon}} \\
+\cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(lr){9-11}
+Method & & DetRe & AssA & OWTA & DetRe & AssA & OWTA & DetRe & AssA & OWTA \\
+\midrule
+Mask2Former & w/ Box tracker~\cite{athar2023burst} & 61.5 & 51.1 & 55.9 & 71.4 & 52.5 & 61.0 & 21.1 & 30.0 & 24.6 \\
+Mask2Former & w/ STCN tracker~\cite{athar2023burst} & 61.6 & 54.1 & 57.5 & 71.5 & 55.7 & 62.9 & 21.0 & 28.6 & 23.9 \\
+OWTB~\cite{liu2022opening} & & 70.9 & 45.2 & 56.2 & 76.8 & 47.0 & 59.8 & 46.5 & 34.3 & 38.5 \\
+Mask2Former & w/ ours online & 72.2 & 68.6 & 70.1 & \textbf{79.8} & 70.8 & 75.0 & 40.7 & 49.2 & 44.1 \\
+Mask2Former & w/ ours semi-online & 71.9 & \textbf{69.6} & \textbf{70.5} & 79.7 & \textbf{71.7} & \textbf{75.4} & 39.5 & 50.7 & 44.1 \\
+EntitySeg & w/ ours online & \textbf{72.5} & 67.3 & 69.5 & 77.3 & 69.2 & 72.9 & \textbf{52.3} & 55.0 & 53.0 \\
+EntitySeg & w/ ours semi-online & 72.4 & 67.7 & 69.8 & 77.4 & 69.5 & 73.1 & 51.9 & \textbf{55.9} & \textbf{53.3} \\
+\midrule
+\bottomrule
+\end{tabular}
+     \caption{Extended results comparing baselines and our methods in the validation/test sets of BURST~\cite{athar2023burst}. Baseline performances are transcribed from~\cite{athar2023burst}.}
+    \label{tab:app:burst-deta-assa}
+\end{table*}
+
+\subsection{Referring Video Segmentation}\label{sec:app:referring-details}
+To evaluate on Ref-DAVIS~\cite{khoreva2019video} and Ref-YouTubeVOS~\cite{seo2020urvos}, we use ReferFormer Swin-L~\cite{wu2022language} as the image model. The network is first pretrained on Ref-COCO~\cite{yu2016modeling}, Ref-COCO+~\cite{yu2016modeling}, and G-Ref~\cite{mao2016generation} datasets and finetuned on Ref-YouTubeVOS~\cite{seo2020urvos} following~\cite{wu2022language}.
+Unlike in video panoptic segmentation or open-world video segmentation, we do not need to use integer programming to associate segments from the image model in different frames.
+This is because each segment corresponds to a known language expression. 
+Thus, we process each object independently and use  to fuse the final segmentations.
+As mentioned in the main paper, we employ an offline setting as in prior works~\cite{seo2020urvos,wu2022language,ding2022vlt}.
+
+In the offline setting, we first perform in-clip consensus by selecting 10 uniformly spaced frames in
+the video and using the frame with the highest confidence given by the image model as a ‘key frame’ for aligning the other frames. 
+Soft probability maps are used in the consensus to preserve confidence levels in the prediction.
+We then forward- and backward-propagate from the key frame without incorporating additional image segmentations.
+
+Formally, for a given object, we denote its soft probability map and confidence score given by the image model as  and  respectively.
+We denote the frame index of the ten chosen frames as .
+
+We aim to compute a soft probability consensus  at a keyframe index  by a weighted summation of the soft probability maps of the chosen frames :
+
+where  is a weighting coefficient, with .
+
+We use the frame with the highest confidence predicted by the image model as the keyframe:
+
+
+We compute the weighting coefficients using a softmax of the confidences such that we weigh confident predictions more:
+
+
+After the consensus,  is used to initialize forward and backward propagation from frame  without incorporating additional image segmentations.
+The propagation is implemented as standard semi-supervised video object segmentation inference with the keyframe as initial guidance.
+During propagation, the internal memory  is updated every 5 frames using its own prediction as in~\cite{cheng2022xmem}.
+
+\subsection{Unsupervised Video Object Segmentation}
+For single-object unsupervised video object segmentation (DAVIS-2016~\cite{perazzi2016benchmark}), we use DIS~\cite{qin2022highly} as the image segmentation model. 
+Since it does not provide segmentation confidence, we approximate it with the normalized area of the predicted mask to ignore null detections, i.e., .
+
+For multi-object unsupervised video object segmentation (DAVIS-2017~\cite{caelles2019}), we follow our semi-online protocol in open-world video segmentation. 
+The exception being DAVIS-2017~\cite{caelles2019} allows a maximum of 20 objects in the prediction. 
+We overcome this limitation online by only accepting the first 20 objects and discarding the rest. 
+When there are more than 20 objects in the frame, we prioritize the ones with larger areas as they are less likely to be noisy.
+
+\section{Results on YouTube-VIS}\label{sec:app:youtube-vis-results}
+Here we present additional results on the small-vocabulary YouTube-VIS~\cite{yang2019video} dataset, but unsurprisingly recent end-to-end specialized approaches perform better because a sufficient amount of data is available in this case.
+For this task, we use our online video panoptic segmentation setting.
+Besides the difference in the scale of vocabularies, our method assumes that no two objects occupy the same pixel, and produces a non-overlapping mask. 
+Although this assumption is usually true, it harms the Average Precision (AP) evaluation of our method in VIS, with other methods typically outputting many (100) potentially overlapping proposals for higher recall. We provide our result in Table~\ref{tab:app:youtubevis}.
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{lcc}
+    \toprule
+    Method & mAP & AP@75\\
+    \midrule
+    MaskProp~\cite{bertasius2020classifying} & 40.0 & 42.9\\
+    Video-K-Net~\cite{li2022video} & 40.5 & 44.5 \\
+    MinVIS~\cite{huang2022minvis} & \textbf{47.4} & \textbf{52.1} \\
+    Mask2Former~\cite{cheng2022masked} w/ Ours & 40.8 & 44.3 \\
+    \midrule
+    \bottomrule
+    \end{tabular}
+    \caption{Performance comparisons on YouTube-VIS 2019 validation. 
+    All models use a ResNet-50 backbone.
+    Note MinVIS is optimized for small-vocabulary YouTube-VIS and underperforms by 8.4  compared with our method in large-vocabulary VIPSeg (Tab.\ 6 of the main paper, Query assoc.\ \vs Ours).}
+    \label{tab:app:youtubevis}
+    \end{table}
+
+\section{Qualitative Results}\label{sec:app:qualitive-details}
+\subsection{Visualization}
+For all results (see our project page), we associate each object id with a unique color. 
+When a segment changes color, its object id has changed. 
+This change might happen often (e.g., flicker) if the method is not stable.
+We additionally show an `overlay' which is a composite of the colored segmentation with the input image.
+
+\subsection{Large-Scale Video Panoptic Segmentation}
+We compare our method with state-of-the-art Video-K-Net~\cite{li2022video}.
+We use the semi-online setting Mask2Former~\cite{cheng2022masked} as the image model.
+Videos are taken from VIPSeg~\cite{miao2022large} validation set.
+
+
+\subsection{Open-World Video Segmentation}
+We compare our method with the best open-world segmentation baseline (Mask2Former + STCN tracker).
+We use the semi-online setting EntitySeg~\cite{qi2021open} as the image model.
+Videos are collected from BURST~\cite{athar2023burst} and the Internet.
+
+
+\subsection{Referring Video Segmentation in the Wild}
+We compare our method with state-of-the-art referring video segmentation ReferFormer~\cite{wu2022language}.
+We are interested in the open-world setting beyond standard Ref-DAVIS~\cite{khoreva2019video} and Ref-YouTubeVOS~\cite{seo2020urvos}. 
+For this, we use a recent open-world referring image segmentation model X-Decoder~\cite{zou2022generalized} as our image model. 
+The agility to switch image backbones and use the latest advancements in image segmentation is one of the main advantages of our decoupled formulation. 
+We employ an offline setting following our referring video segmentation evaluation protocol (Section~\ref{sec:app:referring-details}). 
+Note, ReferFormer~\cite{wu2022language} is also offline.
+Our model can segment rare objects like `wheel of fortune' accurately.
+
+%

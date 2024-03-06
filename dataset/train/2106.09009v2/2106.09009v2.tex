@@ -1,0 +1,103 @@
+
+\begin{figure}[t!]
+	\centering
+	\includegraphics[width=0.72\linewidth]{fig/full_model_bertslu_color.pdf}
+	\caption{A diagram depicting the full E2E SLU model and the soft  Acoustic (AC) and Semantic (SC) component boundary.}
+	\label{fig:model}
+	\vspace{-12pt}
+\end{figure}
+
+\section{Model Architecture}
+\label{sec:model}
+
+We adopted the multistage E2E topology from \cite{haghani2018audio}, that resembles an end-to-end trainable variation of the traditional modularized SLU architecture. Due to this resemblance, we find it helpful to think of our model, shown in Figure \ref{fig:model}, as being composed of two components: an ``acoustic component'' (AC) and a ``semantic component'' (SC). The AC takes in speech spectrograms and outputs a sequence of wordpiece tokens. The SC ingests the AC's output posterior sequence and produces an utterance-level intent class and a sequence of wordpiece-level slot labels. These two components are connected by a modified embedder that is differentiable by operating on wordpiece posteriors. Thus gradients flow from SC to AC, enabling end-to-end training for the entire setup on a single training objective. The differentiable interface idea is similar to \cite{Rao_2020} except we employ it to build the SC around a pretrained neural language model. 
+
+This architecture gives us the flexibility of still being able to produce a transcription, from which the slot values can be extracted via a slot tagger. However, unlike the modular SLU, we propagate gradients from semantic loss all the way to the acoustic input layer. Moreover, we can selectively pretrain components with different datasets and various objectives across the speech and text modalities. For example, the AC can be pretrained using non-SLU, speech-only datasets, that are often available in large quantities. Similarly, since the SC operates on wordpiece-level data, it can be designed to use a pretrained language model, in this case BERT~\cite{devlin2018bert} as a text encoder, where we attach task-specific heads to create an appropriate SC. Therefore, we are able to incorporate appropriate inductive biases in the model, by capturing both the acoustic (via AC pretraining) and linguistic information (via SC pretraining) that is difficult to learn from relatively small E2E SLU datasets.
+
+\noindent \textbf{Acoustic Component (AC)} ---
+The AC is made up of a convolutional neural network (CNN)-based time-reducing embedder, a transformer encoder, and a transformer decoder.
+The input to the embedder consists of  log spectrograms with a 20 ms frame length and 10 ms frame spacing. These  frames are embedded using three  convolutional layers, with an output size 240, kernel size 4, stride 2, and ReLU activations. After embedding, a sequence of encodings corresponding to 240 ms of input audio, with a 120 ms spacing are produced. This architecture is inspired from the time-reducing convolutional speech encoders employed in \cite{radfar2020end}.
+A sequence of wordpieces is then autoregressively transcribed from the encodings using a 12-layer, 12-head transformer encoder-decoder with hidden size 240, trained with teacher forcing during both pretraining and fine-tuning \cite{chiu2018state}.
+
+\noindent \textbf{Semantic Component (SC)} ---
+The semantic component is made up of four parts---a differentiable embedder, a pretrained BERT encoder, an utterance-level dense intent decoder, and a wordpiece-level dense slot sequence decoder.
+The differentiable embedder performs the same function as the typical BERT embedder lookup table, but can take in uncertain posterior inputs from the AC during training, enabling end-to-end gradient flow. 
+The pretrained BERT encoder is a standard 12 layer  transformer encoder, that takes in the sequence of embeddings from the differentiable embedder and outputs a sequence of encodings of equal length.
+The intent decoder is a single linear layer of size  (num. intent classes) that takes the time-averaged encoded sequence to generate a single intent class estimate. The slot label sequence decoder is a single linear layer of size  (num. slot labels). The input to this decoder is formulated by concatenating the top 4 BERT encoder layer outputs at each step \cite{devlin2018bert}, while the output is a slot label estimate. The final sequence of (slot label, slot value) pairs is constructed by concatenating subsequent wordpiece tokens tagged with a slot label other than null.
+
+
+\noindent \textbf{Differentiable Embedders} ---
+\label{sec:diffemb}
+In a non E2E system, an argmax over the vocabulary length dimension could be performed on the AC output, after which the BERT lookup table would embed the transcribed word-pieces. However, this approach interrupts gradient flow, thereby rendering E2E training impossible. We experimented with three different approaches to generate differentiable BERT input encodings from the AC output posteriors. As some approaches to doing this require producing a very large internal posterior or producing large matrix multiplications (vocab size x vocab size), we analyze their impacts on both accuracy and inference speed.
+
+\textbf{TopK:} In this approach, the posterior sequence of the embedder is sorted along the vocabulary dimension to produce a sequence of tokens of decreasing likelihood. This is followed by generating a mixture of the top- token embeddings using the embedding lookup table and the softmax values of the top-k tokens. We used .
+
+\textbf{MatMul:} Here, we store a  matrix containing the input embedding for every token in the vocabulary. With this we can easily generate a confidence-weighted mixture of all possible embeddings by multiplying this matrix by the output softmax of the embedder.
+
+\textbf{Gumbel:} Instead of taking an argmax over the vocabulary, we instead use the Gumbel-softmax trick \cite{gumbel} to select a single word whose embedding is then passed on to the SC at each step. Gumbel-softmax helps approximate a smooth distribution for back propagation, allowing gradient flow.
+
+\section{Methodology}
+We follow a two step training approach: (1) pretrain the AC and SC layers on appropriate datasets and optimization objectives to help encode acoustic and linguistic semantic information, then (2) fine-tune the entire model end-to-end on a task-specific VA dataset. Details for our training and evaluation methodologies, datasets, and baselines are provided below.
+
+\subsection{Pretraining}
+In the pretraining stage, the AC is trained for the ASR transcription task on  460 hours of clean LibriSpeech data \cite{panayotov2015librispeech}. Rather than using typical ASR-style subwords or full words as targets, the transcriptions are converted into BERT-style wordpiece sequences using the HuggingFace {\scriptsize\texttt{bert-base-uncased}} tokenizer \cite{wolf2020transformers}. This helps us prime the AC layers to return tokens in the format that is expected at input to the BERT encoder in the SC. We use the Adam optimizer to minimize the sequential ASR cross entropy loss .
+
+
+We built the SC around the pretrained {\scriptsize\texttt{bert-base-uncased}} model distributed by HuggingFace \cite{wolf2020transformers}. We perform no task-specific text-level pretraining beyond the cloze (masked LM) task and next sentence prediction learning that is inherent to using a pretrained BERT module \cite{devlin2018bert}. The final output linear layers (intent and slot decoders) are randomly initialized at the beginning of the end-to-end training phase.
+
+\subsection{End-to-end training}
+After pretraining, the AC and SC layers are composed such that the AC output posteriors are fed directly into the input of the SC, with the differentiable embedder acting as the embedding lookup component. This setup is trained on a three-term sum of categorical cross entropy loss for the ASR output sequence , the slot labels , and a single utterance-level intent .   is a sequence-level target where each token in the ASR output sequence is assigned either a null output or a slot label. This three-term loss (\cref{eqn:le2e}) is minimized using Adam. 
+
+
+
+
+
+\subsection{Model evaluation}
+We use greedy ASR decoding to produce the output sequence of wordpieces from the AC. The inputs to SC are the output posteriors rather than the discrete word choices themselves. We perform a grid search over learning rates , dropout , and hidden layer sizes , as well as experiment with slanted triangular learning rate schedules and hierarchical unfreezing strategies as described in \cite{howard2018universal}, to get the best performing model. All models were trained and evaluated on EC2 instances with Tesla V100 GPUs.  In order to analyze the final SLU performance, we use three metrics:
+\begin{enumerate}
+	\item \textbf{Intent Classification Error Rate (ICER) }- Ratio of the number of incorrect intent predictions to the total number of utterances.
+	\item \textbf{Slot Error Rate (SER)} - Ratio of incorrect slot predictions to the total number of labeled slots in the dataset.
+	\item \textbf{Interpretation Error Rate (IRER)} -  Ratio of the number of incorrect interpretations to the total number of utterances. An incorrect interpretation is the one where either the intent or the slots are wrong. This ``exact match'' error rate is the strictest of our evaluation metrics.
+\end{enumerate}
+
+
+\subsection{Data}
+We use two E2E SLU datasets for our experiments - (1) the publicly available Fluent Speech Commands (FSC) and (2) an internal SLU dataset. Additionally, we create a ``hard test set'' to assess model performance in the most demanding scenarios in generalized VA. We use the average -gram entropy and Minimum Spanning Tree (MST) complexity score as described in \cite{mckenna2020semantic} to quantify their levels of semantic complexity.
+
+\noindent \textbf{Fluent Speech Commands} ---
+FSC \cite{lugosch2019speech} is an SLU dataset containing 30,043 utterances with a vocabulary of 124 words and 248 unique utterances over 31 intents in home appliance and smart speaker control. The SLU task on this dataset is just the intent classification task. It has an average -gram entropy of 6.9 bits and an average MST complexity score of 0.2 \cite{mckenna2020semantic}. 
+
+\noindent \textbf{Internal SLU Dataset} --- 
+In order to analyze the effectiveness of our proposed architecture on a generalized voice assistant (VA) setting, we collect a random, de-identified slice of internal data from a commercial VA system. The data is processed so that users are not identifiable. The resulting dataset contains about 150 hours of audio, with over 100 different slot labels, dozens of intent classes and no vocabulary restrictions.  It has an average entropy of 11.6 bits and an average MST complexity of 0.52 \cite{mckenna2020semantic}. Both complexity metrics, alongside the less structurally constrained output label space, demonstrate that this task is more complex than FSC.
+
+\noindent \textbf{Hard Subset of Internal Traffic Data} ---
+In generalized VA, accuracy on semantic outliers is desirable. To assess this dynamic we produce a \textbf{hard test set} of 18k utterances from our internal  dataset. This is done by selecting utterances that exclusively contain at least one \textit{minimum-frequency bigram}, a pair of subsequent words that is not present in our training or validation sets. This test set helps us simulate how a system will perform on unforseen utterances that tend to arise in production VA.
+
+\begin{table*}[ht!]
+	\small
+	\centering
+		\caption{Results from Internal Traffic Dataset, for both the regular and hard test sets. Relative improvement in absolute Intent Classification Error Rate (ICER), Slot Error Rate (SER) and Interpretation Error Rate (IRER) are reported as positive deltas over the Multitask LSTM Baseline (lowest performance). }
+	\label{tab:alexaresults}
+\begin{tabular}{cccccccc}
+		\cline{3-8}
+		\multicolumn{2}{c}{} & \multicolumn{3}{c}{Regular Test Set} &  \multicolumn{3}{c}{Hard Test Set} \\
+		\hline 
+		\textit{Model} & \textit{Num. Params.} & \textit{ICER}  & \textit{SER}  & \textit{IRER} &  \textit{ICER}  & \textit{SER} &  \textit{IRER}  \\ \specialrule{.1em}{.05em}{.05em}
+Multitask LSTM Baseline &  45.9M  &--- & --- & --- & --- & --- & --- \\
+Multitask BiLSTM Baseline & 67.3M  &+0.5 & +0.5 & --1.1 & +1.8 & +0.2 & +0.5 \\
+Multitask Transformer Baseline &  101M  &+4.0 & --2.7 & --0.1 & +4.4 & --3.5 & +0.2 \\ \hline
+\textbf{Ours} (No Pretraining) &  115M  &+9.1 & +37.1 & +40.5 & +11.4 & +14.2 & +18.1 \\
+\textbf{Ours} (BERT, AC Pretraining) &  115M  & \textbf{+9.3} & \textbf{+37.3} & \textbf{+42.8} & \textbf{+12.9} & \textbf{+15.0} & \textbf{+18.9} \\
+		\hline
+	\end{tabular}
+\end{table*}
+
+
+\subsection{Baselines}
+We design our baselines using a multitask E2E topology, defined by Haghani et al.~\cite{haghani2018audio}.
+Our ability to use proven E2E models vetted on public SLU tasks such as FSC, as baselines, is hampered by the fact that they are typically designed with non-generalized VA use-cases in mind. In particular, the hard subset classification task is impossible for the models designed according to the direct or joint topologies from \cite{haghani2018audio} to perform without significant modification. Specifically, they lack the ability to select arbitrary words from the transcription vocabulary as slot values. Most high-performing models for FSC follow the direct or joint topology \cite{radfar2020end,kim2020st, lugosch2020using}. Instead, the multitask topology \cite{haghani2018audio} provides a good contrast to our proposed multistage model; both maintain the necessary capability of identifying slots by labeling a sequence of wordpieces.
+
+We analyze three baseline multitask models, that differ only in the sequential encoder and decoder used, in particular (1) unidirectional LSTM, (2) bidirectional LSTM, and (3) transformer. All baseline models use a CNN-based speech spectrogram embedder identical to the one presented in Section \ref{sec:model}. This is followed by the speech sequence encoder using one of the three aforementioned encoder types. Finally, these encodings are decoded with task-specific heads, that consist of a dense layer for utterance level intent classification and word-level dense layer for sequential slot decoding. The final structured output for IRER evaluation contains the slot values and slot labels along with the intent label for the entire utterance. 
+Our baselines allow us to evaluate both the efficacy of a multistage setup and of using a transformer based encoder-decoder with BERT.
+
+

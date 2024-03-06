@@ -1,0 +1,645 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} 
+
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[accepted]{arxiv}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\usepackage[textsize=tiny]{todonotes}
+
+\renewcommand{\paragraph}[1]{\vspace{-0.1em} \noindent \textbf{#1}}
+\linespread{0.98}
+
+\newcommand{\sparsegpt}[1]{\texttt{SparseGPT}}
+
+\icmltitlerunning{SparseGPT: Massive Language Models Can be Accurately Pruned in One-Shot}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{SparseGPT: Massive Language Models Can be Accurately Pruned in One-Shot}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+    \icmlauthor{Elias Frantar}{ista}
+    \icmlauthor{Dan Alistarh}{ista,nm}
+\end{icmlauthorlist}
+
+\icmlaffiliation{ista}{Institute of Science and Technology Austria (ISTA)}
+\icmlaffiliation{nm}{Neural Magic Inc}
+
+\icmlcorrespondingauthor{Elias Frantar}{elias.frantar@ist.ac.at}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+We show for the first time that large-scale generative pretrained transformer (GPT) family models can be pruned to at least 50\% sparsity in \emph{one-shot, without any retraining}, at minimal loss of accuracy. 
+This is achieved via a new pruning method called \sparsegpt{}, specifically designed to work efficiently and accurately on  massive GPT-family models.
+We can execute \sparsegpt{} on the largest available open-source models, OPT-175B and BLOOM-176B, in under 4.5 hours, and can reach 60\% unstructured sparsity with negligible increase in perplexity: remarkably, more than 100 billion weights from these models can be ignored at inference time.
+\sparsegpt{} generalizes to semi-structured (2:4 and 4:8) patterns,  and is compatible with weight quantization approaches. The code is available at: \url{https://github.com/IST-DASLab/sparsegpt}.
+\end{abstract}
+
+\section{Introduction}
+
+Large Language Models (LLMs) from the Generative Pretrained Transformer (GPT) family have shown remarkable performance on a wide range of tasks, but are difficult to deploy because of their massive size and computational costs.  
+For illustration, the top-performing GPT-175B models have 175 billion parameters, which total at least 320GB (counting multiples of 1024) of storage in half-precision (FP16) format, leading it to require at least five A100 GPUs with 80GB of memory each for inference. 
+It is therefore natural that there has been significant interest in reducing these costs via \emph{model compression}. 
+To date, virtually all existing GPT compression approaches have focused on \emph{quantization}~\cite{dettmers2022llm, yao2022zeroquant, xiao2022smoothquant, frantar2022gptq}, that is, reducing the precision of the model's numerical representation. 
+
+A complementary approach for compression is \emph{pruning}, which removes network elements, 
+from individual weights (unstructured pruning) to higher-granularity structures such as rows/columns of the weight matrices (structured pruning). 
+Pruning has a long history~\cite{lecun1990optimal, hassibi1993optimal}, and has been applied successfully in the case of vision and smaller-scale language models~\cite{hoefler2021sparsity}. 
+Yet, the best-performing pruning methods require \emph{extensive retraining} of the model to recover accuracy. 
+In turn, this is extremely expensive for GPT-scale models. 
+While some accurate \emph{one-shot} pruning methods exist~\cite{hubara2021accelerated, frantar2022obc}, compressing the model without retraining, unfortunately even they become very expensive when applied to models with billions of parameters. 
+Thus, to date, there is essentially no work on accurate pruning of billion-parameter models.
+
+\begin{figure*}[h]
+    \begin{minipage}[c]{.49\textwidth}
+        \centering
+        \includegraphics[width=.8\linewidth]{opt175b_unstr.pdf}
+        \vspace{-10pt}
+        \captionof{figure}{Sparsity-vs-perplexity comparison of \sparsegpt{} against magnitude pruning on OPT-175B, when pruning to different \emph{uniform} per-layer sparsities.}
+        \label{fig:opt-unstr}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[c]{.49\textwidth}
+    \centering
+        \includegraphics[width=.8\linewidth]{opt-sparsities.pdf}
+        \vspace{-10pt}
+        \captionof{figure}{Perplexity vs. model and sparsity type when compressing the entire OPT model family (135M, 350M, \ldots, 66B, 175B) to different sparsity patterns using \sparsegpt{}.}
+        \label{fig:opt-sparsities}
+    \end{minipage}
+\end{figure*}
+
+\textbf{Overview.} 
+In this paper, we propose \sparsegpt{}, the first accurate one-shot pruning method which works efficiently at the scale of models with 10-100+ billion parameters. 
+\sparsegpt{} works by reducing the pruning problem to a set of extremely large-scale instances of \emph{sparse regression}. It then solves these instances via a new approximate sparse regression solver, which is efficient enough to execute in a few hours on the largest openly-available GPT models (175B parameters), 
+on a single GPU. 
+At the same time, \sparsegpt{} is accurate enough to drop negligible accuracy post-pruning, without any fine-tuning.  
+For example, when executed on the largest publicly-available generative language models (OPT-175B and BLOOM-176B), \sparsegpt{} induces 50-60\% sparsity in one-shot, with minor accuracy loss, measured either in terms of perplexity or zero-shot accuracy.  
+
+Our experiments, from which we provide a snapshot in Figures \ref{fig:opt-unstr} and \ref{fig:opt-sparsities}, lead to the following observations. 
+First, as shown in Figure~\ref{fig:opt-unstr}, \sparsegpt{} can induce uniform layer-wise sparsity of up to 60\% in e.g. the 175-billion-parameter variant of the OPT family~\cite{zhang2022opt}, with minor accuracy loss. 
+By contrast, the only known one-shot baseline which easily extends to this scale, Magnitude Pruning~\cite{hagiwara1994, han2015learning}, preserves accuracy only until 10\% sparsity, and completely collapses beyond 30\% sparsity. 
+Second, as shown in Figure~\ref{fig:opt-sparsities}, \sparsegpt{} can also accurately impose sparsity in the 
+more stringent, but hardware-friendly, 2:4 and 4:8 semi-structured sparsity patterns~\cite{NVIDIASparse}, 
+although this comes at an accuracy loss relative to the dense baseline for smaller models.  
+
+One key positive finding, illustrated in Figure~\ref{fig:opt-sparsities}, is that \emph{larger models are more compressible}:  
+ they drop significantly less accuracy at a fixed sparsity, relative to their smaller counterparts. 
+ (For example, the largest models from the OPT and BLOOM families can be sparsified to 50\% with almost no increase in perplexity.) 
+In addition, our method allows sparsity to be \emph{compounded} with weight quantization techniques~\citep{frantar2022gptq}: 
+for instance, we can induce 50\% weight sparsity jointly with 4-bit weight quantization with negligible perplexity increase on OPT-175B. 
+
+One notable property of \sparsegpt{} is that it is \emph{entirely local}, in the sense that it relies solely on weight updates designed to preserve the input-output relationship for each layer, which are computed without any global gradient information. As such, we find it remarkable that one can directly identify such sparse models in the ``neighborhood'' of dense pretrained models, whose output correlates extremely closely with that of the dense model.  
+
+\section{Background}
+\label{sec:preliminaries}
+
+\paragraph{Post-Training Pruning} is a practical scenario where we are given a well-optimized model , together with some calibration data, and must obtain a compressed (e.g., sparse and/or quantized) version of . Originally popularized in the context of quantization~\cite{hubara2021accurate, nagel2020up, li2021brecq}, this setting has also recently been successfully extended to pruning~\cite{hubara2021accelerated, frantar2022obc, kwon2022fast}.
+
+\paragraph{Layer-Wise Pruning.} Post-training compression is usually done by splitting the full-model compression problem into \emph{layer-wise} subproblems, whose solution quality is measured in terms of the -error between the output, for given inputs , of the uncompressed layer with weights  and that of the compressed one. Specifically, for pruning, \cite{hubara2021accelerated} posed this problem as that of finding, for each layer , a sparsity mask\footnote{Throughout the paper, by \emph{sparsity mask} for a given tensor we mean a binary tensor of the same dimensions, with  at the indices of the sparsified entries, and  at the other indices.}  with a certain target density, and possibly updated weights  such that 
+
+The overall compressed model is then obtained by ``stitching together'' the individually compressed layers.
+
+\paragraph{Mask Selection \& Weight Reconstruction.} A key aspect of the layer-wise pruning problem in (\ref{eq:layerwise-pruning}) is that both the mask  as well as the remaining weights  are optimized \emph{jointly}, which makes this problem NP-hard \cite{blumensath2008iterative}. Thus, exactly solving it for larger layers is unrealistic, leading all existing methods to resort to approximations.
+
+A particularly popular approach is to separate the problem into \emph{mask selection} and \emph{weight reconstruction} \cite{he2018amc, kwon2022fast, hubara2021accelerated}. Concretely, this means to first choose a pruning mask  according to some saliency criterion, like the weight magnitude~\cite{zhu2017prune}, and then optimize the remaining unpruned weights while keeping the mask unchanged. Importantly, once the mask is fixed, (\ref{eq:layerwise-pruning}) turns into a \textit{linear squared error problem} that is easily optimized.
+
+\paragraph{Existing Solvers.} Early work \cite{Kingdon1997} applied iterated linear regression to small networks. More recently, the AdaPrune approach \cite{hubara2021accelerated} has shown good results for this problem on modern models via magnitude-based weight selection, followed by applying SGD steps to reconstruct the remaining weights. Follow-up works demonstrate that pruning accuracy can be further improved by removing the strict separation between mask selection and weight reconstruction. Iterative AdaPrune \cite{frantar2022spdy} performs pruning in gradual steps with reoptimization in between and OBC \cite{frantar2022obc} introduces a greedy solver which removes weights one-at-a-time, fully reconstructing the remaining weights after each iteration, via efficient closed-form equations.
+
+\paragraph{Difficulty of Scaling to 100+ Billion Parameters.} Prior post-training techniques have all been designed to accurately compress models up to a few hundred million parameters with several minutes to a few hours of compute. However, our goal here  is to sparsify models up to  larger.
+
+Even AdaPrune, the method optimized for an ideal speed/accuracy trade-off, takes a few hours to sparsify models with just 1.3 billion parameters (see also Section~\ref{sec:experiments}), scaling linearly to several hundred hours (a few weeks) for 175B Transformers. More accurate approaches are at least several times more expensive \cite{frantar2022spdy} than AdaPrune or even exhibit worse than linear scaling \cite{frantar2022obc}. This suggests that scaling up existing accurate post-training techniques to extremely large models is a challenging endeavor. Hence, we propose a new layer-wise solver \sparsegpt{}, based on careful approximations to closed form equations, which easily scales to giant models, both in terms of runtime as well as accuracy.
+
+\section{The \sparsegpt{} Algorithm}
+
+\subsection{Fast Approximate Reconstruction}
+\label{sec:fast-approximate-reconstruction}
+
+\paragraph{Motivation.} As outlined in Section~\ref{sec:preliminaries}, for a fixed pruning mask , the optimal values of all weights in the mask can be calculated exactly by solving the sparse reconstruction problem corresponding to each matrix row  via:
+
+where  denotes only the subset of input features whose corresponding weights have not been pruned in row , and  represents their respective weights. However, this requires inverting the Hessian matrix  corresponding to the values preserved by the pruning mask  for row , i.e. computing , separately for all rows . One such inversion takes  time, for a total computational complexity of  over   rows. For a Transformer model, this means that the overall runtime scales with the 4th power of the hidden dimension ; we need a speedup by at least a full factor of  to arrive at a practical algorithm.
+
+\begin{figure}
+  \begin{center}
+    \includegraphics[width=0.85\linewidth]{different-row-hessians.pdf}
+  \end{center}
+  \vspace{-10pt}
+      \caption{Illustration of the row-Hessian challenge: rows are sparsified independently, pruned weights are in white.}
+    \label{fig:different-row-hessians}
+\end{figure}
+
+\paragraph{Different Row-Hessian Challenge.} The high computational complexity of optimally reconstrucing the unpruned weights following Equation~\ref{eqn:rowwise-pruning} mainly stems from the fact that solving \emph{each row} requires the \emph{individual} inversion of a  matrix. This is because the row masks  are generally different and , i.e., the inverse of a masked Hessian does \emph{not} equal the masked version of the full inverse. This is illustrated also in Figure~\ref{fig:different-row-hessians}. If all row-masks were the same, then we would only need to compute a single shared inverse, as  depends just on the layer inputs which are the same for all rows. 
+
+Such a constraint could be enforced in the mask selection, but this would have a major impact on the final model accuracy, as sparsifying weights in big structures, like entire columns, is known to be much more difficult than pruning them individually\footnote{For example, structured (column-wise) pruning ResNet50 to \% structured sparsity without accuracy loss is challenging, even with extensive retraining \cite{liu2021group}, while  unstructured pruning to 90\% sparsity is easily achievable with state-of-the-art methods~\cite{evci2020rigging, peste2021ac}.}. The key towards designing an approximation algorithm that is both accurate and efficient lies in enabling the reuse of Hessians between rows with distinct pruning masks. We now propose an algorithm that achieves this in a principled manner.
+
+\begin{figure*}[h]
+    \centering
+    \includegraphics[width=.8\textwidth]{sparse-gpt_merged.pdf}
+    \vspace{-5pt}
+    \caption{[Left] Visualization of the \sparsegpt{} reconstruction algorithm. Given a fixed pruning mask , we incrementally prune weights in each column of the weight matrix , using a sequence of Hessian inverses , and updating the remainder of the weights in those rows, located to the ``right'' of the column being processed. Specifically, the weights to the ``right'' of a pruned weight (dark blue) will be updated to compensate for the pruning error, whereas the unpruned weights do not generate updates (light blue). [Right] Illustration of the adaptive mask selection via iterative blocking.}
+    \label{fig:sparse-gpt-vis}
+\end{figure*}
+
+\paragraph{Equivalent Iterative Perspective.} To motivate our algorithm, we first have to look at the row-wise weight reconstruction from a different \emph{iterative} perspective, using the classic OBS update \cite{hassibi1993optimal, singh2020woodfisher, frantar2021m}. Assuming a quadratic approximation of the loss, for which the current weights  are optimal, the OBS update  provides the optimal adjustment of the remaining weights to compensate for the removal of the weight at index , incurring error :
+
+Since the loss function corresponding to the layer-wise pruning of one row of  is a quadratic, the OBS formula is exact in this case. Hence,  is the optimal weight reconstruction corresponding to mask . Further, given an optimal sparse reconstruction  corresponding to mask , we can apply OBS again to find the optimal reconstruction for mask . Consequently, this means that instead of solving for a full mask  directly, we could iteratively apply OBS to individually prune the weights  up until  in order, one-at-a-time, reducing an initially complete mask to , and will ultimately arrive at \emph{the same} optimal solution as applying the closed-form regression reconstruction with the full  directly. 
+
+\textbf{Optimal Partial Updates.} Applying the OBS update  potentially adjusts the values of all available parameters (in the current mask ) in order to compensate for the removal of . However, what if we only update the weights in a subset  among remaining unpruned weights? Thus, we could still benefit from error compensation, using only weights in , while reducing the cost of applying OBS.
+
+Such a partial update can indeed be accomplished by simply computing the OBS update using , the Hessian corresponding to , rather than , and updating only . Importantly, the loss of our particular layer-wise problem remains quadratic also for  and the OBS updates are still optimal: the restriction to  does not incur any extra approximation error by itself, only the error compensation might not be as effective, as less weights are available for adjustment. At the same time, if , then inverting  will be a lot faster than inverting . We will now utilize this mechanism to accomplish our goal of synchronizing the masked Hessians across all rows of .
+
+\textbf{Hessian Synchronization.} In the following, assume a fixed ordering of the input features . Since those are typically arranged randomly, we will just preserve the given order for simplicity, but any permutation could in principle be chosen. Next, we define a sequence of  index subsets  recursively as:
+
+In words, starting with  being the set of all indices, each subset  is created by removing the smallest index from the previous subset . These subsets also impose a sequence of inverse Hessians  which we are going to share across all rows of . Crucially, following \cite{frantar2022obc}, the updated inverse  can be calculated efficiently by removing the first row and column, corresponding to  in the original , from  in  time via one step of Gaussian elimination:
+
+\noindent with 
+Hence, the entire sequence of  inverse Hessians can be calculated recursively in  time, i.e. at similar cost to a single extra matrix inversion on top of the initial one for .
+
+Once some weight  has been pruned, it should not be updated anymore. Further, when we prune , we want to update as many unpruned weights as possible for maximum error compensation. This leads to the following strategy: iterate through the  and their corresponding inverse Hessians  in order and prune  if , for all rows . Importantly, each inverse Hessian  is computed only once and reused to remove weight  in all rows where it is part of the pruning mask. A visualization of the algorithm can be found in Figure \ref{fig:sparse-gpt-vis}.
+
+\textbf{Computational Complexity.} 
+The overall cost consists of three parts: (a) the computation of the initial Hessian, which takes time  where  is the number of input samples used---we found that taking the number of samples  to be a small multiple of  is sufficient for good and stable results, even on very large models (see Appendix \ref{app:ablations}); (b) iterating through the inverse Hessian sequence in time  and (c) the reconstruction/pruning itself. The latter cost can be upper bounded by the time it takes to apply~(\ref{eq:obs-update}) to all  rows of  for all  columns in turn, which is . In total, this sums up to . For Transformer models, this is simply , and is thus a full -factor more efficient than exact reconstruction. This means that we have reached our initial goal, as this complexity will be sufficient to make our scheme practical, even for extremely large models.
+
+\textbf{Weight Freezing Interpretation.} While we have motivated the \sparsegpt{} algorithm as an  approximation to the exact reconstruction using optimal partial updates, there is also another interesting view of this scheme. Specifically, consider an exact greedy framework which compresses a weight matrix column by column, always optimally updating all not yet compressed weights in each step \cite{frantar2022obc, frantar2022gptq}. At first glance, \sparsegpt{} does not seem to fit into this framework as we only compress some of the weights in each column and also only update a subset of the uncompressed weights. Yet, mechanically, ``compressing'' a weight ultimately means fixing it to some specific value and ensuring that it is never ``decompressed'' again via some future update, i.e. that it is \emph{frozen}. Hence, by defining column-wise compression as:
+
+i.e. zeroing weights not in the mask and fixing the rest to their current value, our algorithm can be interpreted as an exact column-wise greedy scheme. This perspective will allow us to cleanly merge sparsification and quantization into a single compression pass.
+
+\subsection{Adaptive Mask Selection}
+
+So far, we have focused only on weight reconstruction, i.e. assuming a fixed pruning mask . One simple option for deciding the mask, following AdaPrune \cite{hubara2021accelerated}, would be via magnitude pruning~\cite{zhu2017prune}. 
+However, recent work \cite{frantar2022obc} shows that updates during pruning change weights significantly due to correlations, and that taking this into account in the mask selection yields better results. 
+This insight can be integrated into \sparsegpt{} by \emph{adaptively} choosing the mask while running the reconstruction.
+
+One obvious way of doing so would be picking the  easiest weights to prune in each column  when it is compressed, leading to  overall sparsity. 
+The big disadvantage of this approach is that sparsity cannot be distributed non-uniformly across columns, imposing additional unnecessary structure. 
+This is particularly problematic for massive language models, which have a small number of highly-sensitive outlier features~\cite{dettmers2022llm, xiao2022smoothquant}.
+
+We remove this disadvantage via \textit{iterative blocking}. 
+More precisely, we always select the pruning mask for  columns at a time (see Appendix \ref{app:ablations}), based on the OBS reconstruction error  from Equation~(\ref{eq:obs-update}), using the diagonal values in our Hessian sequence. 
+We then perform the next  weight updates, before selecting the mask for the next block, and so on. 
+This procedure allows \emph{non-uniform selection} per column, in particular also using the corresponding Hessian information, while at the same time considering also previous weight updates for selection.
+(For a single column , the selection criterion becomes the magnitude, as  is constant across rows.)
+
+\subsection{Extension to Semi-Structured Sparsity} 
+
+\sparsegpt{} is also easily adapted to \textit{semi-structured} patterns such as the popular n:m sparsity format \cite{zhou2021learning, hubara2021accelerated} which delivers speedups in its 2:4 implementation on Ampere NVIDIA GPUs. Specifically, every consecutive  weights should contain exactly  zeros. Hence, we can simply choose blocksize  and then enforce the zeros-constraint in the mask selection for each row by picking the  weights which incur the lowest error as per Equation (\ref{eq:obs-update}). A similar strategy could also be applied for other semi-structured pruning patterns. Finally, we note that a larger  would not be useful in this semi-structured scenario since zeros cannot be distributed non-uniformly between different column-sets of size .
+
+\subsection{Full Algorithm Pseudocode}
+
+\begin{algorithm}[h!]
+    \centering
+    \caption{The \sparsegpt{} algorithm. We prune the layer matrix  to  unstructured sparsity given inverse Hessian , lazy batch-update blocksize  and adaptive mask selection blocksize ; each  consecutive columns will be  sparse.}
+    \small
+    \label{alg:sparsegpt}
+    \begin{algorithmic}
+        \STATE  \,\, \textit{// binary pruning mask}
+        \STATE  \,\, \textit{// block quantization errors}
+        \STATE  \,\, \textit{// Hessian inverse information}
+        \FOR {}
+            \FOR {}
+                {
+                \IF {}
+                    \STATE  mask of  weights  with largest 
+                \ENDIF
+                \STATE  \,\, \textit{// pruning error}
+                \STATE  \,\, \textit{// freeze weights}
+                }
+                \STATE  \,\, \textit{// update}
+            \ENDFOR
+            \STATE  \,\, \textit{// update}
+        \ENDFOR
+        \STATE { \,\, \textit{// set pruned weights to 0}}
+    \end{algorithmic}
+\end{algorithm}
+
+\begin{table*}[h!]
+    \centering
+    \caption{OPT perplexity results on raw-WikiText2.}
+    \vspace{5pt}
+    \scalebox{.85}{
+        \begin{tabular}{|l|c|c|c|}
+            \toprule
+            OPT - 50\% & 125M & 350M & 1.3B \\
+            \midrule
+            Dense & 27.66 & 22.00 & 14.62 \\
+            \midrule
+            Magnitude & 193. & 97.80 & 1.7e4 \\
+            AdaPrune & 58.66 & 48.46 & 32.52 \\
+            \sparsegpt{} &\textbf{36.85} & \textbf{31.58} & \textbf{17.46} \\
+            \bottomrule
+        \end{tabular}
+    }~~~
+    \scalebox{.8}{
+        \begin{tabular}{|l|c|c|c|c|c|c|c|}
+            \toprule
+            OPT & Sparsity & 2.7B & 6.7B & 13B & 30B & 66B & 175B \\
+            \midrule
+            Dense & 0\% & 12.47 & 10.86 & 10.13 & 9.56 & 9.34 & 8.35 \\
+            \midrule
+            Magnitude & 50\% & 265. & 969. & 1.2e4 & 168. & 4.2e3 & 4.3e4 \\
+            \sparsegpt{} & 50\% & \textbf{13.48} & \textbf{11.55} & \textbf{11.17} & \textbf{9.79} & \textbf{9.32} & \textbf{8.21} \\
+            \midrule
+            \sparsegpt{} & 4:8 & 14.98 & 12.56 & 11.77 & 10.30 & 9.65 & 8.45 \\
+            \sparsegpt{} & 2:4 & 17.18 & 14.20 & 12.96 & 10.90 & 10.09 & 8.74 \\
+            \bottomrule
+        \end{tabular}
+    }
+    \label{tab:opt-wikitext2}
+\end{table*}
+
+With the weight freezing interpretation discussed at the end of Section \ref{sec:fast-approximate-reconstruction}, the \sparsegpt{} reconstruction can be cast in the column-wise greedy framework of the recent quantization algorithm GPTQ \cite{frantar2022gptq}. This means we can also inherit several algorithmic enhancements from GPTQ, specifically: precomputing all the relevant inverse Hessian sequence information via a Cholesky decomposition to achieve numerical robustness and applying lazy batched weight matrix updates to improve the compute-to-memory ratio of the algorithm. Our adaptive mask selection, as well as its extensions to semi-structured pruning, are compatible with all of those extra techniques as well.
+
+Algorithm~\ref{alg:sparsegpt} presents the the unstructured sparsity version of the \sparsegpt{} algorithm in its fully-developed form, integrating all the relevant techniques from GPTQ. 
+
+\subsection{Joint Sparsification \& Quantization}
+\label{sec:joint}
+
+Algorithm \ref{alg:sparsegpt} operates in the column-wise greedy framework of GPTQ, thus sharing the computationally heavy steps of computing the Cholesky decomposition of  and continuously updating . This makes it possible to merge both algorithms into a single joint procedure. Specifically, all weights that are frozen by \sparsegpt{} are additionally quantized, leading to the following generalized errors to be compensated in the subsequent update step:
+
+where  rounds each weight in  to the nearest value on the quantization grid. Crucially, in this scheme, sparsification and pruning are performed \textit{jointly} in \textit{a single pass} at essentially no extra cost over \sparsegpt{}. Moreover,  doing quantization and pruning jointly means that later pruning decisions are influenced by earlier quantization rounding, and vice-versa. This is in contrast to prior joint techniques~\cite{frantar2022obc}, which first sparsify a layer and then simply quantize the remaining weights.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\paragraph{Setup.} We implement \sparsegpt{} in PyTorch \cite{paszke2019pytorch} and use the HuggingFace Transformers library~\cite{wolf2019huggingface} for handling models and datasets. All pruning experiments are conducted on \emph{a single} NVIDIA A100 GPU with 80GB of memory. In this setup, \sparsegpt{} can fully sparsify the 175-billion-parameter models in approximately 4 hours.  Similar to \citet{yao2022zeroquant, frantar2022gptq}, we sparsify Transformer layers sequentially in order, which significantly reduces memory requirements. All our experiments are performed in one-shot, without finetuning, in a similar setup to recent work on post-training quantization of GPT-scale models~\cite{frantar2022gptq, yao2022zeroquant, dettmers2022llm}. Additionally, in Appendix \ref{app:speedup} we investigate the real-world acceleration of our sparse models with existing tools.
+
+For calibration data, we follow~\citet{frantar2022gptq} and use 128 2048-token segments, randomly chosen from the first shard of the C4 \cite{C4} dataset. 
+This represents generic text data crawled from the internet and makes sure that our experiments remain actually zero-shot since \emph{no task-specific data is seen during pruning}.
+
+\paragraph{Models, Datasets \& Evaluation.} We primarily work with the OPT model family \cite{zhang2022opt}, to study scaling behavior, but also consider the 176 billion parameter version of BLOOM \cite{scao2022bloom}. While \emph{our focus lies on the very largest variants}, we also show some results on smaller models to provide a broader picture.
+
+In terms of metrics, we mainly focus on \textit{perplexity}, which is known to be a challenging and stable metric that is well suited for evaluating the accuracy of compression methods \cite{yao2022zeroquant, frantar2022obc, dettmers2022case}. We consider the test sets of raw-WikiText2 \cite{wikitext103} and PTB \cite{PTB} as well as a subset of the C4 validation data, all popular benchmarks in LLM compression literature \cite{yao2022zeroquant, park2022nuqmm, frantar2022gptq, xiao2022smoothquant}. For additional interpretability, we also provide ZeroShot accuracy results for Lambada~\cite{paperno2016lambada}, ARC (Easy and Challenge)~\cite{boratko2018systematic},  PIQA~\cite{tata2003piqa} and StoryCloze~\cite{mostafazadeh2017lsdsem}.
+
+We note that the main focus of our evaluation lies on the \emph{accuracy of the sparse models, relative to the dense baseline} rather than on absolute numbers. Different preprocessing may influence absolute accuracy, but has little impact on our relative claims.  The perplexity is calculated following precisely the procedure described by HuggingFace~\cite{hfperplexity}, using full stride. Our ZeroShot evaluations are performed with GPTQ's \cite{frantar2022gptq} implementation, which is in turn based on the popular EleutherAI-eval-harness~\cite{eleuther}. Additional evaluation details can be found in Appendix \ref{app:evaluation-details}. All dense and sparse results were computed with exactly the same code, available as supplementary material, to ensure a fair comparison.
+
+\paragraph{Baselines.} We compare against the standard magnitude pruning baseline \cite{zhu2017prune}, applied layer-wise, which scales to the very largest models. 
+On models up to 1B parameters, we compare also against AdaPrune \cite{hubara2021accelerated}, the most efficient among existing accurate post-training pruning methods. 
+For this, we use the memory-optimized reimplementation of~\citet{frantar2022spdy} and further tune the hyper-parameters provided by the AdaPrune authors. We thus achieve a  speedup without impact on solution quality, for our models of interest.
+\vspace{-15pt}
+
+\subsection{Results}
+\label{sec:results}
+
+\paragraph{Pruning vs. Model Size.} We first study how the difficulty of pruning LLMs changes with their size. We consider the entire OPT model family and uniformly prune all linear layers, excluding the embeddings and the head, as standard \cite{2020-sanh, kurtic2022optimal}, to 50\% unstructured sparsity, full 4:8 or full 2:4 semi-structured sparsity (the 2:4 pattern is the most stringent). The raw-WikiText2 performance numbers are given in Table \ref{tab:opt-wikitext2} and visualized in Figure \ref{fig:opt-sparsities}. The corresponding results for PTB and C4 can be found in Appendix \ref{app:additional-experiments} and show very similar trends overall.
+
+\begin{figure*}[ht]
+    \begin{minipage}[c]{.325\textwidth}
+        \centering
+        \includegraphics[width=.95\linewidth]{bloom_unstr.pdf}
+        \vspace{-10pt}
+        \captionof{figure}{Uniform pruning BLOOM-176B.}
+        \label{fig:bloom-unstr}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[c]{.675\textwidth}
+        \centering
+        \vspace{-15pt}
+        \captionof{table}{ZeroShot results on several datasets for sparsified variants of OPT-175B.}
+        \vspace{5pt}
+        \scalebox{.85}{
+            \begin{tabular}{|l|c|c|c|c|c|c|c|}
+                \toprule
+                Method & Spars. & Lamb. & PIQA & ARC-e & ARC-c & Story. & \textbf{Avg.} \\
+                \midrule
+                Dense & 0\% & 75.59 & 81.07 & 71.04 & 43.94 & 79.82 & \textbf{70.29} \\
+                \midrule
+                Magnitude & 50\% & 00.02 & 54.73 & 28.03 & 25.60 & 47.10 & \textbf{31.10} \\
+                \midrule
+                \sparsegpt{} & 50\% & 78.47 & 80.63 & 70.45 & 43.94 & 79.12 & \textbf{70.52} \\
+                \sparsegpt{} & 4:8 & 80.30 & 79.54 & 68.85 & 41.30 & 78.10 & \textbf{69.62} \\
+                \sparsegpt{} & 2:4 & 80.92 & 79.54 & 68.77 & 39.25 & 77.08 & \textbf{69.11} \\
+                \bottomrule
+            \end{tabular}
+        }
+        \label{tab:zeroshot}
+    \end{minipage}
+\end{figure*}
+
+One immediate finding is that the accuracy of magnitude-pruned models collapses across all scales, with larger variants generally dropping faster than smaller ones. This is in stark contrast to smaller vision models which can usually be pruned via simple magnitude selection to 50\% sparsity or more at very little loss of accuracy~\cite{singh2020woodfisher, frantar2022obc}. It highlights the importance of accurate pruners for massive generative language models, but also the fact that perplexity is a very sensitive metric. 
+
+For \sparsegpt{}, the trend is very different: already at 2.7B parameters, the perplexity loss is  point, at 66B, there is essentially zero loss and at the very largest scale there is even a slight accuracy improvement over the dense baseline, which however seems to be dataset specific (see also Appendix \ref{app:additional-experiments}). AdaPrune, as expected, also yields a big improvement over magnitude pruning, but is significantly less accurate than \sparsegpt{}. Despite the efficiency of AdaPrune, running it takes approximately h on a 350M model and h on a 1.3B one, while \sparsegpt{} can fully sparsify 66B and 175B models in roughly the same time, executing on the same A100 GPU.
+
+In general, there is a clear trend of larger models being easier to sparsify, which we speculate is due to overparametrization. 
+A detailed investigation of this phenomenon would be a good direction for future work. 
+For 4:8 and 2:4 sparsity, the behavior is similar, but accuracy drops are typically higher due to the sparsity patterns being more constrained \cite{hubara2021accelerated}. Nevertheless, at the largest scale, the perplexity increases are only of  and  for 4:8 and 2:4 sparsity, respectively.
+
+\paragraph{Sparsity Scaling for 100+ Billion Parameter Models.} Next, we take a closer look at the largest publicly-available dense models, OPT-175B and BLOOM-176B, and investigate how their performance scales with the degree of sparsity induced by either \sparsegpt{} or magnitude pruning. The results are visualized in Figures \ref{fig:opt-unstr} and \ref{fig:bloom-unstr}.
+
+For the OPT-175B model (Figure~\ref{fig:opt-unstr}) magnitude pruning can achieve at most 10\% sparsity before significant accuracy loss occurs; meanwhile, \sparsegpt{} enables up to 60\% sparsity at a comparable perplexity increase. BLOOM-176B (Figure~\ref{fig:bloom-unstr}) appears to be more favorable for magnitude pruning, admitting up 30\% sparsity without major loss; still, \sparsegpt{} can deliver 50\% sparsity, a  improvement, at a similar level of perplexity degradation. Even at 80\% sparsity, models compressed by \sparsegpt{} still score reasonable perplexities, while magnitude pruning leads to a complete collapse (100 perplexity) already at 40/60\% sparsity for OPT and BLOOM, respectively. Remarkably, \sparsegpt{} removes around \emph{100 billion weights} from these models, with low impact on accuracy.
+
+\paragraph{ZeroShot Experiments.} To complement the perplexity evaluations, we provide results on several ZeroShot tasks. These evaluations are known to be relatively noisy \cite{dettmers2022llm}, but more interpretable. Please see Table~\ref{tab:zeroshot}.
+
+Overall, a similar trend holds, with magnitude-pruned models collapsing to close to random performance, while \sparsegpt{} models stay close to the original accuracy. However, as expected, these numbers are more noisy: 2:4 pruning appears to achieve noticeably higher accuracy than the dense model on Lambada, despite being the most constrained sparsity pattern. These effects ultimately average out when considering many different tasks, which is consistent to the literature~\cite{yao2022zeroquant, dettmers2022llm, dettmers2022case}.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=.8\linewidth]{opt-sparse-quant.pdf}
+    \vspace{-10pt}
+    \caption{Comparing joint 50\% sparsity + 4-bit quantization with size-equivalent 3-bit on the OPT family for  2.7B params.}
+    \label{fig:sparse-quantized}
+\end{figure}
+
+\paragraph{Joint Sparsification \& Quantization.} Another interesting research direction is the combination of sparsity and quantization, which would allow combining computational speedups from sparsity \cite{pmlr-v119-kurtz20a, elsen2020fast} with memory savings from quantization \cite{frantar2022gptq, dettmers2022llm, dettmers2022case}. Specifically, if we compress a model to 50\% sparse + 4-bit weights, store only the non-zero weights and use a bitmask to indicate their positions, then this has the same overall memory consumption as 3-bit quantization. Hence, in Figure \ref{fig:sparse-quantized} (right) we compare \sparsegpt{} 50\% + 4-bit with state-of-the-art GPTQ \cite{frantar2022gptq} 3-bit numbers. It can be seen that 50\% + 4-bit models are more accurate than their respective 3-bit versions for 2.7B+ parameter models, including 175B with 8.29 vs. 8.68 3-bit. We also tested 2:4 and 4:8 in combination with 4-bit on OPT-175B yielding 8.55 and 8.85 perplexities, suggesting that 4bit weight quantization only brings an  perplexity increase on top semi-structured sparsity.
+
+\paragraph{Sensitivity \& Partial N:M Sparsity.} One important practical question concerning n:m pruning is what to do when the fully sparsified model is not accurate enough? The overall sparsity level cannot simply be lowered uniformly, instead one must choose a subset of layers to n:m-sparsify completely. We now investigate what a good selection is in the context of extremely large language models: we assume that 2/3 of the layers of OPT-175B/BLOOM-176B should be pruned to 2:4 sparsity and consider skipping either all layers of one type (attention, fully-connected-1, fully-connected-2) or skipping one third of consecutive layers (front, middle, back). The results  are shown in Figure \ref{fig:sensitivity}.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=\linewidth]{sens.pdf}
+    \vspace{-20pt}
+    \caption{Sensitivity results for partial 2:4 pruning.}
+    \label{fig:sensitivity}
+\end{figure}
+
+While the sensitivity of layer-types differs noticeably between models, there appears to be a clear trend when it comes to model parts: \textit{later layers are more sensitive than earlier ones}; skipping the last third of the model gives the best accuracy. This has a very practical consequence in that, due to the sequential nature of \sparsegpt{}, we can generate a sequence of increasingly 2:4 sparsified models (e.g. 1/2, 2/3, 3/4, \dots) in \textit{a single pruning pass} by combining the first  layers from a \sparsegpt{} run with the last  of the original model. The accuracy of such model sequences are shown in Appendix \ref{app:partial-24}.
+
+\section{Related Work}
+
+\textbf{Pruning Methods.} 
+To our knowledge, we are the first to investigate pruning of massive GPT-scale models, e.g. with more than 10 billion parameters.
+One justification for this surprising gap is the fact that most existing pruning methods, e.g.~\cite{han2015deep, gale2019state, kurtic2022gmp}, require \emph{extensive retraining} following the pruning step in order to recover accuracy, while GPT-scale models usually require massive amounts of computation and parameter tuning both for training or finetuning~\cite{zhang2022opt}.
+\sparsegpt{} is a \emph{post-training} method for  GPT-scale models, as it does not perform any finetuning. 
+So far, post-training pruning methods have only been investigated at the scale of classic CNN or BERT-type models~\cite{hubara2021accelerated, frantar2022obc, kwon2022fast}, which have 100-1000x fewer weights than our models of interest. 
+We discussed the challenges of scaling these methods, and their relationship to \sparsegpt{}, in Section~\ref{sec:preliminaries}. 
+
+\textbf{Post-Training Quantization.} 
+By contrast, there has been significant work on post-training methods for \emph{quantizing} open GPT-scale models~\cite{zhang2022opt, scao2022bloom}. 
+Specifically, the ZeroQuant~\cite{yao2022zeroquant}, LLM.int8()~\cite{dettmers2022llm} and nuQmm~\cite{park2022nuqmm} methods investigated the feasibility of round-to-nearest quantization for billion-parameter models, showing that 8-bit quantization for weights is feasible via this approach, but that activation quantization can be difficult due to the existence of outlier features. 
+\citet{frantar2022gptq} leverage approximate second-order information for accurate quantization of weights down to 2--4 bits, for the very largest models, and show generative batch-size 1 inference speedups of 2-5x when coupled with efficient GPU kernels.
+Follow-up work~\citep{xiao2022smoothquant} 
+investigated joint activation and weight quantization  to 8 bits, proposing a smoothing-based scheme which reduces the difficulty of activation quantization and is complemented by efficient GPU kernels. 
+\citet{park2022quadapter} tackle the hardness of quantizing activation outliers via \emph{quadapters}, learnable parameters whose goal is to scale activations channel-wise, while keeping the other model parameters unchanged. \citet{dettmers2022case} investigate scaling relationships between model size, quantization bits, and different notions of accuracy for massive LLMs, observing high correlations between perplexity scores and aggregated zero-shot accuracy across tasks.
+As we have shown in Section~\ref{sec:joint}, the \sparsegpt{} algorithm can be applied in conjunction with GPTQ, the current state-of-the-art algorithm for weight quantization, and should be compatible with activation quantization approaches~\cite{xiao2022smoothquant, park2022quadapter}.
+
+\section{Discussion}
+\label{sec:discussion}
+
+We have provided a new post-training pruning method called \sparsegpt{}, specifically tailored to massive language models from the GPT family. Our results show for the first time that large-scale generative pretrained Transformer-family models can be compressed to high sparsity via weight pruning in \emph{one-shot, without any retraining}, at low loss of accuracy, when measured both in terms of perplexity and zero-shot performance. 
+Specifically, we have shown that the largest open-source GPT-family models (e.g. OPT-175B and BLOOM-176B)  can reach 50-60\% sparsity, dropping more than 100B weights, with low accuracy fluctuations.
+
+Our work shows that the high degree of parametrization of massive GPT models allows pruning to directly identify sparse accurate models in the ``close neighborhood'' of the dense model, without gradient information. Remarkably, the output of such sparse models correlates extremely closely with that of the dense model. 
+We also show that \emph{larger models are easier to sparsify}: at a fixed sparsity level, the relative accuracy drop for the larger sparse models narrows as we increase model size, to the point where inducing 50\% sparsity results in practically no accuracy decrease on the largest models, which should be seen as very encouraging for future work on compressing such massive models.  
+
+\section{Acknowledgements}
+
+The authors gratefully acknowledge funding from the European Research Council (ERC) under the European Union’s
+Horizon 2020 programme (grant agreement No. 805223 ScaleML), as well as experimental support from Eldar Kurtic,
+and from the IST Austria IT department, in particular Stefano Elefante, Andrei Hornoiu, and Alois Schloegl.
+
+\bibliography{references}
+\bibliographystyle{arxiv}
+
+
+
+\newpage
+\appendix
+\onecolumn
+
+\section{Ablation Studies}
+\label{app:ablations}
+
+In this section, we conduct ablations studies with respect to several of the main parameters of \sparsegpt{}. For a fast iteration time and making it possible to also explore more compute and memory intensive settings, we focus on the OPT-2.7B model here. Unless stated otherwise, we always prune uniformly to the default 50\% sparsity. For brevity we only show raw-WikiText2 results here, but would like to note that the behavior on other datasets is very similar.
+
+\begin{figure*}[h]
+    \centering
+    \begin{minipage}[c]{.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{abl-samples.pdf}
+        \vspace{-20pt}
+        \captionof{figure}{Calibration samples ablation.}
+        \label{fig:ablation-samples}
+    \end{minipage}
+    \begin{minipage}[c]{.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{abl-damp.pdf}
+        \vspace{-20pt}
+        \captionof{figure}{Hessian dampening ablation.}
+        \label{fig:ablation-dampening}
+    \end{minipage}
+    \begin{minipage}[c]{.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{abl-blocksize.pdf}
+        \vspace{-20pt}
+        \captionof{figure}{Mask select. blocksize ablation.}
+        \label{fig:ablation-blocksize}
+    \end{minipage}
+\end{figure*}
+
+\paragraph{Amount of Calibration Data.} First, we investigate how the accuracy of \sparsegpt{} scales with the number calibration data samples, which we vary in powers of two. The results are shown in Figure \ref{fig:ablation-samples}. Curiously, \sparsegpt{} is already able to achieve decent results even with just a few 2048-token segments; using more samples however yields significant further improvements, but only up to a certain point as the curve flattens quite quickly. Thus, since using more samples also increases compute and memory costs, we stick to 128 samples in all our experiments.
+
+\paragraph{Hessian Dampening.} Next, we study the impact of Hessian dampening by testing values varying as powers of ten (see Figure \ref{fig:ablation-dampening}) which are multiplied by the average diagonal value, following \cite{frantar2022gptq}. Overall, this parameter does not seem to be too sensitive,  to  appear to perform quite similar; only when the dampening is very high, the solution quality decreases significantly. We choose  (i.e. ) dampening to be on the safe side with respect to inverse calculations also for the very largest models.
+
+\paragraph{Mask Selection Blocksize.} Another important component of our method is the adaptive mask selection as shown in Figure~\ref{fig:ablation-blocksize} where we vary the corresponding blocksize parameter with powers of two. Both column-wise (blocksize 1) as well as near full blocksize (4096 and 8192) perform significantly worse than reasonable blocking. Interestingly, a wide range of block-sizes appear to work well, with ones around a few hundred being very slightly more accurate. We thus choose blocksize 128 which lies in that range while also slightly simplifying the algorithm implementation as it matches the default lazy weight update batchsize.
+
+\paragraph{Sensitivity to Random Seeds.} Finally, we determine how sensitive the results of our algorithm are with respect to randomness; specifically, relative to the random sampling of the calibration data. We repeat a standard 50\% pruning run 5 times with different random seeds for data sampling and get  (mean/std) suggesting that \sparsegpt{} is quite robust to the precise calibration data being used, which is in line with the observations in other post-training works \cite{nagel2020up, hubara2021accurate, frantar2022obc}.
+
+\subsection{Approximation Quality}
+\label{sec:approx-quality}
+
+In this section we investigate how much is lost by the partial-update approximation employed by \sparsegpt{}, relative to (much more expensive) exact reconstruction. We again consider the OPT-2.7B model at 50\% sparsity and plot the layer-wise squared error of \sparsegpt{} relative to the error of exact reconstruction (with the same mask and Hessian) for the first half of the model in Figure \ref{fig:errors}. Apart from some outliers in form of the early attention out-projection layers, the final reconstruction errors of \sparsegpt{} seem to be on average only around 20\% worse than exact reconstruction; on the later fully-connected-2 layers, the approximation error even gets close to only 10\%, presumably because these layers have a very large number of total inputs and thus losses by considering only correlations within subsets are less severe than on smaller layers. Overall, these results suggest that, despite its dramatic speedup, \sparsegpt{} also remains quite accurate.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=.9\textwidth]{errors.pdf}
+    \vspace{-10pt}
+    \caption{Error of \sparsegpt{} reconstruction relative to exact reconstruction for the first half of OPT-2.7B at 50\% sparsity.}
+    \label{fig:errors}
+\end{figure}
+
+\section{Evaluation Details}
+\label{app:evaluation-details}
+
+\paragraph{Perplexity.} As mentioned in the main text, our perplexity calculation is carried out in standard fashion, following exactly the description of \cite{hfperplexity}. Concretely, that means we concatenate all samples in the test/validation dataset, encode the result with the model's matching tokenizer and then split it into non-overlapping segments of 2048 tokens (the maximum history of the models we study). Those are run through the model to calculate the corresponding average language modelling loss. The exponentiated number is the perplexity we report.
+
+\paragraph{Datasets.} In terms of datasets, we use the raw version of the WikiText2 test-set and concatenate samples, as recommended by the HuggingFace description referenced above, with ``\textbackslash n\textbackslash n" to produce properly formatted markdown. For PTB, we use the test-set of HuggingFace's ``ptb\_text\_only'' version and concatenate samples directly, without separators, as PTB is not supposed to contain any punctuation. Our C4 subset consists of the starting (the dataset comes in random order) 256 times 2048 encoded tokens in the first shard of the directly concatenated validation set; this choice is made to keep evaluation costs manageable.
+
+\section{Additional Results}
+\label{app:additional-experiments}
+
+\paragraph{Pruning Difficulty Scaling on PTB \& C4.} Tables \ref{tab:opt-ptb} and \ref{tab:opt-c4} present the equivalent results to Table \ref{tab:opt-wikitext2} in the main text, but on PTB and our C4 subset, respectively. Overall, they follow very similar trends to those discussed in Section \ref{sec:results}. The main notable difference is that no slight perplexity decrease relative to the dense baseline is observed at 50\% sparsity for the largest models, hence we have labelled this as a dataset specific phenomenon.
+\vspace{-5pt}
+\begin{table*}[h!]
+    \centering
+    \caption{OPT perplexity results on PTB.}
+    \vspace{5pt}
+    \scalebox{.9}{
+        \begin{tabular}{|l|c|c|c|}
+            \toprule
+            OPT - 50\% & 125M & 350M & 1.3B \\
+            \midrule
+            Dense & 38.99 & 31.07 & 20.29 \\
+            \midrule
+            Magnitude & 276. & 126. & 3.1e3 \\
+            AdaPrune & 92.14 & 64.64 & 41.60 \\
+            \sparsegpt{} & \textbf{55.06} &\textbf{43.80} & \textbf{25.80} \\
+            \bottomrule
+        \end{tabular}
+    }
+    \scalebox{.9}{
+        \begin{tabular}{|l|c|c|c|c|c|c|c|}
+            \toprule
+            OPT & Sparsity & 2.7B & 6.7B & 13B & 30B & 66B & 175B \\
+            \midrule
+            Dense & 0\% & 17.97 & 15.77 & 14.52 & 14.04 & 13.36 & 12.01 \\
+            \midrule
+            Magnitude & 50\% & 262. & 613. & 1.8e4 & 221. & 4.0e3 & 2.3e3 \\
+            \sparsegpt{} & 50\% & \textbf{20.45} & \textbf{17.44} & \textbf{15.97} & \textbf{14.98} & \textbf{14.15} & \textbf{12.37} \\
+            \midrule
+            \sparsegpt{} & 4:8 & 23.02 & 18.84 & 17.23 & 15.68 & 14.68 & 12.78 \\
+            \sparsegpt{} & 2:4 & 26.88 & 21.57 & 18.71 & 16.62 & 15.41 & 13.24 \\
+            \bottomrule
+        \end{tabular}
+    }
+    \label{tab:opt-ptb}
+\end{table*}
+\vspace{-15pt}
+\begin{table*}[h!]
+    \centering
+    \caption{OPT perplexity results on a C4 subset.}
+    \vspace{5pt}
+    \scalebox{.9}{
+        \begin{tabular}{|l|c|c|c|}
+            \toprule
+            OPT - 50\% & 125M & 350M & 1.3B \\
+            \midrule
+            Dense & 26.56 & 22.59 & 16.07 \\
+            \midrule
+            Magnitude & 141. & 77.04 & 403. \\
+            AdaPrune & 48.84 & 39.15 & 28.56 \\
+            \sparsegpt{} & \textbf{33.42} &\textbf{29.18} & \textbf{19.36} \\
+            \bottomrule
+        \end{tabular}
+    }
+    \scalebox{.9}{
+        \begin{tabular}{|l|c|c|c|c|c|c|c|}
+            \toprule
+            OPT & Sparsity & 2.7B & 6.7B & 13B & 30B & 66B & 175B \\
+            \midrule
+            Dense & 0\% & 14.32 & 12.71 & 12.06 & 11.45 & 10.99 & 10.13 \\
+            \midrule
+            Magnitude & 50\% & 63.43 & 334. & 1.1e4 & 98.49 & 2.9e3 & 1.7e3 \\
+            \sparsegpt{} & 50\% & \textbf{15.78} & \textbf{13.73} & \textbf{12.97} & \textbf{11.97} & \textbf{11.41} & \textbf{10.36} \\
+            \midrule
+            \sparsegpt{} & 4:8 & 17.21 & 14.77 & 13.76 & 12.48 & 11.77 & 10.61 \\
+            \sparsegpt{} & 2:4 & 19.36 & 16.40 & 14.85 & 13.17 & 12.25 & 10.92 \\
+            \bottomrule
+        \end{tabular}
+    }
+    \label{tab:opt-c4}
+\end{table*}
+
+\paragraph{50\% Sparse + 3-bit.} The main paper only presents near loss-less results for 50\% + 4-bit joint sparsification and quantization, corresponding to 3-bit quantization in terms of storage. For 50\% + 3-bit (corresponding to 2.5-bit), OPT-175B achieves 8.60 PPL on raw-WikiText2, which is also more accurate than GPTQ's \cite{frantar2022gptq} 8.94 state-of-the-art 2.5-bit result. \sparsegpt{} scores the same 8.93 for 4:8 + 3-bit. Based on these initial investigations, we believe that combining sparsity + quantization is a promising direction towards even more extreme compression of very large language models.
+
+\section{Partial 2:4 Results}
+\label{app:partial-24}
+
+Tables \ref{tab:opt-part24} and \ref{tab:bloom-part24} show the performance of a sequence of partially 2:4 sparse models on three different language modelling datasets. The first fraction of layers is fully sparsified while the remainder is kept dense. In this way, speedup and accuracy can be traded off also from binary compression choices, such as n:m-pruning.
+\vspace{-5pt}
+\begin{table}[h!]
+    \centering
+    \caption{Pruning different fractions (as consecutive segments from the beginning) of OPT-175B layers to the 2:4 pattern.}
+    \vspace{5pt}
+    \scalebox{.9}{
+        \begin{tabular}{|l|c|c|c|c|c|c|}
+            \toprule
+            OPT-175B -- 2:4 & dense & 1/2 & 2/3 & 3/4 & 4/5 & full \\
+            \midrule
+            raw-WikiText2 & 8.34 & 8.22 & 8.38 & 8.49 & 8.52 & 8.74 \\
+            PTB & 12.01 & 12.15 & 12.80 & 13.02 & 13.12 & 13.25 \\
+            C4-subset & 10.13 & 10.22 & 10.41 & 10.52 & 10.59 & 10.92 \\
+            \bottomrule
+        \end{tabular}
+    }
+    \label{tab:opt-part24}
+\end{table}
+\vspace{-15pt}
+\begin{table}[h!]
+    \centering
+    \caption{Pruning different fractions (as consecutive segments from the beginning) of BLOOM-176B layers to the 2:4 pattern.}
+    \vspace{5pt}
+    \scalebox{.9}{
+        \begin{tabular}{|l|c|c|c|c|c|c|}
+            \toprule
+            BLOOM-176B -- 2:4 & dense & 1/2 & 2/3 & 3/4 & 4/5 & full \\
+            \midrule
+            raw-WikiText2 & 8.11 & 8.20 & 8.50 & 8.67 & 8.74 & 9.20 \\
+            PTB & 14.58 & 14.78 & 15.44 & 15.84 & 15.96 & 16.42 \\
+            C4-subset & 11.71 & 11.81 & 12.06 & 12.23 & 12.32 & 12.67 \\
+            \bottomrule
+        \end{tabular}
+    }
+    \label{tab:bloom-part24}
+\end{table}
+
+\section{Sparsity Acceleration}
+\label{app:speedup}
+
+Lastly, we perform a preliminary study of how well sparse language models can already be accelerated in practice with off-the-shelf tools, for both CPU and GPU inference. We think that these results can likely be improved significantly with more model specific optimization, which we think is an important topic for future work.
+
+\paragraph{CPU Speedups.} First, we investigate acceleration of \textit{unstructured} sparsity for CPU inference. For that we utilize the state-of-the-art DeepSparse engine \cite{deepsparse} and run end-to-end inference on OPT-2.7B (support for larger variants appears to be still under development) for a single batch of 400 tokens, on an Intel(R) Core(TM) i9-7980XE CPU @ 2.60GHz using 18 cores. Table~\ref{tab:cpu-inference} shows the end-to-end speedups of running sparse models over the dense one, executed in the same engine/environment. (For reference, dense DeepSparse is  faster than the standard ONNXRuntime.) The achieved speedups are close to the theoretical optimum, which suggests that unstructured sparsity acceleration for LLM inference on CPUs is already quite practical.
+
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|l|c|c|c|}
+        \toprule
+        Sparsity & 40\% & 50\% & 60\%  \\
+        \midrule
+        Speedup &  &  &  \\
+        \bottomrule
+    \end{tabular}
+    \caption{Speedup over dense version when running sparsified OPT-2.7 models in DeepSparse.}
+    \label{tab:cpu-inference}
+\end{table}
+
+\paragraph{GPU Speedups.} 2:4 sparsity as supported by NVIDIA GPUs of generation Ampere and newer theoretically offers  acceleration of matrix multiplications. We now evaluate how big those speedups are in practice for the matmul problem sizes that occur in our specific models of interest. We use NVIDIA's official CUTLASS library (selecting the optimal kernel configuration returned by the corresponding profiler) and compare against the highly optimized dense cuBLAS numbers (also used by PyTorch). We assume a batch-size of 2048 tokens and benchmark the three matrix shapes that occur in OPT-175B; the results are shown in Table \ref{tab:gpu-speedups}. We measure very respectable speedups through 2:4 sparsity between , for individual layers (end-to-end speedups will likely be slightly lower due to some extra overheads from e.g. attention).
+
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|l|c|c|c|}
+        \toprule
+        Weight & Q/K/V/Out & FC1 & FC2 \\
+        \midrule
+        Dense & 2.84ms & 10.26ms & 10.23ms \\
+        2:4 Sparse & 1.59ms & 6.15ms &6.64ms \\
+        \midrule
+        Speedup &  &  &  \\
+        \bottomrule
+    \end{tabular}
+    \caption{Runtime and speedup for the different layer shapes occuring in OPT-175B using 2048 tokens.}
+    \label{tab:gpu-speedups}
+\end{table}
+
+
+
+\end{document}

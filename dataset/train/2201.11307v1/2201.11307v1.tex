@@ -1,0 +1,608 @@
+
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage{cvpr}              
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage[moderate]{savetrees}
+\usepackage[table,xcdraw]{xcolor}
+\usepackage{import}
+\usepackage{mathrsfs}
+\usepackage{adjustbox}
+\usepackage{multirow}
+
+\newcommand{\todo}[1]{\textcolor{red}{TO DO: {\tt #1}}}
+\newcommand\numberthis{\addtocounter{equation}{1}\tag{\theequation}}
+
+\usepackage[pagebackref,breaklinks,colorlinks]{hyperref}
+
+
+\usepackage[capitalize]{cleveref}
+\crefname{section}{Sec.}{Secs.}
+\Crefname{section}{Section}{Sections}
+\Crefname{table}{Table}{Tables}
+\crefname{table}{Tab.}{Tabs.}
+
+
+\def\cvprPaperID{10122} \def\confName{CVPR}
+\def\confYear{2022}
+
+
+\begin{document}
+
+\title{Dissecting the impact of different loss functions with gradient surgery}
+
+\author{Hong Xuan\\
+Microsoft\\
+{\tt\small Hong.Xuan@microsoft.com }
+\and
+Robert Pless\\
+Geroge Washington University\\
+{\tt\small pless@gwu.edu}
+}
+\maketitle
+
+\begin{abstract}
+   Pair-wise loss is an approach to metric learning that learns a semantic embedding by optimizing a loss function that encourages images from the same semantic class to be mapped closer than images from different classes.  The literature reports a large and growing set of variations of the pair-wise loss strategies. Here we decompose the gradient of these loss functions into components that relate to how they push the relative feature positions of the anchor-positive and anchor-negative pairs.  This decomposition allows the unification of a large collection of current pair-wise loss functions.  Additionally, explicitly constructing pair-wise gradient updates to separate out these effects gives insights into which have the biggest impact, and leads to a simple algorithm that beats the state of the art for image retrieval on the CAR, CUB and Stanford Online products datasets.
+\end{abstract}
+
+\section{Introduction}
+Deep Metric Learning trains networks to map semantically related images to similar locations in an embedding space.  Metric learning is useful in extreme classification settings when there are so many classes and limited embedding size that standard approaches fail, when there is a need to compare features extracted from images in unseen classes, or when there may be incomplete labels that allow a system to know that images come from the same or different classes without knowing what those classes are.
+
+In this domain, one popular pair-wise loss to train a network is Triplet Loss.  Triplets are three images comprising an anchor image, a positive image from the same class, and a negative image from a different class.  The network is trained with a loss function that penalizes situations where the anchor-negative pair is closer than the anchor-positive pair.  Many variations of this basic approach explore ways to choose which triplets should be included in the optimization or how much they should be weighted, whether the optimization should consider distances or angles between the embedded vectors, and what specific loss function should drive the scoring of a particular triplet.
+
+One recent work gave a large-scale analysis of many of these variations~\cite{musgrave2020metric} and found that a substantial fraction of the reported performance variation disappears with careful matching of experimental conditions.  In this work, we propose a further unifying analysis of these approaches, but explicitly consider how the pair-wise loss function attempts to affect the embedding location of the anchor, positive, and negative examples.  Different pair-wise loss functions have gradients that directly affect the desired locations of each embedded location in different ways. Those gradients are different in terms of the {\it direction} the anchor, positive and negative examples are pushed, the {\it overall importance} or weight given to different triplets, and the {\it relative importance} or weight given to the anchor-positive vs. the anchor negative pairs.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1\columnwidth]{figure/figure/main_figure.jpg}
+    \caption{To realize a desired embedding space, a common method is to design a loss function which can be calculated on deep learning platforms such as PyTorch and TensorFlow(Red). The auto-grad mechanism on the platforms automatically calculates the gradient to update the model parameters to forming the desired embedding space(Blue). In practice, the goal of deep metric learning is about optimizing the separation or clustering of feature points extracted from imagery, and the loss function is a somewhat indirect approach to reach that goal, while the gradient more directly affects the update of the feature extraction.   We propose the method to directly design the gradient to train models.
+    }
+    \label{fig:main}
+\end{figure}
+
+ 
+In addition to the analysis, we exploit the fact that PyTorch~\cite{pytorch} allows for the programmatic specification of gradients, allowing us to explicitly control the above gradient components, and then supports back-propagation to encourage the low-level features to move in this way. This flexibility allows us to explore the relative contributions of these components of the gradient and better understand what is and is not important in the optimization. Finally, we demonstrate the potential to directly modify the gradient components to train models for deep metric learning tasks instead of loss function modification.
+
+The three main contributions\footnote{Reject in CVPR2021, ICCV2021, CVPR2022} of this are:
+\begin{itemize}
+    \item a direct gradient framework to create a unified analysis of many recent triplet and pair-wise loss functions in terms of their gradients,
+    \item an experimental analysis showing how different choices for components of the gradient affects model performance,
+    \item a deeper understanding of the practical effects of defining a loss based on the Euclidean metric compared with the cosine similarity metric, and
+    \item an integration of the best choice of each component to create a new gradient rule that outperforms the current state-of-art result for image retrieval by a clear margin across multiple datasets.
+\end{itemize}
+
+\section{Background}
+There are many loss functions that have been proposed to solve the deep metric learning problem. Pair-wise loss functions such as contrastive loss~\cite{hadsell2006dimensionality}, binomial deviance loss~\cite{yi2014deep}, lifted structure loss~\cite{SOP} and multi-similarity loss~\cite{wang2019multi} penalize pairs of same label instances if their distance is large and pairs of different label instances if their distance is small.  The triplet loss function~\cite{hoffer2015deep,facenet} and its variants such as circle loss~\cite{Sun_2020_CVPR} form a triplet that contains anchor, positive and negative instances, where the anchor and positive instance share the same label, and anchor and negative instance share different labels. These loss functions have losses encouraging the anchor-positive distance to be smaller than anchor-negative distance.  Other variants of triplet loss integrate more negative instances into a triplet, such as N-Pair loss~\cite{Npairs}.  Proxy loss~\cite{Proxy} defines for each class a learnable anchor as a proxy. During the training, each instance is directly pulled to its proxy and pushed away from the proxy location for other classes.
+
+Due to the explosion of many new loss functions, issues underlying the fair comparison for these loss functions have been raised in~\cite{musgrave2020metric}. This paper works hard to re-implement many works before 2019. It tries to fix settings such as network architecture, optimizer and image prepossessing and compares different methods apple to apple.  This gives a relatively clear comparison of many loss functions but does not try to explore why some methods are superior to others. 
+
+Recent works such as Multi-Similarity Loss and Circle Loss~\cite{wang2019multi,Sun_2020_CVPR,Xuan_2020_ECCV} have started with standard triplet loss formulations and adjust the gradient of loss functions to give clear improvements with very simple code modifications.  These works all find an explicit loss function whose gradient creates the desired loss function.  In some cases, like the current state-of-the-art approach across many datasets~\cite{wang2019multi}, the updated loss function for one triplet includes the relative similarity between the anchor-positive and the anchor and other examples for the anchor's class.  This more complicated loss function and more complicated gradient may cause subtle challenges in the optimization process.
+
+Other strategies start with a desired gradient weighting function and integrate the desired gradients to solve for a loss function whose gradient has the appropriate properties.  This is often limited to simple weighting strategies, such as the simple linear form in~\cite{Sun_2020_CVPR} and simple gradient removal for positive pairs when triplets contain hard negative in~\cite{Xuan_2020_ECCV}, because it may be hard to find the loss function whose gradient is consistent with complex weighting strategies.
+
+The discussion of explicitly updating the direction of the gradient has been introduced in~\cite{Mohan_2020_CVPR}.  They encourage the anchor-positive and anchor-negative directional updates to be orthogonal (so they don't cancel each other), but include this as a  "direction regularization", which does not enforce orthogonality.
+
+The most related work is P2Sgrad~\cite{zhang2019p2sgrad}, the author analyzes the gradient in the family of margin-based softmax loss and directly modified the gradient with the cosine similarity for better optimization. Comparing to P2Sgrad, our work focuses on the triplet and pair-wise loss functions.
+
+The framework in this paper directly explore the space of desired gradient updates as shown in Figure~\ref{fig:main}.  By not limiting ourselves to designing a loss function with appropriate gradients, we can be more explicit in experimentally dissecting the effects of different parts of the gradient.  Furthermore, we can recombine the gradient terms that are experimentally most useful in a form of gradient surgery~\cite{yu2020gradient} that very slightly alters existing algorithms to give improved performance.
+
+\section{The Role of the Gradient in Metric Learning}
+We define a collection of terms for how a batch of images affects a network.
+Let  be a batch of input images,  be the  normalized feature vectors of the images extracted by the network, 
+ be loss value for the batch, 
+ be the parameters of the network, 
+ be the learning rate,
+  be the mapping function of the network, and  be loss function. In the forward training step, the expression is:
+ 
+. 
+
+The network weights are updated as:
+
+
+This equation highlights that the gradient of the loss function (rather than the loss function itself) directly affects how the model updates its parameters. Therefore, explicitly exploring the gradient is a useful path to exploring network learning behavior.
+
+We decompose the gradient into two terms,  and . The first term represents how changing the embedded feature location affects the loss, and this is the term explored most in detail in this work. The second term represents how model parameter (network weight) changes affect the feature embedding.  In a modern deep network with multiple layers, the second term is always expanded with the multiplication of multiple terms for each layer because of the derivative chain rule.
+
+In the following discussion, we focus on the particular forms of the first term in many triplet and pair-wise loss functions and then proposed to directly set and design the first term for model training. In Section~\ref{sec:idea}, as an example, two commonly used triplet losses are decomposed into components and then those components are categorized into three parts. Then, Section~\ref{sec:idea_gd},~\ref{sec:idea_wp} and ~\ref{sec:idea_wt} extend the analysis to more existing loss functions.
+
+\subsection{Gradient of Triplet Losses}
+\label{sec:idea}
+Given a triplet, , there are two commonly used triplet losses in the literature, a triplet loss based on Euclidean distance:
+
+where ,  are the distances between the anchor-positive and the anchor-negative pairs, and  is a distance margin. A second common triplet loss is the triplet loss based on cosine similarity with NCA~\cite{nca}:
+
+where , is the cosine similarity computed as the dot-product of the normalized anchor feature and the normalized feature from the positive example, the anchor-negative is computed in the same way,  and  is the scaling parameter.
+
+When comparing these two loss functions, their substantial differences make it challenging to determine how the loss affects performance. One loss is based on the Euclidean distance combined with a hinge function, while the other uses cosine similarity along with a negative log softmax function to combine the anchor-positive and anchor-negative pairs.  Looking at the gradients of these loss functions makes the difference more clear.  In triplet loss based on Euclidean distance, if the loss is greater than 0, its gradient can be derived from Equation~\ref{eq:euc_loss} as:
+
+Being explicit about this gradient allows us to name the direction that the positive example is being pulled to anchor example as , and these are unit vectors defined as: , with corresponding directions for the negative example, . 
+
+The gradient of the triplet loss function based on cosine similarity can also be derived from Equation~\ref{eq:nca_loss} to give a unit direction and magnitude:
+
+where , ,  and   are the unit gradient directions.
+
+Though both  and  contain different gradient components, those components can be categorized into two major parts: unit gradient direction for moving the feature and a scalar weight that affects the length of the gradient in that direction.  The weight itself can be divided into two sub-parts: the weight related to all three features in a triplet ,  and  (\textbf{Triplet Weight}), and the weight related to the positive pair  and  or negative pair  and  in a triplet (\textbf{Pair Weight}).
+
+With the categorizations of the gradient components, it becomes easy to compare the effects of each component. Before the comparison, we first show how recently proposed loss functions can be characterized by computing the direction and weights of the different gradient terms 
+in Sections~\ref{sec:idea_gd},~\ref{sec:idea_wp} and~\ref{sec:idea_wt} and then perform comparisons of the isolated effects of each gradient component in Sections~\ref{sec:exp_gd},~\ref{sec:exp_wp} and~\ref{sec:exp_wt}
+
+\subsection{Unit Gradient Direction}
+\label{sec:idea_gd}
+\import{figure/GD_analysis}{cos_euc.tex}
+The first gradient component is the unit vector in the direction of the gradient, derived from how the loss function moves the relative configuration of the anchor, positive and negative features.  We refer to the unit gradient direction of the two most common metrics Euclidean distance and cosine similarity as Euclidean direction  and cosine direction .   Recent work~\cite{Mohan_2020_CVPR}, also suggests to other directions, Euclidean orthogonal direction  and cosine orthogonal direction .
+
+\paragraph{Euclidean Direction():}
+In equation~\ref{eq:gradient_margin}, the geometric explanation of Euclidean direction is to move the positive feature directly towards the anchor and move the negative feature directly away from the anchor, as shown in Figure~\ref{fig:cos_euc_thoery}.  The vector direction of the anchor image (not shown in the Figure), is a combination of these directions.
+
+\paragraph{Cosine Direction():}
+In equation~\ref{eq:gradient_nca}, the geometric explanation of cosine direction on positive pair is to move the positive feature in the anchor feature direction and move the anchor in positive feature direction, and on negative pair is to move negative in the opposite of the anchor feature direction and move the anchor in the opposite of the negative feature direction as shown in Figure~\ref{fig:cos_euc_thoery}.
+
+\paragraph{Orthogonal Direction(  ):} 
+A direct gradient modification function~\ref{eq:gradient_orth} can be applied to both the  Euclidean and cosine directions.  This requires the negative pair to move in a direction orthogonal to the direction the positive pair is moving.  This is constrained as:
+
+
+This gradient was realized in recent work by~\cite{Mohan_2020_CVPR} who implicitly encourage the negative examples to move orthogonally to the anchor positive direction by adding regularizer in their loss function.  Our approach is directly understanding the gradient direction for each example highlights the impact of this loss function.
+
+\subsection{Pair Weight}
+\label{sec:idea_wp}
+We define the pair-weight , for the anchor-positive pair  and anchor-negative pair . The pair weight of cosine similarity  based triplet loss is a constant scaling parameter.  This is useful as a baseline for comparison. For this case where both pair weights are set with constant , as:
+
+
+In Euclidean distance based triplet loss, the pair weight  is different for the anchor-positive and anchor-negative pairs:
+
+and indicates the pair weight is proportional to the distance between the anchor and the other element of the pair.
+
+Recent works~\cite{Sun_2020_CVPR, wang2019multi, Xuan_2020_ECCV} argue that the weight for anchor-negative pair should be large when they are close to each other. Otherwise, as mentioned in ~\cite{Xuan_2020_ECCV}, the optimization will quickly converge to bad local minima. The solution in Circle loss~\cite{Sun_2020_CVPR} is to apply a linear pair weight : for negative pairs, the weight is large if the similarity is large and small if the similarity is small; for positive pairs, the weight is large if the similarity is small and small if the similarity is large:
+
+
+Early work binomial deviance loss~\cite{yi2014deep} uses a similar pair weight but with a nonlinear sigmoid form :
+
+where ,  and  are three hyper-parameters. 
+
+Multi-similar(MS) loss~\cite{wang2019multi} combines ideas from the lifted structure loss~\cite{SOP} and binomial deviance loss~\cite{yi2014deep}, which includes not only the self-similarity of a selected pair but also the relative similarity from other pairs.  
+
+The MS paper~\cite{wang2019multi} tries to find a loss function whose derivative fits the proposed pair weight.  Because the relative similarity term involves additional examples (outside the triplet), this creates additional gradients relative to those examples, even though the stated purpose is to weigh the selected pair.  Therefore, it's difficult to understand if the performance gain is coming from the proposed pair weight or from the gradients affecting the feature location of these other examples.  By casting their work within our framework, we can decouple the pair-weighting and explore the impact of this term in isolation.
+
+We follow the MS paper to cast their weighting function  in our framework.  Given a triplet, the self-similarity of the selected positive pair and negative pair are  and . The similarity of other positives and negatives to the anchor is considered as relative-similarity, noted as  and . In addition, \cite{wang2019multi} also defines  and  be the sets of selected  and , where 
+
+
+
+where 
+
+
+When  the pair weights simplify back to the sigmoid form in equation~\ref{eq:wp_sig}. 
+
+In practice, training MS loss needs to tune four hyper-parameters , ,  and  to fit different datasets, making the training not convenient and not efficient. With analysis on relative-similarity terms  and  in the appendix, we define a clearer and parameter free version of pair weight called linear MS pair weight , which behaves similar to the original MS weight:
+where 
+
+
+\subsection{Triplet Weight}
+\label{sec:idea_wt}
+\import{figure/WT}{exp_wt.tex}
+The triplet weight contains the similarity of both positive and negative pairs of a triplet, measuring whether a triplet is well separated or not. In Euclidean distance based triplet loss, the triplet weight (denoted as ) is a constant indicating that every triplet will be treated equally. For the fair comparison for other triplet weights, we set constant weight . 
+
+
+In cosine similarity based triplet loss, the triplet weight is:
+
+ is rely on the difference of  and . When a triplet in a correct configuration, , the triplet weight is small. Otherwise, the triplet weight will be large. 
+
+In Circle loss~\cite{Sun_2020_CVPR}, the triplet weight is:
+
+Because  only considers the similarity difference , some corner cases such triplet with both large  and  or both small  and  are not well treated.  The idea of  is to introduce a non-linear mapping for  and  in the exponential term in order to weight more on the corner cases. 
+
+Figure~\ref{fig:exp_wt} shows the triplet weight diagram, a triplet visualization tool from~\cite{Xuan_2020_ECCV}, for  and  with . The equal weight line in  is straight lines with form . And the equal weight line in  is circular lines with form . 
+
+Selectively Contrastive Triplet(SCT) loss~\cite{Xuan_2020_ECCV} selects triplets with hard negatives (the negative example in a triplet is closer to anchor than the positive example) and applies only contrastive loss to the hard negative pairs during the batch training. At gradient level, this approach is to remove the gradients from the anchor-positive pairs for triplets with hard negatives. We treat the selection as a masking operator on positive pair weight:
+
+
+Because the decision boundary of triplets selection   is a 1st order straight line, we note this masking operator is noted as .  Besides, we continue to extend the selection idea with Circle loss. The triplets in the corner cases can be also selected to only separate the negative pairs. Then, the decision boundary of the selection operator becomes a 2nd order circular line. We note it as , 
+
+Figure~\ref{fig:exp_wt} right shows the difference decision boundaries of  and .
+
+\subsection{Metric Learning Gradient Summary}
+\begin{table}[t]
+\centering
+\begin{adjustbox}{width=1\columnwidth}
+\begin{tabular}{l|c|c|c}
+Method & Direction & PairWeight & TripletWeight \\
+\hline
+Triplet (Euclidean)~\cite{facenet}
+&       &     &  \\
+Triplet (cosine)~\cite{Xuan_2020_WACV}
+&       &     &  \\
+Circle loss~\cite{Sun_2020_CVPR}
+&       &     &  \\
+Binomial deviance~\cite{yi2014deep}
+&       &     &  \\
+MS loss~\cite{wang2019multi}
+&       &  &  \\
+DR-MS loss~\cite{Mohan_2020_CVPR}
+&  &  &  \\
+SC triplet loss~\cite{Xuan_2020_ECCV}
+&       &    & ,  \\
+\hline
+\end{tabular}
+\end{adjustbox}
+\caption{Triplet loss functions define a gradient on the embedded feature locations of the anchor, positive, and negative examples of the triplet.  A large collection of recently proposed triplet loss functions (left) can be put into a unified framework by decomposing the gradient into the (unit) directions they impose on the features, and the weight of that gradient due to the properties of the anchor-positive and anchor-negative pairs, and the overall configuration of the triplet.  This decomposition gives some insight into why some approaches give improved results, and provides a design space for choosing particular combinations of weights to optimize overall performance.}
+\label{table:methods}
+\end{table} In this section, we have derived ways to represent many previous loss functions in terms of their gradients.  We have explicitly defined the gradients in terms of how the anchor, positive and negative are moved, defined them in terms of a unit vector in the direction of motion, a weight of anchor-positive term and the anchor negative term and weight of the triplet overall. Table~\ref{table:methods} shows how to map different combinations of gradient components into currently proposed loss functions. Section~\ref{sec:exp_all} gives explicit experiments to understand the isolated effects of these three parts of gradient component.
+
+\section{Experiment Settings}
+\label{sec:experiments}
+We run a set of experiments on the CUB200 (CUB)~\cite{CUB200}, CAR196 (CAR)~\cite{CAR196}, Stanford Online Products (SOP)~\cite{SOP} and In-shop Cloth (In-shop)~\cite{ICR} dataset. All experiments are run on the PyTorch platform~\cite{pytorch} with Nvidia Tesla V100 GPU, using ResNet~\cite{resnet} architectures, pre-trained on ILSVRC 2012-CLS data~\cite{ILSVRC15}. Training images augmented using a standard scheme (random horizontal flip and random crops padded by 10 pixels on each side), and normalized using the channel means and standard deviations. The network is trained with stochastic gradient descent (SGD) with momentum , step  and milestone at  of the total epochs. We refer the Easy Positive with Hard Negative mining protocol~\cite{Xuan_2020_WACV} to sample a batch with  classes and  images per class. On CUB, CAR, SOP and In-shop dataset, we sample 8, 16, 4 and 4 images per class in a mini-batch. 
+
+\textbf{Small embedding size comparing to training classes size}: We follow the early goal of deep metric learning works~\cite{SOP,Npairs,Proxy,harwood2017smart} which sets the embedding size to be smaller than the number of training classes. On CUB, CAR, SOP and In-shop dataset the embedding size is 64, 64, 512, 512.
+
+\textbf{Comparison of Gradient Components}: To compare each component in the gradient, we train ResNet18 on CAR dataset and In-shop dataset for 60 epochs. The training is run with batch size 128. For a given test setting, we run the test 5 times to remove the effect caused by the randomness coming from the random sampling of the batch and random initialization of the final FC embedding layer which reducing the GAP feature to a target dimension (e.g. 64 or 512). Then, the mean and standard deviation of Recall@1 are calculated. 
+
+\textbf{Comparison with the State-of-the-Art}: To compare the recent state-of-the-Arts results, we select ResNet50 as the backbone for 80 epochs training. The training is run with different batch sizes 128, 256, 384 and 512. Each test is run 3 times and mean Recall@K is calculated as the measurement for retrieval quality. 
+
+\textbf{PyTorch Implementation}: In PyTorch platform, we use \textit{torch.autograd.Function} module to customize both forward and backward functions for a loss module. The backward function is to generate our customized gradient for the optimizer. During the training, the gradient is directly starting from the backward function, replacing the gradient generated by AutoGrad of the forward function. 
+
+\section{Comparison Experiments}
+\label{sec:exp_all}
+In this section, we give explicit experiment results to demonstrate the isolated effects contributed by unit gradient direction, pair weight and triplet weight. More raw results are shown in Appendix.
+
+\begin{table}[t]
+\centering
+\begin{adjustbox}{width=0.8\columnwidth}
+\begin{tabular}{c|c|c}
+Direction & CAR & In-shop \\
+\hline
+      & \cellcolor[HTML]{F9DEDC}69.5  0.7 & \cellcolor[HTML]{FFFFFF}83.7  0.1 \\
+      & \cellcolor[HTML]{EA9088}75.5  0.2 & \cellcolor[HTML]{F3BCB7}85.2  0.3 \\
+ & \cellcolor[HTML]{FFFFFF}66.9  0.5 & \cellcolor[HTML]{FCEFEE}84.1  0.1 \\
+ & \cellcolor[HTML]{E67C73}77.0  0.7 & \cellcolor[HTML]{E67C73}86.6  0.2
+\end{tabular}
+\end{adjustbox}
+\caption{Comparing recall@1 performance of different gradient directions on CAR and In-shop dataset}
+\label{table:grad_gd}
+\end{table} \begin{table}[t]
+\centering
+\begin{adjustbox}{width=1.0\columnwidth}
+\begin{tabular}{c|l|c|c}
+ & PairWeight &  &  \\
+\hline
+ &  & \cellcolor[HTML]{FFFFFF}69.5  0.7 & \cellcolor[HTML]{B0DFC8}75.5  0.2 \\
+ &  & \cellcolor[HTML]{B4E1CB}75.2  0.4 & \cellcolor[HTML]{8CD1AF}77.0  0.4 \\
+ &  & \cellcolor[HTML]{95D4B5}76.7  0.5 & \cellcolor[HTML]{75C79F}77.8  0.9 \\
+ &  & \cellcolor[HTML]{68C296}78.2  0.4 & \cellcolor[HTML]{57BB8A}78.8  0.9 \\
+ &  & \cellcolor[HTML]{DFF2E9}71.9  0.4 & \cellcolor[HTML]{C0E6D4}74.3  0.2 \\
+\multirow{-6}{*}{\rotatebox[origin=c]{90}{CAR}}
+ &  & \cellcolor[HTML]{BCE4D1}74.6  0.8 & \cellcolor[HTML]{A2DABF}76.2  0.5 \\
+\hline
+ &  & \cellcolor[HTML]{FFFFFF}83.7  0.1 & \cellcolor[HTML]{CEECDD}85.2  0.3 \\
+ &  & \cellcolor[HTML]{D0ECDF}85.2  0.2 & \cellcolor[HTML]{DBF1E7}84.8  0.2 \\
+ &  & \cellcolor[HTML]{6CC499}87.4  0.1 & \cellcolor[HTML]{70C69C}87.3  0.2 \\
+ &  & \cellcolor[HTML]{67C296}87.5  0.2 & \cellcolor[HTML]{73C79E}87.3  0.1 \\
+ &  & \cellcolor[HTML]{AFDFC8}86.2  0.1 & \cellcolor[HTML]{57BB8A}87.8  0.2 \\
+\multirow{-6}{*}{\rotatebox[origin=c]{90}{In-shop}} &  & \cellcolor[HTML]{D9F0E5}84.9  0.4 & \cellcolor[HTML]{A5DBC1}86.4  0.2
+\end{tabular}
+\end{adjustbox}
+\caption{Comparing recall@1 performance of different pair weights with Euclidean and cosine direction on CAR and In-shop dataset}
+\label{table:grad_wp}
+\end{table} \begin{table}[t]
+\centering
+\begin{adjustbox}{width=1.0\columnwidth}
+\begin{tabular}{c|l|c|c}
+ & TripletWeight &  &  \\
+\hline
+ & \cellcolor[HTML]{FFFFFF} & \cellcolor[HTML]{FCFDFF}75.5  0.2 & \cellcolor[HTML]{7FACF8}77.8  0.9 \\
+ & \cellcolor[HTML]{FFFFFF} & \cellcolor[HTML]{EFF5FF}75.8  0.2 & \cellcolor[HTML]{8EB6F9}77.5  0.5 \\
+ & \cellcolor[HTML]{FFFFFF} \&  & \cellcolor[HTML]{AAC8FB}77.0  0.2 & \cellcolor[HTML]{4587F5}78.8  0.6 \\
+ & \cellcolor[HTML]{FFFFFF} \&  & \cellcolor[HTML]{A0C2FA}77.2  0.5 & \cellcolor[HTML]{5B95F6}78.4  0.5 \\
+ & \cellcolor[HTML]{FFFFFF} & \cellcolor[HTML]{FFFFFF}75.5  0.3 & \cellcolor[HTML]{6098F6}78.3  0.2 \\
+ & \cellcolor[HTML]{FFFFFF}  \&  & \cellcolor[HTML]{A9C8FA}77.0  0.4 & \cellcolor[HTML]{6EA1F7}78.1  0.6 \\
+\multirow{-7}{*}{\rotatebox[origin=c]{90}{CAR}} & \cellcolor[HTML]{FFFFFF} \&  & \cellcolor[HTML]{BFD6FC}76.6  0.8 & \cellcolor[HTML]{4285F4}78.8  0.3 \\
+\hline
+ & \cellcolor[HTML]{FFFFFF} & \cellcolor[HTML]{C9DDFC}85.2  0.1 & \cellcolor[HTML]{5D97F6}87.3  0.2 \\
+ & \cellcolor[HTML]{FFFFFF} & \cellcolor[HTML]{A4C4FA}86.0  0.3 & \cellcolor[HTML]{4285F4}87.9  0.4 \\
+ & \cellcolor[HTML]{FFFFFF} \&  & \cellcolor[HTML]{D0E1FD}85.1  0.3 & \cellcolor[HTML]{5E97F6}87.3  0.3 \\
+ & \cellcolor[HTML]{FFFFFF} \&  & \cellcolor[HTML]{EFF5FF}84.5  0.2 & \cellcolor[HTML]{76A7F7}86.9  0.2 \\
+ & \cellcolor[HTML]{FFFFFF} & \cellcolor[HTML]{A0C2FA}86.0  0.1 & \cellcolor[HTML]{4D8CF5}87.7  0.2 \\
+ & \cellcolor[HTML]{FFFFFF}  \&  & \cellcolor[HTML]{DCE9FD}84.9  0.2 & \cellcolor[HTML]{649BF6}87.2  0.1 \\
+\multirow{-7}{*}{\rotatebox[origin=c]{90}{In-shop}} & \cellcolor[HTML]{FFFFFF} \&  & \cellcolor[HTML]{FFFFFF}84.2  0.1 & \cellcolor[HTML]{73A5F7}86.9  0.2
+\end{tabular}
+\end{adjustbox}
+\caption{Comparing recall@1 performance of different triplet weights with constant and linear pair weight on CAR and In-shop dataset}
+\label{table:grad_wt}
+\end{table} \subsection{Unit Gradient Direction}
+\label{sec:exp_gd}
+To understand the behavior of unit gradient directions in section~\ref{sec:idea_gd}, we set constant pair and triplet weight  and , and vary the choice of  Euclidean, cosine, Euclidean-orthogonal and cosine-orthogonal direction. 
+
+In Table~\ref{table:grad_gd}, we find the following trends.  First, the cosine and cosine-orthogonal direction have better Recall@1 accuracy than other directions.  Second, the cosine-orthogonal gradient direction gives an improvement for both datasets compared to the cos direction. More analysis will be discussed in section~\ref{sec:euc_cos}.
+
+\subsection{Pair Weight}
+\label{sec:exp_wp}
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.49\columnwidth]{figure/figure/dist_CAR.jpg}
+    \includegraphics[width=0.49\columnwidth]{figure/figure/dist_ICR.jpg}
+    \caption{Distribution of the nearest positive pairs(blue) and the nearest negative pairs(orange) over whole CAR(left) and In-shop(right) dataset after training. On the CAR datasets, the nearest positive pairs distribution is largely overlay on the nearest negative pair distribution, indicating the CAR set is not easily to be separated well among different classes. However, on the In-shop datasets, the overlay area of the nearest positive pairs distribution and the nearest negative pair is much less, indicating the In-shop dataset can be easily separated among different classes.
+    }
+    \label{fig:datasets}
+\end{figure} To understand the behavior of the pair weights, we set triplet weights with constant form  and gradient direction  with  and  for two sets of results respectively. As for baseline results, the pair weights are set with constant form . 
+
+In Table~\ref{table:grad_wp}, all pair weights provide a clear performance gain to their baseline results. Also, the performance gap of gradient direction  and  after applying the pair weight is greatly reduced.
+
+Both relative-similarity methods  and  perform better than the method with only self-similarity on CAR dataset across different learning rates. Due to the property of well separation on In-shop dataset as shown in Figure~\ref{fig:datasets}, the relative-similarity term will less likely exist during the train because few positive and negative examples will be in  and  set as mentioned in equation~\ref{eq:set}.  is performance almost as same as , but  shows some computation instability effect. We put a further analysis of this effect in the appendix.
+
+In summary, Table~\ref{table:grad_wp} shows several features related to the pair weight.  First, pair weight causes substantial improvement in recall@1 accuracy. Second, in most cases, the linear and sigmoid pair weight outperforms the default Euclidean pair weight. Third, the linear version of the multi-similarity gradient direction is much more robust to different learning rates than the sigmoid version(see in appendix), and gives better performance and Recall@1 accuracy. 
+
+\subsection{Triplet Weight}
+\label{sec:exp_wt}
+Table~\ref{table:grad_wt}, we show two groups of experiments to compare the seven triplet weights. One group sets the pair-weight to be constant .  Another group uses the linear pair weight . All experiments use cosine gradient direction. 
+
+Comparing to the baseline method where triplet weight ,  and  has minimal but slight boost in performance;  and  has bigger impact on CAR data set than In-shop dataset. This is due to the properties of these two datasets as shown in Figure~\ref{fig:datasets}. CAR dataset has low inter-class variance(images from different classes may look similar) while In-shop dataset has high inter-class variance(images from different classes look not similar). The major challenge of CAR dataset is to distinguish similar images with different labels, and this is the purpose of triplet operators  and  because they concentrate on separating triplets with hard negative in training.  And In-shop dataset is to relatively easy to separate images with different labels, the goal is to continue separating the images better, which is the impact of  and 
+
+Therefore, we can conclude that the performance gain in Circle loss is largely from the pair weight not from the triplet weight. Selective Contrastive operator benefits the training tasks which need to separate triplets with hard negative and is not helpful for training tasks which easily separate triplets during the training. 
+
+
+
+\subsection{Euclidean or Cosine Direction?}
+\label{sec:euc_cos}
+\begin{table*}[t]
+\centering
+\begin{adjustbox}{width=1.0\textwidth}
+\begin{tabular}{l|ccc|ccc|ccc|ccc}
+Dataset & \multicolumn{3}{c}{CUB(dim=64)} & \multicolumn{3}{c}{CAR(dim=64)} & \multicolumn{3}{c}{SOP(dim=512)} & \multicolumn{3}{c}{In-shop(dim=512)} \\
+\hline
+Method & R@1 & R@2 & R@4 & R@1 & R@2 & R@4 & R@1 & R@10 & R@100 & R@1 & R@10 & R@20 \\
+\hline
+LiftedStruct~\cite{SOP} 
+& 43.6 & 56.6 & 68.6 & 53.0 & 65.7 & 76.0 & 62.5 & 80.8 & 91.9 & - & - & - \\
+ProxyNCA~\cite{Proxy} 
+& 49.2 & 61.9 & 67.9 & 73.2 & 82.4 & 86.4 & 73.7 & - & - & - & - & - \\
+SoftTriple~\cite{Qian_2019_ICCV} 
+& 60.1 & 71.9 & 81.2 & 78.6 & 86.6 & 91.8 & 78.3 & 90.3 & 95.9 & - & - & - \\
+EasyPositive~\cite{Xuan_2020_WACV} 
+& 57.3 & 68.9 & 79.3 & 75.5 & 84.2 & 90.3 & 78.3 & 90.7 & 96.3 & 87.8 & 95.7 & 96.8 \\
+MS~\cite{wang2019multi} 
+& 57.4 & 69.8 & 80.0 & 77.3 & 85.3 & 90.5 & 78.2 & 90.5 & 96.0 & 89.7 & 97.9 & 98.5 \\
+SCT~\cite{Xuan_2020_ECCV}
+& 57.7 & 69.8 & 79.6 & 73.4 & 82.0 & 88.0 & 81.9 & 92.6 & 96.8 & 90.9 & 97.5 & 98.2 \\
+DR-MS~\cite{Mohan_2020_CVPR} 
+& 59.1 & 71.0 & 80.3 & 79.3 & 86.7 & 91.4 & - & - & - & 91.7 & \bf{98.1} & 98.7 \\
+Proxy-anchor~\cite{Kim_2020_CVPR} & 61.7 & 73.0 & 81.8 & 78.8 & 87.0 & 92.2 & 79.1 & 90.8 & 96.2 & 91.5 & \bf{98.1} & \bf{98.8} \\
+\hline
+MS*(B128)
+& 59.8 & 71.7 & 81.0 & 79.0 & 86.6 & 91.5 & 78.7 & 90.4 & 96.0 & 89.4 & 96.6 & 97.4 \\
+DR-MS*(B128)
+& 60.7 & 71.9 & 81.3 & 79.9 & 87.0 & 91.7 & 78.8 & 90.4 & 96.1 & 89.6 & 96.4 & 97.4\\
+Ours(B128) 
+& 63.5 & 74.8 & 83.6 & 82.5 & 89.1 & 93.3 & 79.9 & 90.5 & 95.5 & 91.4 & 97.7 & 98.4 \\
+Ours(B256) 
+& \bf{63.8} & 74.8 & 83.7 & 85.5 & 91.0 & 94.6 & 82.0 & 92.3 & 96.8 & \bf{92.2} & 97.8 & 98.4 \\
+Ours(B384) 
+& \bf{63.8} & \bf{75.0} & \bf{84.2} & \bf{86.5} & \bf{91.6} & \bf{94.8} & 82.2 & \bf{92.5} & 96.8 & 92.0 & 97.8 & 98.3 \\
+Ours(B512) 
+& 63.1 & 74.6 & 83.2 & 85.7 & 91.2 & 94.7 & \bf{82.3} & \bf{92.5} & \bf{96.9} & 90.8 & 97.2 & 97.9 \\
+\hline
+\end{tabular}
+\end{adjustbox}
+\caption{Retrieval Performance on the CUB, CAR, SOP and In-shop datasets comparing to the best reported results.}
+\label{table:SOTA}
+\end{table*} \import{figure/GD_analysis}{gd_result.tex}
+In Section~\ref{sec:idea_gd} and Figure~\ref{fig:cos_euc_thoery}, the different gradient behaviors of  and  have been showed.  But additional discussion 
+will highlight the performance difference shown in Sections~\ref{sec:exp_gd} and~\ref{sec:exp_wp}.
+
+We first decompose the unit gradient to move positive and negative features into two directions: the direction along positive and negative feature  and the direction orthogonal to positive and negative feature . As shown in Figure~\ref{fig:cos_euc_thoery}, only the gradient component along  effectively contributes to the angle change of anchor-positive and anchor-negative pair which directly affect the similarity score.  The effective gradient projection strength for  and :
+
+ where  is the similarity of a positive or negative pair. The derivation of the above projection length is shown in the appendix.
+
+Figure~\ref{fig:cos_euc_thoery} right shows the change of the effective gradient strength for  and  varying as a function of pair similarity. Because most pairs during the training have positive similarity, we focus on projection length when similarity is positive. 
+
+The Euclidean gradient has stronger force to pull positive close and push negative away than the cosine direction when two features are close to each other. Therefore, Euclidean gradient continues to force features together even when they are already relatively close, unlike the cosine gradient. In Figure~\ref{fig:cos_euc_scatter} left column, we show the triplet diagram plot of triplets extracted from the last 5 epochs of training (epoch 55-60) on CAR dataset. The Euclidean direction clusters the same label feature more tightly than the cosine direction because there are more triplets along the right edge of the triplet diagram comparing to the scatter of cosine direction. 
+
+However, the tight clustering behavior in training leads to even the triplet with nearest positive and the nearest negative to be compact. In the middle and right column of Figure~\ref{fig:cos_euc_scatter}, we plot just these triplets for the whole training set (middle), and testing set (right). The Euclidean gradient has more triplets very close to the top right corner, indicating that point have very similar same class {\em and} different class neighbors, while cosine gradient creates triplets that are more spread out. The spread out effect indicates the feature learned by the deep model is distinguishable~\cite{Zhang_2017_ICCV,Wu_2018_CVPR,Xuan_2020_WACV}. Because these Euclidean feature are more compressed (for both the anchor-positive and anchor-negative pairs), it is harder for the network to learn distinguishable features that if it is using the cosine gradient.
+
+One more piece of evidence to support the analysis above is the pair weight result in section~\ref{sec:exp_wp}. When the Euclidean pair weight  is applied to Euclidean direction and cosine direction, the performance gap between these two methods is almost disappeared. This is because the Euclidean pair weight  reduces the weight de-emphasizes positive pair when they are already close, and therefore avoid its tight clustering behavior, making Euclidean direction behave similarly as cosine direction.
+
+\section{Best combination of gradients}
+
+In the previous chapter, we separately consider the gradient terms that relate to the gradient directions, the pair weights applied to the gradients from the anchor-negative and anchor-positive pairs, and the overall weight of the triplets.  In terms of the gradient direction, the  gives the best performance and is relatively stable with respect to the learning rate.  In terms of the pair-weighting,  is consistently a top performer across datasets.  Similarly,  shows stable improvement to both CAR and In-shop datasets. We combine these gradient components empirically to form the final gradient, and train a network by imposing this gradient combination.  We compare the performance of the network trained this way with many latest state-of-the-art results. 
+
+To ensure a fair comparison, we also re-implement current related SOTA approaches, MS and DR-MS results (noted as MS* and DR-MS*) with our gradient method to create a comparison with the same network backbone, pre-processing and training settings. The implementation difference is shown in the appendix. The result is reported in Table~\ref{table:SOTA}.  In addition, we vary the batch size 128, 256, 384, 512 on all tests for four datasets and continue to improve the Recall performance. 
+
+\section{Limitations}
+We point out the following limitations of the paper:
+\begin{itemize}
+    \item We do not exhaustively compute all possible combination of all the three gradient components, and instead focus on the isolated effect of single gradient components.  There may be additional improvements in explicitly considering the interactions between the different gradient components.
+    \item  There are recent loss functions proposed in the deep metric learning literature such as Proxy loss~\cite{Proxy} and N-pair loss~\cite{Npairs}; and we currently are not able to put those loss function into our framework due to complex gradient computation for multiple negative pairs. 
+\item Our experiments do not fully explore training optimizations.  We have fixed hyper-parameters in our sampling approach, we keep a constant step size, and we fix the hyper-parameters in gradient components such as  for most experiments. Our results are based on hyper-parameter selections from earlier papers, but the gradient based approach to learning embedding functions may be improved with additional search over the hyper-parameter space.
+\end{itemize}
+
+
+\section{Conclusion}
+We provide a new framework to train deep metric learning networks with direct gradient modification. In our framework, we disentangled gradient components of many loss functions into common components, and analyze the effects of each component.  We find that the Euclidean gradient direction and the cosine gradient direction behave quite differently. In its default form, the Euclidean gradient creates embedding spaces that are very tightly clustered and the cosine gradient direction has a consistently big improvement over a large set of experimental conditions. 
+
+Second, recently popular works define new loss functions that, in terms of their gradient, primarily change the pair weight term, which is consistent with our findings that the pair-weight term is very important.  In contrast, we find the triplet weight term to have limited impact that was not consistent across datasets.  
+
+Finally, this study of the importance of different weighting functions and components of the gradient led to a simple approach that directly defines the desired gradients and gives improvements to state-of-the-art performance relative to recent work.
+
+\begin{thebibliography}{10}\itemsep=-1pt
+
+\bibitem{nca}
+Jacob Goldberger, Geoffrey~E Hinton, Sam~T. Roweis, and Ruslan~R Salakhutdinov.
+\newblock Neighbourhood components analysis.
+\newblock In L.~K. Saul, Y. Weiss, and L. Bottou, editors, {\em Advances in
+  Neural Information Processing Systems 17}, pages 513--520. MIT Press, 2005.
+
+\bibitem{hadsell2006dimensionality}
+Raia Hadsell, Sumit Chopra, and Yann LeCun.
+\newblock Dimensionality reduction by learning an invariant mapping.
+\newblock In {\em Proc. IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, volume~2, pages 1735--1742. IEEE, 2006.
+
+\bibitem{harwood2017smart}
+Ben Harwood, BG Kumar, Gustavo Carneiro, Ian Reid, Tom Drummond, et~al.
+\newblock Smart mining for deep metric learning.
+\newblock In {\em Proceedings of the IEEE International Conference on Computer
+  Vision}, pages 2821--2829, 2017.
+
+\bibitem{resnet}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In {\em Proc. IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, June 2016.
+
+\bibitem{hoffer2015deep}
+Elad Hoffer and Nir Ailon.
+\newblock Deep metric learning using triplet network.
+\newblock In {\em International Workshop on Similarity-Based Pattern
+  Recognition}, pages 84--92. Springer, 2015.
+
+\bibitem{Kim_2020_CVPR}
+Sungyeon Kim, Dongwon Kim, Minsu Cho, and Suha Kwak.
+\newblock Proxy anchor loss for deep metric learning.
+\newblock In {\em IEEE/CVF Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, June 2020.
+
+\bibitem{CAR196}
+Jonathan Krause, Michael Stark, Jia Deng, and Li Fei-Fei.
+\newblock 3d object representations for fine-grained categorization.
+\newblock In {\em 4th International IEEE Workshop on 3D Representation and
+  Recognition (3dRR-13)}, Sydney, Australia, 2013.
+
+\bibitem{ICR}
+Ziwei Liu, Ping Luo, Shi Qiu, Xiaogang Wang, and Xiaoou Tang.
+\newblock Deepfashion: Powering robust clothes recognition and retrieval with
+  rich annotations.
+\newblock In {\em Proceedings of IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, June 2016.
+
+\bibitem{Mohan_2020_CVPR}
+Deen~Dayal Mohan, Nishant Sankaran, Dennis Fedorishin, Srirangaraj Setlur, and
+  Venu Govindaraju.
+\newblock Moving in the right direction: A regularization for deep metric
+  learning.
+\newblock In {\em Proceedings of the IEEE/CVF Conference on Computer Vision and
+  Pattern Recognition (CVPR)}, June 2020.
+
+\bibitem{Proxy}
+Yair Movshovitz-Attias, Alexander Toshev, Thomas~K. Leung, Sergey Ioffe, and
+  Saurabh Singh.
+\newblock No fuss distance metric learning using proxies.
+\newblock In {\em Proc. International Conference on Computer Vision (ICCV)},
+  Oct 2017.
+
+\bibitem{musgrave2020metric}
+Kevin Musgrave, Serge Belongie, and Ser-Nam Lim.
+\newblock A metric learning reality check.
+\newblock In {\em European Conference on Computer Vision}, pages 681--699.
+  Springer, 2020.
+
+\bibitem{pytorch}
+Adam Paszke, Sam Gross, Soumith Chintala, Gregory Chanan, Edward Yang, Zachary
+  DeVito, Zeming Lin, Alban Desmaison, Luca Antiga, and Adam Lerer.
+\newblock Automatic differentiation in pytorch.
+\newblock In {\em NIPS-W}, 2017.
+
+\bibitem{Qian_2019_ICCV}
+Qi Qian, Lei Shang, Baigui Sun, Juhua Hu, Hao Li, and Rong Jin.
+\newblock Softtriple loss: Deep metric learning without triplet sampling.
+\newblock In {\em Proceedings of the IEEE/CVF International Conference on
+  Computer Vision (ICCV)}, October 2019.
+
+\bibitem{ILSVRC15}
+Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma,
+  Zhiheng Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein,
+  Alexander~C. Berg, and Li Fei-Fei.
+\newblock {ImageNet Large Scale Visual Recognition Challenge}.
+\newblock {\em International Journal of Computer Vision (IJCV)},
+  115(3):211--252, 2015.
+
+\bibitem{facenet}
+Florian Schroff, Dmitry Kalenichenko, and James Philbin.
+\newblock Facenet: A unified embedding for face recognition and clustering.
+\newblock In {\em Proc. IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, June 2015.
+
+\bibitem{Npairs}
+Kihyuk Sohn.
+\newblock Improved deep metric learning with multi-class n-pair loss objective.
+\newblock In {\em Advances in Neural Information Processing Systems}, pages
+  1857--1865, 2016.
+
+\bibitem{SOP}
+Hyun~Oh Song, Yu Xiang, Stefanie Jegelka, and Silvio Savarese.
+\newblock Deep metric learning via lifted structured feature embedding.
+\newblock In {\em Proc. IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, 2016.
+
+\bibitem{Sun_2020_CVPR}
+Yifan Sun, Changmao Cheng, Yuhan Zhang, Chi Zhang, Liang Zheng, Zhongdao Wang,
+  and Yichen Wei.
+\newblock Circle loss: A unified perspective of pair similarity optimization.
+\newblock In {\em IEEE/CVF Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, June 2020.
+
+\bibitem{wang2019multi}
+Xun Wang, Xintong Han, Weilin Huang, Dengke Dong, and Matthew~R Scott.
+\newblock Multi-similarity loss with general pair weighting for deep metric
+  learning.
+\newblock In {\em Proceedings of the IEEE Conference on Computer Vision and
+  Pattern Recognition}, pages 5022--5030, 2019.
+
+\bibitem{CUB200}
+P. Welinder, S. Branson, T. Mita, C. Wah, F. Schroff, S. Belongie, and P.
+  Perona.
+\newblock {Caltech-UCSD Birds 200}.
+\newblock Technical Report CNS-TR-2010-001, California Institute of Technology,
+  2010.
+
+\bibitem{Wu_2018_CVPR}
+Zhirong Wu, Yuanjun Xiong, Stella~X. Yu, and Dahua Lin.
+\newblock Unsupervised feature learning via non-parametric instance
+  discrimination.
+\newblock In {\em The IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, June 2018.
+
+\bibitem{Xuan_2020_ECCV}
+Hong Xuan, Abby Stylianou, Xiaotong Liu, and Robert Pless.
+\newblock Hard negative examples are hard, but useful.
+\newblock In {\em The European Conference on Computer Vision (ECCV)}, September
+  2020.
+
+\bibitem{Xuan_2020_WACV}
+Hong Xuan, Abby Stylianou, and Robert Pless.
+\newblock Improved embeddings with easy positive triplet mining.
+\newblock In {\em Proceedings of the IEEE/CVF Winter Conference on Applications
+  of Computer Vision (WACV)}, March 2020.
+
+\bibitem{yi2014deep}
+Dong Yi, Zhen Lei, Shengcai Liao, and Stan~Z Li.
+\newblock Deep metric learning for person re-identification.
+\newblock In {\em 2014 22nd International Conference on Pattern Recognition},
+  pages 34--39. IEEE, 2014.
+
+\bibitem{yu2020gradient}
+Tianhe Yu, Saurabh Kumar, Abhishek Gupta, Sergey Levine, Karol Hausman, and
+  Chelsea Finn.
+\newblock Gradient surgery for multi-task learning.
+\newblock {\em arXiv preprint arXiv:2001.06782}, 2020.
+
+\bibitem{Zhang_2017_ICCV}
+Xu Zhang, Felix~X. Yu, Sanjiv Kumar, and Shih-Fu Chang.
+\newblock Learning spread-out local feature descriptors.
+\newblock In {\em The IEEE International Conference on Computer Vision (ICCV)},
+  Oct 2017.
+
+\bibitem{zhang2019p2sgrad}
+Xiao Zhang, Rui Zhao, Junjie Yan, Mengya Gao, Yu Qiao, Xiaogang Wang, and
+  Hongsheng Li.
+\newblock P2sgrad: Refined gradients for optimizing deep face models.
+\newblock In {\em Proceedings of the IEEE/CVF Conference on Computer Vision and
+  Pattern Recognition}, pages 9906--9914, 2019.
+
+\end{thebibliography}
+ 
+\end{document}
