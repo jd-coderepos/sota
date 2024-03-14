@@ -48,7 +48,7 @@ originally downloaded in LaTeX format from arXiv.
 Of the 5207 papers in the train set, only 625 papers reported their code links as a mention within the paper's text. Similarly, of the 2242 papers in the test set, only 215 papers reported their code links as a mention within the paper's text. Whereever found, for the two repositories respectively, the code link annotations are included in the file `code-link.txt`.
 -->
 
-There are 9,352+100 total papers in the train+validation sets,respectively. Furthermore, note each `annotations.json` file either contains (task, dataset, metric, score) annotations for all papers reporting model scores. Otherwise `annotations.json` contains the value "unanswerable." This is for those papers that do not report any model scores and therefore leaderboards cannot be populated from them. Models trained on our dataset should, in a first step, distinguish papers with leaderboards and those without, then for the former set of papers, extract their leaderboard tuples as annotations. The train dataset has 5,274 papers with leaderboard annotations and the remaining 4,078 papers without leaderboard annotations and therefore annotated as "unasnwerable." The validation dataset has 50 papers with leaderboard and 50 papers without leaderboard annotations.
+There are 12,288+100 total papers in the train+validation sets,respectively. Furthermore, note each `annotations.json` file either contains (task, dataset, metric, score) annotations for all papers reporting model scores. Otherwise `annotations.json` contains the value "unanswerable." This is for those papers that do not report any model scores and therefore leaderboards cannot be populated from them. Models trained on our dataset should, in a first step, distinguish papers with leaderboards and those without, then for the former set of papers, extract their leaderboard tuples as annotations. The train dataset has 7,936 papers with leaderboard annotations and the remaining 4,352 papers without leaderboard annotations and therefore annotated as "unanswerable." The validation dataset has 51 papers with leaderboard and 49 papers without leaderboard annotations.
 
 Below are provided some detailed statistics relevant to the leaderboard annotations in our dataset offering a glimpse into the corpus. 
 
@@ -56,11 +56,11 @@ Below are provided some detailed statistics relevant to the leaderboard annotati
 
 | Parameter | train+validation (counts) |
 | --- | --- |
-| Unique Tasks | 1,171 |
-| Unique Datasets | 3,759 |
-| Unique Metrics | 2,259 |
-| Unique (Task, Dataset, Metric) triples | 8,723 |
-| Avg. (Task, Dataset, Metric) triples occurrences per paper | 5.47 |
+| Unique Tasks | 1,372 |
+| Unique Datasets | 4,795 |
+| Unique Metrics | 2,782 |
+| Unique (Task, Dataset, Metric) triples | 11,977 |
+| Avg. (Task, Dataset, Metric) triples occurrences per paper | 6.93 |
 
 Ten most common Tasks, Datasets, and Metrics in the **Train+Validation set**:
 <table>
@@ -81,93 +81,93 @@ Ten most common Tasks, Datasets, and Metrics in the **Train+Validation set**:
   </tr>
   <tr>
 		<td>1</td>
-		<td>atari games</td>
-		<td>1196</td>
-		<td>coco test-dev</td>
-		<td>476</td>
+		<td>image classification</td>
+		<td>2273</td>
+		<td>imagenet</td>
+		<td>1603</td>
 		<td>accuracy</td>
-		<td>2521</td>
+		<td>4383</td>
 	</tr>
 	<tr>
 		<td>2</td>
-		<td>image classification</td>
-		<td>786</td>
-		<td>imagenet</td>
-		<td>466</td>
+		<td>atari games</td>
+		<td>1448</td>
+		<td>coco test-dev</td>
+		<td>792</td>
 		<td>score</td>
-		<td>1258</td>
+		<td>1515</td>
 	</tr>
 	<tr>
 		<td>3</td>
-		<td>link prediction</td>
-		<td>716</td>
-		<td>cifar-10</td>
-		<td>328</td>
+		<td>node classification</td>
+		<td>1113</td>
+		<td>human3.6m</td>
+		<td>624</td>
 		<td>f1</td>
-		<td>1061</td>
+		<td>1384</td>
 	</tr>
 	<tr>
 		<td>4</td>
 		<td>object detection</td>
-		<td>610</td>
-		<td>chebi-20</td>
-		<td>205</td>
+		<td>1001</td>
+		<td>cifar-10</td>
+		<td>585</td>
 		<td>psnr</td>
-		<td>516</td>
+		<td>1144</td>
 	</tr>
 	<tr>
 		<td>5</td>
-		<td>image super-resolution</td>
-		<td>610</td>
-		<td>chebi-20</td>
-		<td>205</td>
-		<td>psnr</td>
-		<td>516</td>
+		<td>video retrieval</td>
+		<td>997</td>
+		<td>coco minival</td>
+		<td>310</td>
+		<td>map</td>
+		<td>1068</td>
 	</tr>
 	<tr>
 		<td>6</td>
-		<td>question answering</td>
-		<td>450</td>
-		<td>human3.6m</td>
-		<td>196</td>
-		<td>ssim</td>
-		<td>387</td>
+		<td>link prediction</td>
+		<td>941</td>
+		<td>youtube-vos 2018</td>
+		<td>295</td>
+		<td>miou</td>
+		<td>862</td>
 	</tr>
 	<tr>
 		<td>7</td>
 		<td>semantic segmentation</td>
-		<td>427</td>
-		<td>fb15k-237</td>
-		<td>193</td>
-		<td>ap</td>
-		<td>367</td>
+		<td>901</td>
+		<td>cifar-100</td>
+		<td>252</td>
+		<td>ssim</td>
+		<td>799</td>
 	</tr>
 	<tr>
 		<td>8</td>
-		<td>neural architecture search</td>
-		<td>399</td>
-		<td>iconqa</td>
-		<td>188</td>
-		<td>fid</td>
-		<td>346</td>
+		<td>semi-supervised video object segmentation</td>
+		<td>890</td>
+		<td>msr-vtt-1ka</td>
+		<td>247</td>
+		<td>top 1 accuracy</td>
+		<td>789</td>
 	</tr>
 	<tr>
 		<td>9</td>
-		<td>visual question answering (vqa)</td>
-		<td>397</td>
-		<td>wn18rr</td>
-		<td>161</td>
-		<td>miou</td>
-		<td>325</td>
+		<td>3d human pose estimation</td>
+		<td>889</td>
+		<td>fb15k-237</td>
+		<td>244</td>
+		<td>1:1 accuracy</td>
+		<td>787</td>
 	</tr>
 	<tr>
 		<td>10</td>
-		<td>node classification</td>
-		<td>387</td>
-		<td>snli</td>
-		<td>143</td>
-		<td>mae</td>
-		<td>276</td>
+		<td>question answering</td>
+		<td>866</td>
+		<td>msu super-resolution for video compression</td>
+		<td>225</td>
+		<td>number of params</td>
+		<td>759</td>
 	</tr>
 </table>
 
@@ -175,23 +175,23 @@ Ten most common (Task, Dataset, Metric) triples in Train+Validation Set:
 
 | (Task, Dataset, Metric) | Count |
 | --- | --- |
-| (image classification, imagenet, top 1 accuracy) | 146 |
-| (image classification, cifar-10, percentage correct) | 81 |
-| (image classification, cifar-100, percentage correct) | 70 |
-| (visual reasoning, winoground, text score) | 68 |
-| (visual reasoning, winoground, image score) | 68 |
-| (object detection, coco test-dev, box map) | 64 |
-| (3d human pose estimation, human3.6m, average mpj...) | 64 |
-| (neural architecture search, imagenet, top-1 error) | 134 |
-| (visual reasoning, winoground, group score) | 60 |
-| (natural language inference, snli, % test accuracy) | 51 |
+| (image classification, imagenet, top 1 accuracy) | 524 |
+| (image classification, imagenet, number of params) | 313 |
+| (image classification, imagenet, gflops) | 256 |
+| (3d human pose estimation, human3.6m, average mpj...) | 197 |
+| (image classification, cifar-10, percentage correct) | 128 |
+| (action classification, kinetics-400, acc@1) | 108 |
+| (object detection, coco test-dev, box map) | 106 |
+| (image classification, cifar-100, percentage correct) | 105 |
+| (semantic segmentation, ade20k, validation miou) | 92 |
+| (neural architecture search, imagenet, top-1 erro...) | 83 |
 
 Since each paper is accompanied with an annotations file, this section concludes with statistics for each of the four types in the tuple, what proportion of those can actually be found in the accompanying full-text.
 
-- for Tasks, 63,53% of the annotation labels can be found in the accompanying paper full-text.
-- for Datasets, 47,32% of the annotation labels can be found in the accompanying paper full-text.
-- for Metrics, 48.4% of the annotation labels can be found in the accompanying paper full-text.
-- for Scores, 67.95% of the annotations can be found in the accompanying paper full-text.
+- for Tasks, 60.24% of the annotation labels can be found in the accompanying paper full-text.
+- for Datasets, 45.48% of the annotation labels can be found in the accompanying paper full-text.
+- for Metrics, 42.69% of the annotation labels can be found in the accompanying paper full-text.
+- for Scores, 58.86% of the annotations can be found in the accompanying paper full-text.
 
 <!--
 ### Rough Timeline:
