@@ -20,14 +20,14 @@ In this repository, we have included an example from the validation dataset avai
 
 Note that once the evaluation phase begins, the test datasets will automatically switch to the relevant dataset for that phase.
 
-To help participants prepare for the testing phases, we have released a validation dataset:
+During the practice phase we have uploaded the validation dataset annotations on Codalab. Participants can prepare for the testing phase by making a few practice submissions with the validation dataset ahead of time to ensure that your outputs are processed and results are obtained. The following two folders will be discussed:
 
 1. **blind-validation-dataset**
    - This folder contains sub-directories of articles. Each sub-directory has an identifier and contains the LaTeX content in `.tex` format.
-   - During the testing phases, participants will receive unique test dataset releases for each phase, available as input to the systems.
+   - During the testing phases, participants will receive unique articles collection as test dataset releases for each phase, available as input to the systems. Similar to the dataset in this folder there will be no `annotations.json` files released.
 
 2. **sample-submission**
    - This folder contains the expected output format from participant systems given the input data. The output must preserve the original subdirectory names from the input dataset to uniquely identify each article during evaluation. Each subdirectory should include a file named `annotations.json`, which either contains SOTA annotations or the string "unanswerable".
-   - Create a `*.zip` file of all output subdirectories as shown in `sample-submission.zip`. On Codalab, assuming you are registered, navigate to the `Participate` tab and select `Submit/View Results` to submit your zip file.
+   - Create a `*.zip` file of all output subdirectories as shown in `sample-submission.zip`. The naming of the zipped file is not relevant. On Codalab, assuming you are registered to the SOTA? task, navigate to the `Participate` tab and select `Submit/View Results` to submit your zip file.
 
-Note: Submitting the `sample-submission.zip` provided in this repository as it is will result in an evaluation score of 100%, as this file is an exact replica of the validation set, merely copying over the `annotations.json` files.
+Note: Submitting the `sample-submission.zip` provided in this repository, during the practice phase until the end of April 22nd, as it is will result in an evaluation score of 100%, as this file is an exact replica of the validation set, merely copying over the `annotations.json` files.
