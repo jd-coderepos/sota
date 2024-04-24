@@ -1,0 +1,349 @@
+This section presents a detailed description of the implementation of KBLAS kernels. 
+We will begin with single GPU kernels 
+and leverage the design idea to the multi-GPU kernels. 
+\subsection{General Outlines}
+\label{subsec:outlines}
+We focus on describing the processing 
+pattern of input matrices, since this is the dominant part when 
+compared with reading or writing input and output vectors. 
+Input matrices are processed in square blocks. The block size  is a tuning parameter. 
+
+KBLAS usually launches more than one kernel per a BLAS operation. Sections \ref{grid_design} and \ref{tb_design} discuss 
+the design of kernels that dominate the execution time of the BLAS operations. The dominant 
+kernels are:
+\begin{enumerate}
+\item The general non-transposed MV kernel computing the product .
+\item The general transposed MV kernel computing the product .
+\item The symmetric/Hermitian MV kernel computing the product , where  
+refers to the off diagonal blocks of . 
+\end{enumerate}
+These kernels 
+have a common processing strategy, and are designed in almost the same manner. Other kernels will be 
+discussed separately in Sections \ref{beta_scaling} and \ref{symv_diag}.
+\subsection{Grid Design}
+\label{grid_design}
+In general, the grid of any KBLAS kernel is organized as a 2D array of TBs. 
+The size of the grid is (, ). While  is a tuning parameter that 
+the user can pick regardless of the problem size,  is decided based on the problem size and . Given a 
+matrix ,  is given by, 
+
+The value of  determines the number of TBs working collaboratively (through atomic operations) on the same 
+part of the output vector. From now on, we will consider square matrices, that is, . 
+
+Each TB is distinguish by its (, ) coordinates. The  coordinate indicates the 
+block row or the block column on which the TB will work. Eventually, 
+TBs having different values of the 
+ write to different parts of the output vector. TBs with different  coordinate 
+and share the same  coordinate will write to the same segment in the output vector using atomic operations. 
+
+
+All TBs traverse the input matrix, in blocks, either horizontally or vertically. The movement direction depends 
+on the operation to be performed. In the case of a GEMV operation, the movement is decided by the 
+input character that specifies whether the matrix is transposed. If it is, then TBs will move vertically. 
+Otherwise, the movement is horizontal. Figure \ref{fig:gemv_mv} shows both possibilities. 
+\begin{figure}[ht]
+\centering
+\subfigure[GEMV-N (non-transposed)]{
+\includegraphics[height=0.25\linewidth]{gemvn-movement.png}
+\label{fig:gemvn_mv}
+}
+\subfigure[GEMV-T (transposed)]{
+\includegraphics[height=0.25\linewidth]{gemvt-movement.png}
+\label{fig:gemvt_mv}
+}
+\caption[]{Movement of TBs in a GEMV operation. TBs with the same color share the same value of .}
+\label{fig:gemv_mv}
+\end{figure}
+In either case, TBs are programmed to traverse the entire matrix. At the beginning of execution, 
+each TB must decides its starting point (first block) and its workload (number of blocks to be 
+processed by this TB). TBs sharing the same  values will collaboratively process an entire block row or and 
+entire block column of the matrix. The total workload  for these TBs is given by
+
+Then each TB computes its workload share  and its starting point  as follows
+
+
+Equations \ref{eqn:local_workload} ensures a minimum load imbalance among TBs. Equation \ref{eqn:starting_point} allows 
+each TB to process adjacent blocks in the matrix. According to the input matrix size and grid configuration, some TBs 
+might have their  value equal to zero. In such a case, these TBs terminate immediately, writing nothing to the output 
+vector.
+
+If the matrix is symmetric (SYMV/HEMV kernel), then TBs are programmed to process either the upper or the lower triangular part. As shown in 
+Figure \ref{fig:symv_mv}, diagonal blocks, colored in solid black, are processed separately. This is because they have a different 
+processing pattern from off-diagonal blocks.
+Off-diagonal blocks are processed in a 
+similar manner to the GEMV kernel, except for the movement being vertical regardless of which triangular part is being processed. 
+The vertical movement ensures contiguous data access for each TB. 
+The total workload  is not constant across block columns, and is no longer determined by Equation \ref{eqn:total_workload}. In fact, each block row/block column has a unique 
+value of  that is given by 
+
+where  is the index of a block column, typically 0, 1, 2, , from left to right. 
+\begin{figure}[ht]
+\centering
+\subfigure[SYMV-L (lower triangular)]{
+\includegraphics[height=0.25\linewidth]{symvl-movement.png}
+\label{fig:symvl_mv}
+}
+\subfigure[SYMV-U (upper triangular)]{
+\includegraphics[height=0.25\linewidth]{symvu-movement.png}
+\label{fig:symvu_mv}
+}
+\caption[]{Movement of TBs in a SYMV/HEMV operation. TBs with the same color share the same value of .}
+\label{fig:symv_mv}
+\end{figure}
+
+The same strategy for TB movement applies for the multi-GPU kernels. The movement is horizontal only for the non-transposed GEMV, 
+and vertical otherwise. The different is that the movement will be applied to the local submatrix stored on the GPU, as shown in 
+Figure \ref{fig:big_matrix_mgpu}, instead of the whole matrix.  
+\subsection{Thread Block Design}
+\label{tb_design}
+Each TB is designed as a 2D array of threads. The size of the TB is (, ), where = and 
+ is a third tuning parameter. Each thread is distinguished by its (, ) coordinates. 
+For a certain value of ,  controls the total number of threads, the amount of shared memory required 
+for local reductions, and most importantly, the register pressure within a single TB. For simplicity, we will discuss an example 
+of ==32 and =4, shown in Figure \ref{fig:tb_design}. 
+
+\begin{figure}[ht]
+\centering
+\includegraphics[height=0.6\linewidth]{tb-design.png}
+\caption[]{Thread block design}
+\label{fig:tb_design}
+\end{figure}
+
+The design of TBs maximizes memory throughput through double buffers. Each square block of the matrix is processed in two phases, as 
+shown in Figure \ref{fig:tb_design}. At each phase a half block of dimension  is processed in register buffers. 
+Meanwhile, a new half block is fetched from memory into another set of register buffers. The overlap between computation and memory prefetching 
+spans multiple blocks of the matrix, meaning that processing in phase 2 overlaps phase 1 in the next block. 
+The dark cells in Figure \ref{fig:tb_design} show the original positions of threads in the first half block. The hashed cells indicate the respective positions for 
+these threads in the next half block. 
+Threads are reorganized as a  thread block (168). That is, we end up with 8 thread columns, each 
+consisting of 16 threads. A thread column is responsible for processing a  (164) rectangle, 
+where  is the register buffer length required, per thread, per half block.  is given by
+
+Each thread keeps two register buffers of length  to fetch its corresponding elements. For the example discussed 
+in Figure \ref{fig:tb_design}, this means 
+thread (0, 0) will be responsible for elements \{(0, 0), (0, 1), (0, 2), (0, 3)\} as well as elements \{(16, 0), (16, 1), (16, 2), (16, 3)\}.
+Upon completion of processing, each thread spills its partial products to a reduction space located in shared memory. A synchronization point 
+is enforced to make sure that all threads have written their partial products. 
+A reduction is done 
+in shared memory before writing the result (using atomic operations) to the global memory. 
+
+Thread columns always read the block horizontally, in order to maintain contiguous memory access. 
+However, the number of partial products per thread as well as the frequency of the 
+synchronization and reduction depends on the kernel being executed. All possibilities are summarized using a pseudo code in Figure 
+\ref{fig:kblas_pseudocode}. In the pseudo code, abbreviations  and  refer to Lower Half Block and Upper Half Block, respectively.
+Variables , , and  refer to register accumulators where each thread keeps its local partial result. 
+The variables  and  are register buffers that are used to read elements from  and  respectively. 
+
+If the kernel is a non-transposed GEMV (Algorithm \ref{alg:gemvn}), then only reduction space 1 is needed for the final reduction. Each thread produces 2 partial 
+products, one for each half block. The reduction is performed per row. The total space required for reduction space 1 is given by,
+
+The reduction in this case is needed only once. According to the grid design in Section \ref{grid_design}, TBs traverse horizontal adjacent 
+blocks, accumulating the partial results of all blocks together. The overhead of synchronization and reduction is, therefore, negligible. 
+
+If the kernel is a transposed GEMV (Algorithm \ref{alg:gemvt}), then only reduction space 2 is needed for the final reduction. Each thread produces  partial 
+products, one for each matrix column. The reduction is performed per column. The total space required for reduction is given by, 
+
+Like the non-transposed GEMV, the reduction is needed only once, since TBs traverse the matrix vertically, and can accumulate partial results 
+from one block to another. 
+
+If the kernel is a SYMV/HEMV (Algorithm \ref{alg:symv}), exclusive of diagonal blocks, then both reduction spaces are needed. Each off-diagonal block is processed 
+twice: non-transposed and transposed. Each thread will have a total of 2+ partial products. This case combines the two possibilities of the 
+GEMV kernel. However, it differs in the frequency of sync-and-reduce steps. Since TBs always traverse half the matrix vertically, partial 
+results of the transposed computation can be accumulated, but those of non-transposed computation cannot, since they belong to different parts 
+in the output vector. This means that a sync-and-reduce step is required whenever a TB moves from one matrix block to another, in order 
+to write the partial products into global memory. The number of reductions is equal to the number of processed off-diagonal blocks plus an extra reduction 
+performed only once for transposed computation. 
+
+\begin{figure}
+\noindent\begin{minipage}[][][t]{0.48\textwidth}
+\begin{algorithm}[H]
+\KwData{, , }
+\KwResult{}
+Compute  and  and navigate accordingly\;
+ \;
+  \;
+\For{   \KwTo }
+{
+  \;
+ \;
+\If{}
+{
+Move right to the next block\;
+  \;
+}
+ \;
+}Write  and  to SHMEM\;
+Barrier\;
+\If{  }
+{
+reduction in SHMEM\;
+Write  into  using atomics\;
+}
+\vspace{1.4mm}
+\caption{Non-transposed GEMV}
+\label{alg:gemvn}
+\end{algorithm}
+\end{minipage}
+\noindent\begin{minipage}[][][t]{0.48\textwidth}
+\begin{algorithm}[H]
+\KwData{, , }
+\KwResult{}
+Compute  and  and navigate accordingly\;
+ \;
+  \;
+\For{   \KwTo }
+{
+  \;
+ \;
+\If{}
+{
+Move down to the next block\;
+  \;
+}
+ \;
+}Write  to SHMEM\;
+Barrier\;
+\If{  }
+{
+reduction in SHMEM\;
+Write  into  using atomics\;
+}
+\caption{Transposed GEMV}
+\label{alg:gemvt}
+\end{algorithm}
+\end{minipage}
+\begin{center}
+\vspace{-1mm}
+\noindent\begin{minipage}{0.48\textwidth}
+\begin{algorithm}[H]
+\KwData{, , }
+\KwResult{}
+Compute  and  and navigate accordingly\;
+ \;
+  \;
+\For{   \KwTo }
+{
+  \;
+ \;
+ \;
+\If{}
+{
+Move down to the next block\;
+  \;
+}
+ \;
+ \;
+Barrier\;
+Write  and  to SHMEM\;
+Barrier\;
+\If{  }
+{
+reduction in SHMEM\;
+Write  into  using atomics\;
+}
+}Write  to SHMEM\;
+Barrier\;
+\If{  }
+{
+reduction in SHMEM\;
+Write  into  using atomics\;
+}
+\caption{Upper/Lower SYMV/HEMV}
+\label{alg:symv}
+\end{algorithm}
+\end{minipage}
+\end{center}
+\vspace{-2mm}
+\caption{Pseudo code of the core kernels in KBLAS}
+\label{fig:kblas_pseudocode}
+\end{figure}
+
+The design of TBs does not change going from one GPU to multi-GPUs. The scope of the design is 
+a square block of the matrix, so no major differences in the design exist. 
+\subsection{Scaling with  in GEMV kernels}
+\label{beta_scaling}
+Sections \ref{grid_design} and \ref{tb_design} show how KBLAS computes the product . However, a standard BLAS 
+operation involves scaling  with . Although the scaling is a trivial operation, it cannot be performed inside the 
+KBLAS kernel that computes . This is because every segment of length  in the resulting vector is computed by 
+multiple thread blocks using atomic operations. Since the CUDA programming model handles the executing 
+of TBs transparently, we cannot determine the order of execution for TBs. This means we cannot assign the scaling operation to 
+a particular TB, since it is not necessarily executed first. 
+
+The solution is to perform the scaling operation in a separate kernel. The scale and the multiplication kernel are launched 
+in order, so the scale operation must finish before the multiplication is performed. The scale kernel is similar to 
+the standard level-1 BLAS  operation SCAL. 
+A KBLAS GEMV operation 
+consists, therefore, of two successive kernels called transparently to the user. As discussed in Section \ref{symv_diag}, the scale 
+kernel is not needed if the matrix is symmetric/Hermitian.
+\subsection{Diagonal Blocks Processing in SYMV/HEMV kernels}
+\label{symv_diag}
+If the matrix is symmetric/Hermitian, then diagonal blocks are different from the off-diagonal blocks, in terms of 
+the processing strategy. 
+The difference is that only one triangular part of a diagonal block should be read from global memory.
+Moreover, only one non-transposed computation per diagonal block is necessary, in contrast with two computations 
+per a off-diagonal block. KBLAS processes diagonal blocks in a separate kernel.
+
+One TB is launched per diagonal block. The entire block is fetched into shared memory. Then a mirroring step is performed to copy one 
+triangular part to the other. This mirroring step eliminates the triangular part that should not be referenced, meaning that extra 
+reads are done from global memory. After mirroring is done, the block residing in shared memory is multiplied by the 
+corresponding segment in . The contribution of this kernel to the total execution time of 
+a SYMV/HEMV operation is negligible, specially if the matrix is large. 
+
+The reason behind separation is to simplify the programming, since the two kernels obviously need different 
+amounts of GPU resources. It is also better for the CUDA runtime to optimize the GPU utilization for each kernel individually.
+
+Furthermore, it is possible to fuse the scaling operation with  into this kernel, since exactly one TB is launched per diagonal 
+block. The KBLAS SYMV/HEMV operation does not invoke the SCAL kernel mentioned in Section \ref{beta_scaling}. 
+
+\subsection{Multiplication by a Submatrix}
+\label{submatrix}
+In many LAPACK algorithms, matrix-vector multiplication is performed on submatrices. This is a typical situation in matrix reduction techniques. 
+A common performance consideration is to pad the leading dimension so that the matrix can be stored in a fully 128 byte aligned memory space, and 
+so, can be accessed in a coalesced manner. However, if the multiplication is done by a submatrix, coalesced access is not guaranteed and depends on the 
+shifts in rows and columns. For example, Figure \ref{fig:submatrix} shows a matrix stored in a column major format. Each column consists of segments that 
+are stored in aligned 128 bytes. If the entire matrix is to be processed using 8 thread columns, then it is straightforward to write a kernel 
+that maps thread columns to access 
+the matrix in a coalesced manner as shown in Figure \ref{fig:submatrix_1}. 
+Now consider the submatrix obtained by skipping one row and one column of the original matrix, as shown 
+in Figure \ref{fig:submatrix_2}. 
+Using the same kernel will result in non-coalesced memory access. 
+This is because each memory request by a thread column will translate into 2 memory transactions, 
+leading to an overhead in memory traffic. 
+
+KBLAS proposes an additional set of BLAS routines with new interfaces other than the BLAS interfaces. As shown in Figure \ref{fig:submatrix_3}, the routine processes the same original 
+matrix, but ignores the top rows and the left most column when computation is performed. This strategy does extra reads, but preserves memory coalesced 
+access. The hashed cells refer to matrix elements that are read 
+but ignored in computation. This is in contrast with Figure \ref{fig:submatrix_2}, where 
+the hashed cells correspond to locations outside the matrix boundary that should be avoided by thread columns. 
+
+In general, given an  matrix , with a properly padded leading dimension, a multiplication by a 
+submatrix  with the dimensions  can 
+be translated into a multiplication by the submatrix  with dimensions , where 
+
+ 
+
+Equation \ref{eqn:offset_dim} shows that the dimensions  and  are padded to the nearest values divisible by . This helps 
+minimize the amount of extra global memory reads. 
+
+The standard BLAS interface cannot pass information about the input matrix being a part of a bigger one. This is why we propose a new interface 
+to convey these information to the kernel. The user should pass a pointer to the original matrix 
+as well as the offsets in rows and columns. Since KBLAS relies on perfect memory coalesced access while reading the matrix, 
+these set of new routines are expected to perform better than standard ones when a submatrix is processed.
+
+\begin{figure}[ht]
+\centering
+\subfigure[Coalesced access]{
+\includegraphics[height=0.43\linewidth]{submatrix-1.png}
+\label{fig:submatrix_1}
+}
+\subfigure[Non-coalesced access]{
+\includegraphics[height=0.43\linewidth]{submatrix-2.png}
+\label{fig:submatrix_2}
+}
+\subfigure[Submatrix processing in KBLAS]{
+\includegraphics[height=0.43\linewidth]{submatrix-3.png}
+\label{fig:submatrix_3}
+}
+\caption[]{Non-coalesced memory access due to processing a submatrix}
+\label{fig:submatrix}
+\end{figure}

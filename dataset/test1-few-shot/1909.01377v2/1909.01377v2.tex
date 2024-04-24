@@ -1,0 +1,504 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers, compress}{natbib}
+
+
+
+
+
+
+\usepackage[final]{neurips_2019}
+
+
+
+\usepackage[utf8]{inputenc} \usepackage[T1]{fontenc}    \usepackage{hyperref}       \usepackage{url}            \usepackage{booktabs}       \usepackage{tabu}
+\usepackage{amsfonts}       \usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{nicefrac}       \usepackage{microtype}      \usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{color}
+\usepackage{multirow}
+\usepackage{wrapfig}
+\usepackage[linesnumbered,ruled]{algorithm2e}
+
+
+\title{Deep Equilibrium Models}
+
+
+
+\author{Shaojie Bai  \\
+  Carnegie Mellon University\\
+\And
+  J. Zico Kolter \\
+  Carnegie Mellon University \\ Bosch Center for AI\\
+  \And
+  Vladlen Koltun \\
+  Intel Labs
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{apptheorem}{Theorem}
+\newtheorem{claim}{Claim}
+\newtheorem{appclaim}{Claim}
+\newenvironment{proofidx}[1]{\renewcommand{\proofname}{Proof of Theorem #1}\proof}{\endproof}
+\newenvironment{claimproofidx}[1]{\renewcommand{\proofname}{Proof of Claim #1}\proof}{\endproof}
+
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+  We present a new approach to modeling sequential data: the deep equilibrium model (DEQ).  Motivated by an observation that the hidden layers of many existing deep sequence models converge towards some fixed point, we propose the DEQ approach that \emph{directly} finds these equilibrium points via root-finding.  Such a method is equivalent to running an \emph{infinite} depth (weight-tied) feedforward network, but has the notable advantage that we can analytically backpropagate through the equilibrium point using implicit differentiation.  Using this approach, training and prediction in these networks require only \emph{constant} memory, regardless of the effective ``depth'' of the network.  We demonstrate how DEQs can be applied to two state-of-the-art deep sequence models: self-attention transformers and trellis networks.  On large-scale language modeling tasks, such as the WikiText-103 benchmark, we show that DEQs 1) often improve performance over these state-of-the-art models (for similar parameter counts); 2) have similar computational requirements to existing models; and 3) vastly reduce memory consumption (often the bottleneck for training large sequence models), demonstrating an up-to \emph{88\%} memory reduction in our experiments. The code is available at \url{https://github.com/locuslab/deq}.
+\end{abstract}
+
+\section{Introduction}
+
+Most modern feedforward deep networks are built on the core concept of \emph{layers}. In the forward pass, each network consists of a stack of some  transformations, where  is the depth of the network.  To update these networks, the backward passes rely on backpropagating through the same  layers via the chain rule, which typically necessitates that we store the intermediate values of these layers. The value for  is usually a hyperparameter and is picked by model designers (e.g., ResNet-101~\cite{he2016deep}).  Among the many applications of deep networks, sequence modeling has witnessed continuous advances in model architectures. Specifically, while recurrent networks have long been the dominant model for sequences~\citep{Elman90findstructure,hochreiterLSTM,choGRU,merityRegOpt}, deep feedforward architectures based on temporal convolutions~\citep{waibel,waveNet,bai2018empirical} and self-attention~\citep{vaswani2017attention,dai2018transformer,child2019generating} have (re-)emerged to claim superior performance on a variety of sequence prediction tasks.
+
+In very general terms, a deep feedforward sequence model can be written as the following iteration:
+
+where  is the layer index;  is the hidden sequence of length  at layer ;  is the input sequence (i.e., we are choosing to explicitly model skip connections, for reasons we explain later); and  is some nonlinear transformation which typically enforces causality (i.e., future time points cannot influence past ones).  Our paper derives its motivation from surprising recent works that employ the \emph{same} transformation in each layer (known as \emph{weight tying}, with ) and still achieve results competitive with the state-of-the-art~\cite{dehghani2018universal,bai2018trellis,dabre2019recurrent}. This raises an interesting question: If the same transformation is applied at each layer of a deep network, what is the limit of this process, and how do we model it?
+
+In this paper, we propose a new approach to ``deep'' modeling that addresses this question.  Specifically, we introduce the deep equilibirum model (DEQ), a method that directly computes the fixed point  of a nonlinear transformation, i.e., the solution to the nonlinear system
+
+This solution corresponds to the eventual hidden layer values of an \emph{infinite depth} network.  But instead of finding this value by iterating the model, we propose to directly (and in practice, more quickly) solve for the equilibrium via any black-box root-finding method.  Importantly, we show that DEQ can \emph{directly} differentiate through the fixed point equations via implicit differentation, which does not require storing \emph{any} intermediate activation values.  In other words, we can backpropagate through the infinite-depth network while using only \emph{constant} memory, equivalent to a single layer's activations.
+
+After developing the generic DEQ approach, we study in detail the instantiation of DEQ via two feedforward sequence models: \emph{trellis networks} (weight-tied temporal convolutions)~\citep{bai2018trellis} and memory-augmented \emph{universal transformers} (weight-tied multi-head self-attention)~\citep{dehghani2018universal,dai2018transformer}, both of which have obtained state-of-the-art performance (SOTA) on various sequence tasks. We show how both the forward and backward passes can be implemented efficiently via quasi-Newton methods. Finally, we demonstrate via experiments on large-scale high-dimensional sequence modeling benchmarks (e.g., WikiText-103 language modeling) that, despite only using constant memory, DEQ can attain modeling accuracy on par with (or even slightly better than) corresponding layer-based networks. We believe that DEQ offers a novel perspective on the analysis of sequential data.
+
+
+\section{Background}
+\label{sec:background}
+
+\paragraph{Deep sequence models.} Given an input sequence , where  (e.g., a word embedding) and  is the sequence length, we define a sequence model as any function  that produces output 
+that satisfies the causality constraint:  depends only on  and not on any element of . Recent progress on autoregressive sequence tasks has been based on deep learning, where three major families of sequence models stand out. Recurrent networks (RNNs)~\citep{Elman90findstructure,Werbos1990} as well as their variants such as LSTM~\citep{hochreiterLSTM} are universally applied and optimized in a variety of time-series tasks~\citep{bradbury2016quasi,gal2016dropout,merityRegOpt}. Alternatively, prior work has shown that deeply stacked temporal convolutions~\citep{waibel,waveNet,dauphinGatedConv,bai2018empirical} can achieve competitive results, especially on long sequences. Finally, the self-attention transformer architecture~\citep{vaswani2017attention,dai2018transformer} has also achieved SOTA on several NLP benchmarks~\citep{devlin2018bert,child2019generating}. Efforts have also been devoted to drawing deeper connections among the three model families. Bai et al.~\cite{bai2018trellis} study the underlying relationship between RNNs and ConvNets, unifying these in the Trellis Network, which combines the benefits of both families. Dehghani et al.~\cite{dehghani2018universal} introduce a recurrently-stacked universal transformer and demonstrate its effectiveness on text understanding and generation.
+
+\vspace{-2mm}
+\paragraph{Memory-efficient deep networks.} An important factor that limits the development of high-capacity networks is limited memory on hardware devices used for training. To address this issue, \cite{chen2016training} proposes gradient checkpointing that reduces an -layer network's memory requirement to  at the cost of extra forward passes (i.e., extra computations). Alternatively, \cite{gomez2017reversible,MacKay2018} develop reversible networks, where each layer's activations can be reconstructed from the next layer during backpropagation to reduce memory requirements. DEQs reduce memory consumption to a \emph{constant} (i.e., independent of network ``depth'') by directly differentiating through the equilibrium point and thus circumventing the construction and maintenance of ``layers''.
+
+\vspace{-2mm}
+\paragraph{Continuous view of deep networks.} Some prior works have studied continuous views of deep networks. \cite{scellier2017equilibrium} proposes a biologically inspired equilibrium propagation framework for an energy-based model whose prediction is the fixed-point of the energy dynamics at its local minimum. \cite{haber2017stable,chen2018neural} model deep ResNets by black-box ODE solvers in forward and backward passes (as if the network has smaller ``layer steps'') given the start- and end-points of a dynamical system. For deep sequence models, \cite{simard1989fixed,miller2018recurrent} consider the RNN as a dynamical system to investigate its stability properties.
+
+Our work takes a further step in the direction of the aforementioned areas. While some of the prior work has primarily focused on the analysis of residual architectures or small symmetric-weight energy-based models, our work is not predicated on any specific type of interlayer transformation. We show that DEQs can be easily instantiated via two very different sequence learning architectures. More fundamentally, unlike ODE-based methods, which use the adjoint system to backpropagate through the entire latent trajectory, the DEQ model solves directly for sequence-level equilibria via a quasi-Newton method and backpropagates directly through this fixed point, without regard for the solution path that brought it there. Moreover, while ODE-based models~\citep{haber2017stable,chen2018neural} were verified on numerical experiments and MNIST classification, computation and numerical stability issues challenge their application to large-scale problems. In comparison, we demonstrate the applicability of DEQs on realistic high-dimensional sequence tasks with competitive performance, while enjoying similar constant-memory benefits as \cite{chen2018neural}.
+
+\vspace{-2mm}
+\paragraph{Implicit layers in deep learning.} The DEQ model can be viewed as an infinitely deep network, but interestingly can also be viewed as a \emph{single}-layer network, with the caveat that the layer is defined \emph{implicitly}: the output  is defined as the value which solves some non-linear equation.  There has been a growing interest in implicit layers in recent years~\citep{niculae2018sparsemap,amos2017optnet,niculae2018sparsemap,wang2019satnet}, but the precise formulation of the DEQ is quite different, and our current models represent the largest-scale practical application of implicit layers in deep learning of which we are aware. Concurrent work~\cite{elghaoui2019implicit} also looks at such implicit layers in a broad sense and focuses on training small models via Lagrangian methods; a combination of these approaches with the DEQ model is a promising avenue for future work.
+
+Another thread of work on implicit layers traces back to some of the original papers on recurrent networks trained via recurrent backpropagation (RBP)~\citep{almeida1990learning,pineda1988generalization}.  Recent work~\citep{liao2018reviving} has re-examined RBP and established an implicit, constant-memory variant based on conjugate gradient and Neumann series. A number of related papers also enforce fixed point conditions within RNN architectures~\citep{zhang2019equilibrated,kazi2017implicitly}.  Whereas the DEQ model shares similarities with the RBP approach, some major differences involve: 1) the explicit use of equilibrium as a replacement for depth in general networks, along with our proof of the universality of these models to replace depth; 2) the use of the approach in methods outside of fixed-input RNNs (i.e., same input vector  for all ), especially the compatibility with SOTA architectures; and 3) the scalability of the DEQ model to practical tasks where it achieves results on par with the current SOTA, whereas RBP has typically been applied in small-scale settings.
+
+\section{The Deep Equilibrium Sequence Model}
+\label{sec:deq}
+
+We broadly consider the class of \emph{weight-tied} deep sequence models (with passthrough connections from the input to each layer), which consist of the update
+
+We note that this model encapsulates classes such as the trellis network~\citep{bai2018trellis} and the universal transformer~\citep{dehghani2018universal} (which is typically not written with passthrough connections, but this is a trivial modification).  Such weight-tying is generally considered to come with four major benefits: 1) it acts as a form of regularization that stabilizes training and supports generalization; 2) it significantly reduces the model size; 3) it is trivial to show that \emph{any} deep network can be represented by a weight-tied deep network of equal depth and only a linear increase in width (see Appendix \ref{app:weight-tied}); and 4) the network can be unrolled to \emph{any} depth, typically with improved feature abstractions as depth increases~\cite{bai2018trellis,dehghani2018universal}.
+However, in practice almost all such models (and deep nets in general) are stacked, trained and evaluated \emph{by unrolling a pre-determined, fixed number of layers}. One reason is the limited memory on training hardware: the models need to store intermediate hidden units for backpropagation and thus cannot be trained beyond a certain depth that depends on the available memory.
+
+In principle, the network could have infinite depth. This is attained in the limit of unrolling a weight-tied model for an ever higher number of layers. What is the limit of this process? In practice, for certain classes of  (discussed later), we hypothesize and observe that such weight-tied models tend to converge to a \emph{fixed point} as depth increases towards infinity (see Appendix \ref{app:convergence-observation} for empirical evidence). In other words, as each layer refines the previous one by combining temporal features across the sequence, increasing depth towards infinity brings ``diminishing returns'': each additional layer has a smaller and smaller contribution until the network reaches an equilibrium:
+
+
+\subsection{The Deep Equilibrium Approach}
+\label{subsec:equm}
+
+We introduce the deep equilibrium model (DEQ) which, instead of iteratively stacking , directly solves for and differentiates through the equilibrium state.
+
+\subsubsection{Forward Pass}
+\label{subsubsec:forward}
+
+Unlike a conventional network where the output is the activations from the  layer, the output of a DEQ is the equilibrium point itself.  Therefore, the forward evaluation could be any procedure that solves for this equilibrium point.  Conventional deep sequence networks, if they converge to an equilibrium, can be considered a form of \emph{fixed-point iterations}:
+
+One can alternatively use other methods that provide faster convergence guarantees. For notational convenience, we define  and rewrite Eq. (\ref{eq:fixed-point}) as .
+The equilibrium state  is thus the root of , which we can find more easily with Newton's method or quasi-Newton methods (e.g., Broyden's method~\citep{broyden1965class}):
+
+where  is the Jacobian inverse (or its low-rank approximation) at , and  is the step size. But generally, one can exploit any black-box root-finding algorithm to solve for the equilibrium point in the forward pass, given an initial estimate  (which we set to ): 
+
+
+\subsubsection{Backward Pass}
+\label{subsubsec:backward}
+
+A major problem with using a black-box  is that we are no longer able to rely on explicit backpropagation through the exact operations in the forward pass. While one can certainly fix an algorithm (say Newton's method) to obtain the equilibrium, and then store and backpropagate through all the Newton iterations, we provide below an alternative procedure that is much simpler, requires constant memory, and assumes no knowledge of the black-box .
+
+\begin{theorem}
+\label{thm:backward}
+\textbf{(Gradient of the Equilibrium Model)} \ Let  be an equilibrium hidden sequence with length  and dimensionality , and  the ground-truth (target) sequence. Let  be any differentiable function and let  be a loss function (where  are applied in a vectorized manner) that computes
+
+Then the loss gradient w.r.t.  (for instance,  or ) is
+
+where  is the inverse Jacobian of  evaluated at .
+\end{theorem}
+
+The proof is provided in Appendix \ref{app:backward-proof}. The insight provided by Theorem \ref{thm:backward} is at the core of our method and its various benefits. Importantly, the backward gradient through the ``infinite'' stacking can be represented as one step of matrix multiplication that involves the Jacobian at equlibrium. For instance, an SGD update step on model parameters  would be
+
+Note that this result is independent of the root-finding algorithm we choose or the internal structure of the transformation , and thus does not require any storage of the intermediate hidden states, which is necessary for backpropagation in conventional deep networks.
+
+\subsubsection{Accelerating DEQ by Approximating the Inverse Jacobian}
+\label{subsubsec:accelerate}
+
+One challenge of enforcing the forward and backward passes described in Sections \ref{subsubsec:forward} and \ref{subsubsec:backward} is the cost of computing the exact inverse Jacobian  at every intermediate Newton iteration. We propose to address this using Broyden's method~\citep{broyden1965class}, a quasi-Newton approach that makes low-rank updates to approximate  via the Sherman-Morrison formula~\citep{sherman1950adjustment}:
+
+where  and . Initially, we set  and the Broyden iterations are stopped when either the norm of  falls below a tolerance  or when the maximum number of iterations is reached. This lets us avoid the cubic cost induced by the inverse operation.
+
+A similar idea can be used for the backward pass as well. Specifically, to compute  in Theorem \ref{thm:backward}, we can alternatively solve the linear system
+
+where the first term (a vector-Jacobian product) can be efficiently computed via autograd packages (e.g., PyTorch~\cite{Steiner2019}) for any , without explicitly writing out the Jacobian matrix. Such linear systems can generally be solved by any \emph{indirect} methods that leverage fast matrix-vector products; we thus propose to also rely on Broyden's method (other indirect methods would also suffice) to solve for Eq.~(\ref{eq:backward-objective}) and directly backpropagate through the equilibrium by Theorem \ref{thm:backward} in the backward pass.
+
+\subsection{Properties of Deep Equilibrium Models}
+\label{subsec:deq-discussion}
+
+Section \ref{subsec:equm} develops a sequence model that, while still based on the deep learning philosophy, is quite different from other approaches in the field, as its output is agnostic to the choice of the  algorithm in the forward pass. We now discuss some implications of the DEQ approach.
+
+\vspace{-2mm}
+
+\paragraph{Memory cost of DEQ.} An important benefit of DEQ is its extreme memory efficiency. As outlined in Section \ref{subsubsec:accelerate}, since we are able to use any root-finding algorithm for both the forward and backward passes (e.g., Broyden's method~\citep{broyden1965class}), a DEQ only needs to store  (the equilibrium sequence),  (input-related, layer-independent variables), and  for the backward pass. Note that as we only need the vector-Jacobian product (with dimension , where  is the minibatch size) in Eq.~(\ref{eq:backward-objective}), we never need to explicitly construct the Jacobian , which could be prohibitively large on long and high-dimensional sequences (with dimension ). Compared to other deep networks, DEQs therefore offer a constant-memory alternative that enables models that previously required multiple GPUs and other implementation-based techniques (e.g., half-precision or gradient checkpointing~\citep{chen2016training,child2019generating}) to fit easily into a single GPU.
+\vspace{-2mm}
+
+\paragraph{The choice of .} Our analysis in Sections \ref{subsubsec:forward}, \ref{subsubsec:backward}, and \ref{subsubsec:accelerate} is independent of the choice of , and the same kind of memory benefit is present regardless of the type of . However, to find the equilibrium in a reliable and efficient manner, generally  needs to be stable and constrained. The two instantiations we provide in Section \ref{sec:instantiations} are examples of stable transformations. (The gated activation in TrellisNet and layer normalization in the transformer constrain the output ranges.)
+\vspace{-2mm}
+
+\paragraph{Stacking the DEQ?} A natural question arises: if one DEQ is good, can we get additional benefits by ``stacking'' DEQs (with potentially \emph{different} classes of transformations)? The answer, somewhat surprisingly, is no, as evidenced by the following theorem, which is proved in Appendix \ref{app:sufficiency-proof}. The theorem essentially shows that stacking multiple DEQs does not create extra representational power over a single DEQ.
+
+\begin{theorem}
+\label{thm:stack-deq}
+\textbf{(Universality of ``single-layer'' DEQs.)} Let  be the input sequence, and  the sets of parameters for stable transformations  and , respectively. Then there exists , where , s.t.
+
+where  denotes the last  feature dimensions of .
+\end{theorem}
+
+\section{Instantiations of DEQ}
+\label{sec:instantiations}
+
+While the forward and backward analyses of DEQ do not depend on the internal structure of , in this section we briefly highlight two examples of  as specific instantiations of DEQ. Both models (TrellisNet~\citep{bai2018trellis} and self-attention~\citep{vaswani2017attention,dehghani2018universal}) achieve state-of-the-art results on various sequence modeling benchmarks. Importantly, through these two very different models and their properties, we illustrate the compatibility of the DEQ approach with all three major families of existing deep sequence networks: \emph{transformers}, \emph{RNNs}, and \emph{temporal convolutional networks (TCNs)}.
+\vspace{-2mm}
+
+\paragraph{Trellis networks.} We briefly introduce the trellis network (TrellisNet) here and refer interested readers to \cite{bai2018trellis} for a detailed description. Generally, TrellisNet is a TCN with two modifications. First, a linear transformation of the original input sequence  is added to the convolutional outputs at all layers. Second, the convolutional kernel weights are tied across the depth of the network (i.e., TrellisNet is a weight-tied TCN). Thus we can write TrellisNet with convolutional kernel size , dilation , and nonlinearity  in DEQ form as
+
+where  is typically: 1) the last  elements of the previous sequence's output (if using history padding~\citep{bai2018trellis}); or 2) simply zero-padding.  means concatenation along the temporal dimension. Following~\cite{bai2018trellis}, we use the LSTM gated activation for .
+\vspace{-2mm}
+
+\paragraph{Weight-tied transformers.} At a high level, multi-head self-attention transformers~\citep{vaswani2017attention} are very different from most deep networks. Instead of convolutions or recurrence, a self-attention layer maps the input into  (query),  (key), and  (value) and computes the attention score between time-steps  and  as . This attention score is then normalized via softmax and multiplied with the  sequence to produce the output. Since the transformer is order-invariant, prior work proposed to add positional embeddings (PE)~\citep{vaswani2017attention,dai2018transformer} to the self-attention operation. Following this design, \cite{dehghani2018universal} further proposed the \emph{universal transformer}, which ``recurrently stacks'' the transformer's self-attention and transition function block  through a number of layers. Referring readers to~\cite{vaswani2017attention,dai2018transformer,dehghani2018universal} for more details, we write a weight-tied transformer in the DEQ form as
+
+where  produces the  for the multi-head self-attention, and  stands for layer normalization~\citep{Ba2016layer}. Note that we add input injection  to  in addition to the positional embedding and initialize with . Following prior work~\citep{vaswani2017attention,devlin2018bert,dai2018transformer,dehghani2018universal}, we use a 2-layer positionwise feedforward residual block for . In our implementation, we use the memory-augmented transformer proposed by~\cite{dai2018transformer}, where we feed  (i.e., with history padding of length ) and relative positional embedding  to the self-attention operation.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.355\textwidth}
+    \includegraphics[width=\textwidth]{img/architecture/fp_onefig}
+    \caption{A simple illustration of solving for an equilibrium point in 2D.}
+    \label{fig:iterations}
+  \end{subfigure}
+  ~
+  \begin{subfigure}[b]{0.627\textwidth}
+    \includegraphics[width=\textwidth]{img/architecture/equm_vs_dnn}
+    \caption{A deep equilibrium model operates with significantly less memory than conventional deep nets due to an analytical backward pass.}
+    \label{fig:equm_vs_dnn}
+  \end{subfigure}
+  \caption{Comparison of the DEQ with conventional weight-tied deep networks.}
+  \label{fig:comparisons}
+  \vspace{-5mm}
+\end{figure}
+
+Figure \ref{fig:comparisons} provides a generic comparison between these conventional weight-tied deep networks and the DEQ approach, highlighting the constant memory requirements of the latter.
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate DEQ on both synthetic stress tests and realistic large-scale language modeling (where complex long-term temporal dependencies are involved). We use the two aforementioned instantiations of  in DEQ. On both WikiText-103~\cite{merity2016pointer} (which contains 100M words and a vocabulary size of 260K) and the smaller Penn Treebank corpus (where stronger regularizations are needed for conventional deep nets) for word-level language modeling, we show that DEQ achieves competitive (or better) performance even when compared to SOTA methods (of the same model size, both weight-tied and not) while using significantly less memory. We provide a more detailed introduction of the tasks and datasets in Appendix \ref{app:task-descriptions}.
+
+\vspace{-2mm}
+\paragraph{Setting.} Both instantiations of DEQ use Broyden's method~\cite{broyden1965class} to avoid direct computation of the inverse Jacobian, as described in Section \ref{subsubsec:accelerate}. We note that the use of DEQ implicitly introduces a new ``hyperparameter'' -- the stopping criterion for Broyden iterations. During training, we set this tolerance  of forward and backward passes to  and , respectively. At inference, we relax the tolerance to  (or we can use a smaller maximum iteration limit for Broyden's method; see discussions later). For the DEQ-TrellisNet instantiation, we roughly follow the settings of \cite{bai2018trellis}. For DEQ-Transformers, we employ the relative positional embedding~\cite{dai2018transformer}, with sequences of length 150 at both training and inference on the WikiText-103 dataset. Implementations and pretrained models can be found at \url{https://github.com/locuslab/deq}.
+
+\subsection{Copy Memory Task}
+
+\begin{table*}[t]
+\caption{DEQ achieves strong performance on the long-range copy-memory task.}
+\vspace{-1mm}
+\label{table:copy-memory}
+\centering
+\def\arraystretch{1.1}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{ccccc}
+\toprule
+ & \multicolumn{4}{c}{Models (Size)} \\
+\cline{2-5}
+ & \textbf{DEQ-Transformer (ours)} (14K) & TCN~\citep{bai2018empirical} (16K) & LSTM~\citep{hochreiterLSTM} (14K) & GRU~\citep{choGRU} (14K) \\
+\midrule
+Copy Memory =400 Loss & \textbf{3.5e-6} & \textbf{2.7e-5} & 0.0501 & 0.0491 \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+The goal of the \emph{copy memory task} is simple: to explicitly test a sequence model's ability to exactly memorize elements across a long period of time (see Appendix \ref{app:task-descriptions}). As shown in Table \ref{table:copy-memory}, DEQ demonstrates good memory retention over relatively long sequences (), with substantially better results than recurrent architectures such as LSTM/GRU (consistent with the findings in~\cite{bai2018empirical}).
+
+\subsection{Large-Scale Language Modeling}
+
+One issue encountered in prior works that take a continuous view of deep networks~\citep{chen2018neural, haber2017stable} is the challenge of scaling these approaches to real, high-dimensional, large-scale datasets. In this subsection, we evaluate the DEQ approach on some large-scale language datasets and investigate its effectiveness as a practical ``implicit-depth'' sequence model.
+
+
+\begin{table*}[t]
+\caption{DEQ achieves competitive performance on word-level Penn Treebank language modeling (on par with SOTA results, without fine-tuning steps~\citep{merityRegOpt}). The memory footprints are benchmarked (for fairness) on input sequence length 150 and batch size 15, which does not reflect the actual hyperparameters used; the values also do \emph{not} include the memory for word embeddings.}
+\vspace{-1mm}
+\label{table:word-ptb}
+\centering
+\def\arraystretch{1.06}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{ccccc}
+\toprule
+\multicolumn{5}{c}{Word-level Language Modeling w/ Penn Treebank (PTB)} \\
+\cline{1-5}
+\multirow{2}{*}{Model} & \multirow{2}{*}{\# Params} & Non-embedding & \multirow{2}{*}{Test perplexity} & \multirow{2}{*}{Memory} \\
+& & model size & & \\
+\midrule
+Variational LSTM~\citep{gal2016dropout}     & 66M & - & 73.4 &  - \\
+NAS Cell~\citep{zoph2017neural}             & 54M & - & 62.4 &  - \\
+NAS (w/ black-box hyperparameter tuner)~\citep{Melis2018}     & 24M & 20M & 59.7 &  - \\
+AWD-LSTM~\citep{merityRegOpt}               & 24M & 20M & 58.8 & - \\
+DARTS architecture search (second order)~\citep{liu2018darts}  & 23M & 20M & \textbf{55.7} & - \\
+\midrule
+60-layer TrellisNet (w/ auxiliary loss, w/o MoS)~\citep{bai2018trellis} & 24M & 20M & 57.0 & 8.5GB \\
+\textbf{DEQ-TrellisNet (ours)}               & 24M & 20M & 57.1 &  \textbf{1.2GB}\\
+\bottomrule
+\end{tabular}}
+\vspace{-4mm}
+\end{table*}
+
+\vspace{-2mm}
+\paragraph{Performance on Penn Treebank.} Following the set of hyperparameters used by~\cite{bai2018trellis} for TrellisNet, we evaluate the DEQ-TrellisNet instantiation on word-level language modeling with the PTB corpus. Note that without an explicit notion of ``layer'', we do not add auxiliary losses, as was done in~\cite{bai2018trellis}. As shown in Table \ref{table:word-ptb}, when trained from scratch, the DEQ-TrellisNet achieves a test perplexity on par with the original deeply supervised TrellisNet.
+
+\begin{table*}[t]
+\caption{DEQ-based models are competitive with SOTA deep networks of the same model size on the WikiText-103 corpus, with significantly less memory. See Table \ref{table:word-ptb} for more details on the memory benchmarking. Transformer-XL models are not weight-tied, unless specified otherwise.}
+\vspace{-1mm}
+\label{table:word-wt103}
+\centering
+\def\arraystretch{1.07}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{ccccc}
+\toprule
+\multicolumn{5}{c}{Word-level Language Modeling w/ WikiText-103 (WT103)} \\
+\cline{1-5}
+\multirow{2}{*}{Model} & \multirow{2}{*}{\# Params} & Non-Embedding & \multirow{2}{*}{Test perplexity} & \multirow{2}{*}{Memory} \\
+& & Model Size & & \\
+\midrule
+Generic TCN~\citep{bai2018empirical}          & 150M & 34M & 45.2 & - \\
+Gated Linear ConvNet~\citep{dauphinGatedConv} & 230M & - & 37.2 & - \\
+AWD-QRNN~\citep{merity2018analysis}           & 159M & 51M & 33.0 & 7.1GB \\
+Relational Memory Core~\citep{santoro2018relational} & 195M & 60M & 31.6 & - \\
+Transformer-XL (X-large, adaptive embed., on TPU)~\citep{dai2018transformer}           & 257M & 224M & \textbf{18.7} & 12.0GB \\
+\midrule
+70-layer TrellisNet (+ auxiliary loss, etc.)~\citep{bai2018trellis}   & 180M & 45M & 29.2 & 24.7GB \\
+70-layer TrellisNet with \emph{gradient checkpointing}     & 180M & 45M & 29.2 & 5.2GB \\
+\textbf{DEQ-TrellisNet (ours)}                & 180M & 45M & \textbf{29.0} & \textbf{3.3GB} \\
+\midrule
+Transformer-XL (medium, 16 layers)   & 165M & 44M  & 24.3 & 8.5GB \\
+\textbf{DEQ-Transformer (medium, ours)}.             & 172M & 43M & 24.2 & \textbf{2.7GB} \\
+Transformer-XL (medium, 18 layers, adaptive embed.)        & 110M & 72M  & 23.6 & 9.0GB \\
+\textbf{DEQ-Transformer (medium, adaptive embed., ours)}   & 110M & 70M & \textbf{23.2} & 3.7GB \\
+\midrule
+Transformer-XL (small, 4 layers)                & 139M & 4.9M & 35.8 & 4.8GB \\
+Transformer-XL (small, weight-tied 16 layers)           & 138M & 4.5M & 34.9 & 6.8GB \\
+\textbf{DEQ-Transformer (small, ours)}.    & 138M & 4.5M & \textbf{32.4} & \textbf{1.1GB} \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\vspace{-2mm}
+\paragraph{Performance on WikiText-103.} On the much larger scale WT103 corpus (about 100x larger than PTB), the DEQ-TrellisNet achieves better test perplexity than the original deep TrellisNet. For the Transformer instantiation, we follow the design of the Transformer-XL model~\citep{dai2018transformer}. We specifically compare to a ``medium'' Transformer-XL model (the largest released model that can fit on GPUs) and a ``small'' Transformer-XL model, while noting that the largest Transformer-XL network has massive memory requirements (due in part to very wide hidden features, batch sizes, and training-time sequence lengths, which would not be decreased by a DEQ) and can only be trained on TPUs~\citep{dai2018transformer}. In Table \ref{table:word-wt103}, we show that the DEQs yield competitive performance, outperforming prior SOTA approaches such as~\citep{dai2018transformer} on similar model sizes while consuming much less memory during training.
+
+\vspace{-2mm}
+\paragraph{Memory footprint of DEQ.} For conventional deep networks with  layers, the training memory complexity is  since all intermediate activations are stored for backpropagation. In comparison, DEQs have an  (i.e., constant) memory footprint due to the root-finding formulation. We benchmark the reduced memory consumption in the last column of Tables \ref{table:word-ptb} and \ref{table:word-wt103}, with controlled sequence lengths and batch sizes for fairness. On both instantiations, the DEQ approach leads to an over 80\% (up to 88\%) reduction in memory consumption by the model (excluding word embeddings, which are orthogonal to the comparison here). Moreover, we empirically verify (using a 70-layer TrellisNet) that DEQ consumes even less memory than gradient checkpointing~\citep{chen2016training}, a popular technique that reduces the memory required to train a layer-based model to . Note that the DEQ's memory footprint remains competitive even when compared with baselines that are not weight-tied (a reduction of over 60\%), with similar or better accuracy.
+
+
+\begin{figure}[t]
+  \vspace{-2mm}
+  \centering
+  \begin{subfigure}[b]{0.44\textwidth}
+    \includegraphics[width=\textwidth]{img/result/iter_vs_epoch}
+    \vspace{-5mm}
+  \end{subfigure}
+  ~
+  \begin{subfigure}[b]{0.457\textwidth}
+    \includegraphics[width=\textwidth]{img/result/normdiff_vs_iter}
+    \vspace{-5mm}
+  \end{subfigure}
+  \vspace{-1mm}
+  \caption{Left: number of Broyden iterations in forward and backward passes gradually grows with epochs. Right: DEQ-Transformer finds the equilibrium in a stable and efficient manner (whereas the deep transformer could oscillate around the fixed point, even when one exists).}
+  \label{fig:emp-analysis}
+  \vspace{-6mm}
+\end{figure}
+
+\vspace{-2mm}
+\paragraph{Initialization of DEQ.} To train DEQ models, it is critical to ensure that the model is stable, such that the equilibrium state can be reliably approximated via quasi-Newton methods. While we found that the most commonly used initialization schemes with small values (around 0) suffice, it is generally important to make sure that DEQ starts with a small operator norm in the weight matrices. For both DEQ-TrellisNet and DEQ-Transformer, we observe that they are not sensitive to any specific initialization scheme since non-linearities such as / and LayerNorm also help make  contractive (and stable). We initialize the parameters of  by sampling from .
+
+\vspace{-2mm}
+\paragraph{Convergence to equilibrium.} The deep equilibrium model does not have ``layers''. One factor that affects computation time in DEQs is the number of Broyden iterations in forward/backward passes, where each forward Broyden step evaluates  once, and a backward step computes a vector-Jacobian product. We find that in general the number of Broyden iterations gradually increases with training epochs (Figure \ref{fig:emp-analysis}, left, where the -axis is computed by ), an observation similar to the one reported for training Neural ODEs~\citep{chen2018neural}. One factor contributing to this phenomenon could be that the training pushes the operator norm of  to larger values, making the fixed point harder to solve. Meanwhile, the backward pass requires much fewer iterations than the forward, primarily due to the simplicity of the linear system in Eq. (\ref{eq:backward-objective}). We also find that DEQs can almost always converge to the sequence-level fixed point, much more efficiently than original weight-tied transformers (Figure \ref{fig:emp-analysis}, right). Note that after 12 epochs, deeply stacked self-attention tends to oscillate around the fixed point, while DEQs exhibit stable convergence with the quasi-Newton method.
+
+\vspace{-2mm}
+\paragraph{Broyden iterations and the runtime of DEQ.} Unlike conventional deep networks that come with a fixed number  of layers, the runtime of DEQ depends strongly on the number of Broyden steps to reach the equilibrium. Therefore, it's challenging to fairly compare the runtimes of implicit-depth models like DEQ with those of corresponding weight-tied deep networks (e.g., using higher depth necessarily takes longer to run). Ideally, the values of  should be as small as possible so as to ensure that the analytical gradients from Theorem~\ref{thm:backward} are accurate. However, we empirically observe that using a higher  or a lower iteration limit allows the DEQ to be trained and evaluated much faster with only a small degradation in performance. For instance, generally we find  or an iteration limit of 30 (on sequence length 75) to be sufficient for competitive performance. Figure~\ref{fig:ppl-tradeoff} visualizes this tradeoff on a medium DEQ-Transformer (without adaptive embedding). Note that accuracy quickly diverges when tolerance  is too large (Figure \ref{fig:ppl-tradeoff}, left), suggesting that a poor estimate of the equilibrium can hurt DEQ performances. Table~\ref{tab:runtime} provides approximate runtimes for competitive-accuracy DEQs on WikiText-103. DEQs are typically slower than layer-based deep networks.
+
+Additional empirical remarks as well as training tips are provided in Appendix~\ref{app:empirical-remarks}.
+
+
+\begin{table*}[t]
+\caption{Runtime ratios between DEQs and corresponding deep networks at training and inference ( implies DEQ is slower). The ratios are benchmarked on WikiText-103.}
+\label{tab:runtime}
+\vspace{-1mm}
+\centering
+\def\arraystretch{1.06}
+\begin{tabular}{ccccc}
+\toprule
+\multicolumn{2}{c}{DEQ / 18-layer Transformer} & & \multicolumn{2}{c}{DEQ / 70-layer TrellisNet} \\
+\cline{1-2} \cline{4-5}
+Training & Inference & & Training & Inference \\
+\midrule
+2.82 & 1.76 & & 2.40 & 1.64 \\
+\bottomrule
+\end{tabular}
+\vspace{-1mm}
+\end{table*}
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.455\textwidth}
+    \includegraphics[width=\textwidth]{img/result/ppl_vs_eps_sq}
+  \end{subfigure}
+  ~
+  \begin{subfigure}[b]{0.45\textwidth}
+    \includegraphics[width=\textwidth]{img/result/ppl_vs_limit_sq}
+  \end{subfigure}
+  \vspace{-2mm}
+  \caption{DEQ can be accelerated by leveraging higher tolerance  (left) or a lower Broyden iteration limit (right). In general, poor estimates of the equilibrium can hurt DEQ performances.}
+  \label{fig:ppl-tradeoff}
+  \vspace{-5mm}
+\end{figure}
+
+
+\section{Conclusion}
+
+Deep networks have predominantly taken the form of stacks of layers. We propose the deep equilibrium approach (DEQ), which models temporal data by directly solving for the sequence-level fixed point and optimizing this equilibrium for better representations. DEQ needs only  memory at training time, is agnostic to the choice of the root solver in the forward pass, and is sufficiently versatile to subsume drastically different architectural choices. Our experiments have shown that DEQs have good temporal memory retention, are able to scale to realistic, large-scale sequence tasks, and perform competitively with, or slightly outperform, SOTA methods. Overall, we believe that the DEQ approach provides an interesting and practical new perspective on designing and optimizing sequence models.
+
+{\small
+\bibliographystyle{plain}
+\bibliography{deq}
+}
+
+\appendix
+
+\newpage
+
+\section{Backward Pass of the Deep Equilibrium Model}
+\label{app:backward-proof}
+
+One of the core benefits of the DEQ approach comes from its analytical backward gradient at equilibrium. In this section, we provide a proof to Theorem \ref{thm:backward} (which we restate here).
+
+\begin{apptheorem}
+\textbf{(Gradient of the Equilibrium Model)} \ Let  be an equilibrium hidden sequence with length  and dimensionality , and  the ground-truth (target) sequence. Let  be any differentiable function and  be a loss function (where  are applied in vectorized manner) that computes
+
+Then the loss gradient w.r.t.  (for instance,  or ) is
+
+where  is the inverse Jacobian of  evaluated at .
+\end{apptheorem}
+
+\begin{proofidx}{\ref{thm:backward}}
+We first write out the equilibrium sequence condition: . By implicitly differentiating two sides of this condition with respect to :
+
+
+Since , we have
+
+which implies
+
+\end{proofidx}
+
+\section{Sufficiency of a Single DEQ ``Layer''}
+\label{app:sufficiency-proof}
+
+A hypothetical extension to the DEQ idea follows from the ``deep'' philosophy: if one DEQ works so well, why don't we stack multiple DEQ modules with different parameters  ()? We (re-)state and prove the following theorem, which demonstrates the universality of the DEQ model (i.e., sufficiency of exactly one DEQ ``layer'').
+
+\begin{apptheorem}
+\textbf{(Universality of ``Single-layer'' DEQs)} Let  be the input sequence, and  the sets of parameters for stable transformations  and , respectively. Then there exists , where  s.t.
+
+where  denotes the last  feature dimensions of .
+\end{apptheorem}
+
+\begin{proofidx}{\ref{thm:stack-deq}}
+Assume  is the equilibrium of the first DEQ module under transformation . Define , and  by:
+
+Then  is a fixed point of , which completes the proof.
+\end{proofidx}
+
+\section{Universality of Weight-tied, Input-injected Networks}
+\label{app:weight-tied}
+
+Although the DEQ model corresponds to an infinite-depth network, as mentioned above it applies only to the specific case of \emph{weight-tied}, input-injected infinite-depth models.  This seems at first glance a substantial restriction over traditional deep networks, which have no requirement that the weights at each layer be identical.  However, as we show below, this is not an actual restriction on the representational capacity from a mathematical point of view. Specifically, any deep network can be represented as a deep weight-tied network with no increase in depth and only a linear increase in the size of the hidden layer.  This argument is equivalent to that presented in the TrellisNet work \cite[Theorem 1]{bai2018trellis}, but we include it here in a slightly simpler and more general form.  We emphasize that in practice we do \emph{not} use the sparse structure below to construct the weight-tied layers for DEQ, but instead just use dense matrices  and .  However, the theorem below is important in establishing that there is no notable representational loss.
+
+\begin{apptheorem}
+\label{thm:weight-tied}
+\textbf{(Universality of Weight-tied Deep Networks)}  Consider a traditional -layer deep network defined by the relation
+
+where  denotes the hidden features at depth , ,  are parameters of the network,  is the non-linearity at depth , and  is the original input.  Then the same network can be represented by a weight-tied, input-injected network of equivalent depth
+
+where , ,  and  are constant over all layers.
+\end{apptheorem}
+
+\begin{proofidx}{\ref{thm:weight-tied}}
+The proof is constructive: we build the weight-tied network equivalent to the original network by contructing the relevant matrices using a simple ``shift'' operation.  In particular, we define the network parameters as
+
+It is clear from inspection that after  applications of the layer, i.e.,
+
+using these parameters the hidden vector  will take on the value
+
+Thus the weight-tied network computes all the same terms as the original network, using the same depth as the original network, and with a hidden unit size that is just the sum of the individual hidden unit sizes in the original network.  This establises the claim of the theorem.
+\end{proofidx}
+
+
+\section{Empirical Convergence of Weight-tied Deep Nets}
+\label{app:convergence-observation}
+
+\begin{figure}[h]
+  \centering
+  \begin{subfigure}[b]{0.42\textwidth}
+    \includegraphics[width=\textwidth]{img/result/normdiff_vs_layer_trellisnet}
+  \end{subfigure}
+  ~
+  \begin{subfigure}[b]{0.42\textwidth}
+    \includegraphics[width=\textwidth]{img/result/normdiff_vs_layer_transformer}
+  \end{subfigure}
+  \caption{The convergence of intermediate activations in TrellisNet (with kernel size 2) and weight-tied transformers on different sequence lengths.}
+  \label{fig:app-convergence}
+\end{figure}
+
+As mentioned in Section \ref{sec:deq}, one motivation for optimizing the sequence-level equilibrium comes from our empirical observations that, starting at some point of the deep stacking, weight-tied deep networks \emph{begin} to converge to a fixed point. We show in Figure \ref{fig:app-convergence} the convergence of trained layer-based TrellisNet (weight-tied temporal convolutions) and universal transformer (weight-tied self-attention) on randomly selected test samples of different lengths 100, 200, 400 and 800. In both cases, we see a tendency of the activations to converge. Notably, for transformers, we find stacked iterations usually lead to a oscillatory behavior on the plots (Figure \ref{fig:app-convergence}), with values fluctuating around the actual fixed point (which we empirically verify can be found much more easily with Newton or quasi-Newton methods).
+
+In practice, due to limited computation, we usually set the number of layers to a predetermined number (e.g., 60 layers) and rarely reach the inference depths analyzed in Figure \ref{fig:app-convergence}. Moreover, in the specific case of transformers, \cite{al2018character} stablizes the training of deep transformers (64-layer) on character-level language modeling with the help of various strong auxiliary losses at intermediate layers. In a certain sense, the addition of auxiliary losses have a similar effect as solving for equilibrium: we want intermediate-level hidden units to be both close to the target and as stable as possible (without drastic interlayer differences).
+
+
+\section{More Remarks on DEQ}
+\label{app:empirical-remarks}
+
+\paragraph{Applicability of other deep techniques.} While the DEQ approach does not preclude specific architectural choices of  (which means techniques such as layer normalization~\cite{Ba2016layer} or weight normalization~\citep{Salimans2016} can work as is), it is not clear how certain regularizations such as auxiliary losses~\citep{trinh2018learning,bai2018trellis} could be applied on DEQ, since there are no more ``layers''. For dropout~\citep{srivastava2014dropout}, we follow the practice of~\cite{bai2018trellis}, which adapts the RNN variational dropout~\citep{gal2016dropout} scheme to feedforward networks by applying the same mask at all levels. We empirically find that adding dropout makes the quasi-Newton methods slower to converge (i.e., inference-time equilibria are easier to find without the presence of noisy zeros). Since the weights of  (and thus its operator norm) are directly related to the stability of root-finding, we observe that weight normalization~\citep{Salimans2016} typically finds more stable parameters and slows down the growth of forward/backward Broyden's iterations (as described in Figure \ref{fig:emp-analysis}).
+
+\vspace{-2mm}
+\paragraph{Imbalances within minibatches.} Not all sequences in a minibatch converge to the equilibrium with the same number of iterations. However, with standard batched CUDA operations, the sequences that converge faster essentially need to ``wait'' for the slower ones. Though we empirically find such imbalance to be relatively small in scale, it could mean an inefficient GPU utilization at times.
+
+\vspace{-2mm}
+\paragraph{Warmup of DEQ models with shallow nets.} Instead of training the DEQ from scratch, empirically we find that one can accelerate the DEQ training by pretraining a shallow weight-tied stack of  (e.g., 2 layers), and using the resulting parameters to initialize the DEQ. In general, a shallow model plateaus at much lower accuracy than corresponding DEQs or deeper weight-tied networks. However, given the very small number of layers, a shallow model offers a memory- and computation-efficient starting point for DEQ training.
+
+\vspace{-2mm}
+\paragraph{Training DEQs with subsequences.} On extremely long sequences (e.g., ), the forward-pass fixed points can be challenging to solve accurately (especially at the start of the training) even with the help of the root-finding methods. Therefore, in practice, we suggest breaking these long sequences into a few subsequences when needed (recall that the forward pass can be \emph{any} black-box root-finder). Moreover, with the help of Theorem \ref{thm:backward}, such subsequence technique can be used in the backward pass as well (where we solve for Eq. (\ref{eq:backward-objective})). For instance, on a sequence :
+
+where terms (A) and (B) require one evaluation of  and term (C) requires one evaluation of . Hence, the memory cost is equivalent to that of applying  once on the entire  (but with the subsequences' equilibrium likely easier to optimize).
+
+
+\section{Task Descriptions}
+\label{app:task-descriptions}
+
+We briefly introduce the three sequence prediction tasks/datasets that we employ to evaluate the DEQ approach in Section \ref{sec:experiments}.
+
+\vspace{-2mm}
+\paragraph{Copy memory task.} The copy memory task is a small but challenging synthetic stress test that has been frequently used in prior work to test a sequence model's memory retention ability~\citep{Zhang2016NIPS,arjovsky2016unitary,bai2018empirical}. In this task, each sequence  is 1-dimensional and has length , with  randomly selected from integers  (with repetition). The rest of the input elements are all filled with zeros, except for the . The goal of this task is to produce  such that  and . In other words, a sequence model trained on this task is expected to ``recall'' the first 10 elements of the sequence once it sees the delimiter , and copy them to the end of the sequence. We generate 20K training samples and 2K testing samples. In prior works, \cite{bai2018empirical} have shown that RNNs generally struggle with the task, especially when , whereas feedforward models tend to have better memory.
+
+\paragraph{Penn Treebank.} The Penn Treebank (PTB) corpus~\citep{Marcus93buildinga} is a commonly used dataset for character- and word-level language modeling. When used for word-level language modeling, PTB contains about 888K words at training, with a vocabulary size of 10,000. As this is a comparatively small language corpus (with punctuations and capitalization removed), prior work has shown that well-designed regularizations are required for best results~\citep{merityRegOpt,yang2018breaking}.
+
+\paragraph{WikiText-103.} The training corpus of WikiText-103 (WT103)~\citep{merity2016pointer} is about 110 times larger than PTB, with a vocabulary size over 260K. In general, this dataset is considered much more realistic than many others because it contains many rare words and retains punctuation, numbers, and capitalization from the original Wikipedia articles. WT103 is thus used to evaluate how well a sequence model scales to long sequences from a large vocabulary. This dataset has been frequently used in recent work with high-capacity sequence models~\citep{bradbury2016quasi,bai2018trellis,dai2018transformer,baevski2019adaptive}.
+
+\end{document}
