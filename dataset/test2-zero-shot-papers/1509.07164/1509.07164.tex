@@ -1,0 +1,3031 @@
+\documentclass[12pt]{article}
+\usepackage{stan-papers}
+
+\title{The Stan Math Library: \\ Reverse-Mode Automatic
+  Differentiation \\ in C++}
+
+\author{Bob Carpenter \\ {\small Columbia University}
+        \and Matthew D.\ Hoffman \\ {\small Adobe Research}
+        \and Marcus Brubaker 
+        \\ {\small \begin{tabular}{c}University of Toronto, \\ Scarborough\end{tabular}}
+        \and Daniel Lee \\ {\small Columbia University}
+        \and Peter Li \\ {\small Columbia University}
+        \and Michael Betancourt \\ {\small University of Warwick}
+}
+\date{\vspace*{8pt}\normalsize \today}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract} 
+  \noindent
+  As computational challenges in optimization and statistical
+  inference grow ever harder, algorithms that utilize derivatives are
+  becoming increasingly more important.  The implementation of the
+  derivatives that make these algorithms so powerful, however, is a
+  substantial user burden and the practicality of these algorithms
+  depends critically on tools like automatic differentiation that
+  remove the implementation burden entirely.  The Stan Math Library is
+  a C++, reverse-mode automatic differentiation library designed to be
+  usable, extensive and extensible, efficient, scalable, stable,
+  portable, and redistributable in order to facilitate the
+  construction and utilization of such algorithms.
+
+  Usability is achieved through a simple direct interface and a
+  cleanly abstracted functional interface.  The extensive built-in
+  library includes functions for matrix operations, linear algebra,
+  differential equation solving, and most common probability
+  functions.  Extensibility derives from a straightforward
+  object-oriented framework for expressions, allowing users to easily
+  create custom functions. Efficiency is achieved through a
+  combination of custom memory management, subexpression caching,
+  traits-based metaprogramming, and expression templates.  Partial
+  derivatives for compound functions are evaluated lazily for improved
+  scalability.  Stability is achieved by taking care with arithmetic
+  precision in algebraic expressions and providing stable, compound
+  functions where possible. For portability, the library is
+  standards-compliant C++ (03) and has been tested for all major
+  compilers for Windows, Mac OS X, and Linux.  It is distributed under
+  the new BSD license.
+
+  This paper provides an overview of the Stan Math Library's
+  application programming interface (API), examples of its use, and a
+  thorough explanation of how it is implemented.  It also demonstrates
+  the efficiency and scalability of the Stan Math Library by comparing
+  its speed and memory usage of gradient calculations to that of
+  several popular open-source C++ automatic differentiation systems
+  (Adept, Adol-C, CppAD, and Sacado), with results varying
+  dramatically according to the type of expression being
+  differentiated.
+\end{abstract}
+
+
+
+
+
+\section{Reverse-Mode Automatic Differentiation}
+
+Many contemporary algorithms require the evaluation of a derivative
+of a given differentiable function, , at a given input value, 
+, for example a gradient,
+
+or a directional derivative,\footnote{A special case of a directional derivative computes derivatives with
+respect to a single variable by setting  to a vector with a
+value of 1 for the single distinguished variable and 0 for all other
+variables.}
+
+Automatic differentiation computes these values automatically,
+using only a representation of  as a computer program.  For example, 
+automatic differentiation can take a simple C++ expression such as 
+\code{x~*~y~/~2} with inputs  and  and 
+produce both the output value, 12, and the gradient, .
+
+Automatic differentiation is implemented in practice by transforming
+the subexpressions in the given computer program into nodes of an
+\textit{expression graph} (see \reffigure{expression-graph}, below,
+for an example), and then propagating chain rule evaluations along
+these nodes \citep{GriewankWalther:2008,Giles:2008}. In
+\textit{forward-mode automatic differentiation}, each node  in the
+graph contains both a value  and a \textit{tangent}, , which
+represents the directional derivative of  with respect to the
+input variables.  The tangent values for the input values are
+initialized with values , because that represents the
+appropriate directional derivative of each input variable.  The
+complete set of tangent values is calculated by propagating tangents
+forward from the inputs to the outputs with the rule
+
+In one pass over the expression graph, forward-mode computes a
+directional derivative of any number of output (dependent) variables
+with respect to a vector of input (independent) variables and
+direction ; the special case of a derivative with respect to
+a single independent variable computes a column of the Jacobian of a
+multivariate function.  The proof follows a simple inductive argument
+starting from the inputs and working forward to the output(s).
+
+In \textit{reverse-mode automatic differentiation}, each node  in
+the expression graph contains a value  and an \textit{adjoint}
+, representing the derivative of a single output node with
+respect to .  The distinguished output node's adjoint is
+initialized to 1, because its derivative with respect to itself is 1.
+The full set of adjoint values is calculated by propagating backwards
+from the outputs to the inputs via
+
+This enables the derivative of a single output variable to be done
+with respect to multiple input variables in a single pass over the
+expression graph.  A proof of correctness follows by induction
+starting from the base case of the single output variable and working
+back to the input variables. This computes a gradient with respect to
+a single output function or one row of the Jacobian of a multi-output
+function.
+
+Both forward- and reverse-mode require partial derivatives of each
+node  in the expression graph with respect to its daughters .
+
+Because gradients are more prevalent in contemporary algorithms,
+reverse-mode automatic differentiation tends to be the most efficient
+approach in practice.  In this section we take a more detailed look
+at reverse-mode automatic differentiation and compare it to other
+differential algorithms.
+
+\subsection{Mechanics of Reverse-Mode Automatic Differentiation}
+
+As an example, consider the log of the normal probability density function
+for a variable  with a normal distribution with mean  and
+standard deviation ,
+\renewcommand{\theequation}{\arabic{equation}}
+
+and its gradient,
+6pt]
+\frac{ \partial f }{ \partial \mu} (y, \mu, \sigma)
+&= (y - \mu) \sigma^{-2} \label{gradient-normal-log-density.equation}
+\
+
+
+\newcommand{\gmnode}[3]{\put(#1,#2){\circle{20}}\put(#1,#2){\makebox(0,0){}}}
+\newcommand{\gmnodeobs}[3]{\put(#1,#2){\color{yellow}\circle*{20}}\put(#1,#2){\color{black}\circle{20}}\put(#1,#2){\makebox(0,0){}}}
+\newcommand{\gmnoderoot}[3]{\put(#1,#2){\color{red}\circle*{20}}\put(#1,#2){\color{black}\circle{20}}\put(#1,#2){\makebox(0,0){}}}
+\newcommand{\gmdata}[3]{\put(#1,#2){\makebox(16,16){\footnotesize }}}
+\begin{figure}
+\begin{center}
+\begin{picture}(200,200)
+\gmnoderoot{130}{200}{-}
+\put(142,200){\mbox{\color{blue}{\footnotesize }}}
+\gmnode{100}{170}{-}
+\put(112,170){\mbox{\color{blue}{\footnotesize }}}
+\gmdata{150}{160}{\mbox{\color{gray}{}}}
+\gmnode{70}{140}{*}
+\put(82,140){\mbox{\color{blue}{\footnotesize }}}
+\gmdata{30}{100}{\mbox{\color{gray}{}}}
+\gmnode{100}{110}{\mbox{\footnotesize pow}}
+\put(112,110){\mbox{\color{blue}{\footnotesize }}}
+\gmdata{120}{70}{\mbox{\color{gray}{}}}
+\gmnode{190}{80}{\mbox{\footnotesize }}
+\put(202,80){\mbox{\color{blue}{\footnotesize }}}
+\gmnode{70}{80}{/}
+\put(82,80){\mbox{\color{blue}{\footnotesize }}}
+\gmnode{40}{50}{-}
+\put(52,50){\mbox{\color{blue}{\footnotesize }}}
+\gmnodeobs{10}{20}{\mbox{\footnotesize }}
+\put(22,20){\mbox{\color{blue}{\footnotesize }}}
+\gmnodeobs{70}{20}{\mbox{\footnotesize }}
+\put(82,20){\mbox{\color{blue}{\footnotesize }}}
+\gmnodeobs{130}{20}{\mbox{\footnotesize }}
+\put(142,20){\mbox{\color{blue}{\footnotesize }}}
+\put(123,193){\vector(-1,-1){16}}
+\put(137,193){\color{gray}{\vector(1,-1){16}}}
+\put(93,163){\vector(-1,-1){16}}
+\put(107,163){\vector(1,-1){76}}
+\put(63,133){\color{gray}{\vector(-1,-1){16}}}
+\put(77,133){\vector(1,-1){16}}
+\put(93,103){{\vector(-1,-1){16}}}
+\put(107,103){\color{gray}{\vector(1,-1){16}}}
+\put(63,73){\vector(-1,-1){16}}
+\put(77,73){\vector(1,-1){46}}
+\put(183,73){\vector(-1,-1){46}}
+\put(33,43){\vector(-1,-1){16}}
+\put(47,43){\vector(1,-1){16}}
+\end{picture}
+\end{center}
+\mycaption{expression-graph}{Expression graph for the normal log
+  density function given in \refeq{normal-log-density}.  Each circle
+  corresponds to an automatic differentiation variable, with the
+  variable name given to the right in blue.  The independent variables
+  are highlighted in yellow on the bottom row, with the dependent
+  variable highlighted in red on the top of the graph.  The function
+  producing each node is displayed inside the circle, with operands
+  denoted by arrows.  Constants are shown in gray with gray arrows
+  leading to them because derivatives need not be propagated to
+  constant operands.}
+\end{figure}
+The mathematical formula for the normal log density corresponds to the
+expression graph in \reffigure{expression-graph}.  Each subexpression
+corresponds to a node in the graph, and each edge connects the node
+representing a function evaluation to its operands.  Becuase 
+is used twice in the formula, it has two parents in the graph.
+\begin{figure}
+\begin{center}
+\begin{tabular}{c||c|cc}
+{\it var} & {\it value} & \multicolumn{2}{|c}{\it partials}
+\\ \hline \hline
+ &  
+\2pt]
+ & 
+\4pt]
+ &  & 
+                    & 
+\4pt]
+ &  & \multicolumn{2}{c}{}
+\4pt]
+ &  & 
+                    & 
+\
+\begin{array}{rcl|l}
+{\it var} & {\it operation} & {\it adjoint} & {\it result}
+\\ \hline \hline
+a_{1:9} & = & 0 & a_{1:9} = 0
+\\
+a_{10} & = & 1 & a_{10} = 1
+\\ \hline
+a_{9} & {+}{=} & a_{10} \times (1) & a_9 = 1
+\\
+a_{7} & {+}{=} & a_9 \times (1) & a_7 = 1
+\\
+a_{8} & {+}{=} & a_9 \times (-1) & a_8 = -1
+\\
+a_{3} & {+}{=} & a_8 \times (1 / v_3) & a_3 = -1 / v_3
+\\
+a_{6} & {+}{=} & a_7 \times (-0.5) & a_6 = -0.5
+\\
+a_{5} & {+}{=} & a_6 \times (2 v_5) & a_5 = -v_5
+\\
+a_{4} & {+}{=} & a_5 \times (1 / v_3) & a_4 = -v_5 / v_3
+\\
+a_{3} & {+}{=} & a_5 \times (-v_4 v_3^{-2}) & a_3 = -1 / v_3 + v_5 v_4 v_3^{-2}
+\\
+a_{1} & {+}{=} & a_4 \times (1) & a_1 = -v_5 / v_3
+\\
+a_{2} & {+}{=} & a_4 \times (-1) & a_2 = v_5 / v_3
+\end{array}
+
+\frac{\partial f}{\partial x_n} (x) 
+\approx 
+\frac{f(x_1,\ldots,x_n + \epsilon, \ldots, x_N) - f(x_1, \ldots, x_N)}
+     {\epsilon}
+
+\frac{\partial f}{\partial x_n} (x) 
+\approx 
+\frac{f(x_1,\ldots,x_n + \epsilon/2, \ldots, x_N) 
+      - f(x_1,\ldots,x_n - \epsilon/2, \ldots, x_N)}
+     {\epsilon}.
+
+\log'(x) = \frac{1}{x}.
+
+\mbox{pow}(x,y) = x^y,
+
+\frac{\partial}{\partial x} x^y = y \, x^{y-1}
+
+\frac{\partial}{\partial y} x^y = x^y \log x.
+
+\frac{\partial}{\partial x} \left( x + y \right) = 1
+
+\frac{\partial}{\partial y} \left( x + y \right) = 1.
+
+\mbox{log\_sum\_exp}(x) 
+= \log \sum_{n=1}^N \exp(x_n).
+
+\frac{\partial}{\partial x_n} \mbox{log\_sum\_exp}(x)
+= \frac{\exp(x_n)}{\sum_{n=1}^N \exp(x_n)}.
+
+\exp(x_n - \mbox{log\_sum\_exp}(x))
+\ = \
+\frac{\exp(x_n)}
+     {\exp(\mbox{log\_sum\_exp}(x))}
+\ = \
+\frac{\exp(x_n)}
+     {\sum_{n=1}^N \exp(x_n)}.
+
+\log \sum_{n=1}^N \exp(x_n)
+= \max(x) + \log \sum_{n=1}^N \exp(x_n - \max(x)).
+
+(( \cdots ((p_1 + p_2) + p_3) + p_4) \cdots + p_{N-1}) + p_N).
+
+\left( x_1 \times y_1 \right)
++ \left( x_2 \times y_2 \right) 
++ \cdots +
+\left( x_N \times y_N \right).
+
+\frac{\partial}{\partial x} \log | \mbox{det}(x) |
+= \left( x^{-1} \right)^{\top}.
+
+\frac{\partial}{\partial x_{m,n}} \log | \mbox{det}(x) |
+= \left( \left( x^{-1} \right)^{\top}\right)_{m,n}.
+
+\frac{\totald}{\totald t} y = f(y,\theta,t).
+
+\frac{\totald}{\totald t} y_n = f_n(y,\theta,t).
+
+\xi = y(0) \in \reals^N
+
+\frac{\totald}{\totald t} y_1 = y_2
+\ \ \ \ \mbox{and} \ \ \ \
+\frac{\totald}{\totald t} y_2 = -\theta y_1.
+
+f(y,\theta,t) = [y_2 \ \ \ -\theta y_1].
+
+\frac{\partial}{\partial \theta} y(t),
+
+z_{n,m} = \frac{\partial}{\partial \alpha_m} y_m
+
+z = \frac{\partial}{\partial \theta} y.
+
+z_{n,m} = \frac{\partial}{\partial \theta_m} y_n.
+
+h_{n,m}(y,z,\theta,t)
+& = & \frac{\totald}{\totald t} z_{n,m}.
+\3pt]
+& = &
+\frac{\totald}{\totald \theta_m} \frac{\totald}{\totald t} y_n
+\3pt]
+& = & 
+\frac{\partial}{\partial \theta_m} f_n(y,\theta)
++ \sum_{j = 1}^N \left( \frac{\partial}{\partial \theta_m} y_j \right) \, 
+         \frac{\partial}{\partial y_j} f_n(y,\alpha)
+\
+The sensitivity of a parameter is the derivative of the state of the
+system with respect to that parameter, with all other parameters held
+constant (but not the states).  Thus the sensitivities act as partial
+derivatives with respect to the parameters but total derivatives with
+respect to the states, because of the need to take into account the
+change in solution as parameters change.
+
+The coupled system will also need new initial states  for
+the sensitivities , all of which work out to be zero, because
+
+
+The final system that couples the original state with sensitivities
+with respect to parameters has state , initial conditions
+, and system function .
+
+\subsection{Differentiating an ODE Solution with Respect to the Initial State}
+
+The next form of coupling will be of initial states, with new state
+variables
+
+which works out componentwise to
+
+Sensitivities can be worked out in this case by defining a new
+system with state variables offset by the initial condition,
+
+This defines a new system function  with the original parameters
+ and original initial state  now both treated as
+parameters,
+
+The new initial state is a zero vector by construction.  The
+derivatives are now with respect to the parameters of the revised
+system with state , system function , and parameters
+, and work out to
+3pt]
+& = & \frac{\totald}{\totald \xi_k} \frac{\totald}{\totald t} y_n
+\3pt]
+& = & \frac{\totald}{\totald \xi_k} f_n(u + \xi, \theta)
+\3pt]
+& & 
+{ } + \sum_{j=1}^N 
+        \left( \frac{\partial}{\partial \xi_k} u_j \right)
+           \frac{\partial}{\partial u_j} f_n(u + \xi, \theta)
+\\
+& & 
+ { } + \sum_{j=1}^N
+         \left( \frac{\partial}{\partial \xi_k} \xi_j \right)
+         \frac{\partial}{\partial \xi_j} f_n(u + \xi, \theta)
+\
+The derivative  on the last line is
+equal to 1 if  and equal to 0 otherwise.
+
+
+\subsection{Computing Sensitivities with Nested Automatic Differentiation}
+
+In order to add sensitivities with respect to parameters and/or
+initial states to the system, Jacobians of the differential equation
+system function  are required with respect to the parameters (where
+the parameters may include the initial states, as shown in the last
+section).  
+
+To allow nested evaluation of system Jacobians, the Stan Math Library
+allows nested derivative evaluations.  When the system derivatives are
+required to solve the system of ODEs, the current stack location is
+recorded, autodiff of the system takes place on the top of the stack,
+and then derivative propagation stops at the recorded stack location.
+This allows arbitrary reverse-mode automatic differentiation to be
+nested inside other reverse-mode calculations.  The top of the stack
+can even be reused for Jacobian calculations without rebuilding an
+expression graph for the outer system being differentiated.
+
+\subsection{Putting Results Back Together}
+
+When the numerical integrator solves the coupled system, the solution
+is for the original state variables  along with sensitivities
+ and/or . 
+
+Given a number of solution times requested, , the
+state solutions and sensitivity solutions are used to create a
+\code{vari} instance for each .  Each of these variables is
+then connected via its sensitivity to each of the input parameters
+and/or initial states.  This requires storing the sensitivities as
+part of the result variables in a general (not ODE specific)
+precomputed-gradients \code{vari} structure.
+
+\subsection{System Function}
+
+Given an initial condition and a set of requested solution times, the
+Stan Math Library can integrate an ODE defined in terms of a system
+function.  The system function must be able to be instantiated by the
+following signature (where \code{vector} is \code{std::vector})
+\begin{smallcode}
+vector<var>
+operator()(double t, 
+           const vector<double>& y,
+           const vector<var>& theta) const;
+\end{smallcode}
+The return value is the vector of time derivatives evaluated at time
+\code{t} and system state \code{y}, given parameters \code{theta},
+continuous and integer data \code{x} and \code{x\_int}, and an output
+stream \code{o} for messages.  The function must be constant.
+
+The simple harmonic oscillator could be implemented as the following
+functor.
+\begin{smallcode}
+struct sho {
+  template <typename T>
+  vector<T> operator()(double t, 
+                       const vector<double>& y
+                       const vector<var>& theta) const
+    vector<T> dy_dt(2);
+    dy_dt[0] = y[1];
+    dy_dt[1] = -theta[0] * y[2];
+    return dy_dt;
+  }
+};
+\end{smallcode}
+
+
+\subsection{Integration Function}
+
+The function provided by the Stan Math Library to compute solutions to
+ODEs and support sensitivity calculations through autodiff has the
+following signature.
+\begin{smallcode}
+template <typename F, typename T1, typename T2>
+vector<vector<typename promote_args<T1, T2>::type> >
+integrate_ode(const F& f,
+              const std::vector<T1> y0,
+              const double t0,
+              const std::vector<double>& ts,
+              const std::vector<T2>& theta
+              const std::vector<double>& x,
+              const std::vector<int>& x_int,
+              std::ostream* msgs);
+\end{smallcode}
+The argument \code{f} is the system function, and it must be
+implemented with enough generality to allow autodiff with respect to
+the parameters and/or initial state.  The variable \code{y0} is the
+initial state and \code{t0} is the initial time (which may be
+different than 0); its scalar type parameter \code{T1} may be either
+\code{double} or \code{var}, with \code{var} being used to autodiff
+with respect to the initial state.  The vector \code{ts} is a set of
+solution times requested and must have elements greater than \code{t0}
+arranged in strictly ascending order.  The vector \code{theta} is for
+system parameters; its scalar type parameter \code{T2} can be either
+\code{double} or \code{var}, with \code{var} used to autodiff with
+respect to parameters.  There are two additional arguments, \code{x}
+and \code{x\_int}, used for real and double-valued data respectively.
+These are provided so that data does not need to be either hard coded
+in the system or promoted to \code{var} (which would add unnecessary
+components to the expression graph, increasing time and memory used).
+Finally, an output stream pointer can be provided for messages printed
+by the integrator.
+
+Given the harmonic oscillator class \code{sho}, and initial values
+, the solutions with sensitivities for the harmonic oscillator
+at times  with parameter , initial state , can be obtained as follows.
+\begin{smallcode}
+double t0 = 0.0;   
+vector<double> ts;  
+for (int t = 1; t <= 10; ++t) ts.push_back(t);
+var theta = 0.35;
+vector<var> y0(2);  y[0] = 0;  y[1] = -1.0;
+vector<var> ys 
+  = integrate_ode(sho(), y0, t0, ts, theta);
+for (int i = 0; i < 2; ++i) {
+  if (i > 0) set_zero_all_adjoints();
+  y.grad();
+  for (int n = 0; n <= ys.size(); ++n) 
+    printf("y(printf("sens: theta=theta.adj(), y0[0].adj(), y0[1].adj());
+  }
+}
+\end{smallcode}
+
+
+\section{Probability Functions and Traits}\label{probability-functions.section}\label{traits.section}
+
+The primary application for which the Stan Math Library was developed
+is fitting statistical models, with optimization for maximum
+likelihood estimates and Markov chain Monte Carlo (MCMC) for Bayesian
+posterior sampling \citep{GelmanEtAl:2013}.  For optimization,
+gradient descent and quasi-Newton methods both depend on being able to
+calculate derivatives of the objective function (in the primary
+application, a (penalized) log likelihood or Bayesian posterior).  For
+MCMC, Hamiltonian Monte Carlo (HMC) \citep{Duane:1987, Neal:2011,
+  BetancourtEtAl:2014} requires gradients in the leapfrog integrator
+it uses to solve the Hamiltonian equations and thus simulate an
+efficient flow through the posterior.
+
+In both of these applications, probability functions need only be
+calculated up to a constant term.  In order to do this efficiently and
+automatically, the Stan Math Library uses traits-based metaprogramming
+and template parameters to configure its log probability functions.
+For example, consider the log normal density again
+
+
+
+In all cases, the first term,  can be
+dropped because it's constant.  If  is a constant, then the
+second term can be dropped as well.  The final term must be preserved
+unless all of the arguments, , , and , are constants.  
+
+For maximum generality, each log probability function has a leading
+boolean template argument \code{propto}, which will have a true value
+if the calculation is being done up to a proportion and a false value
+otherwise.  Calculations up to a proportion drop constant terms.  Each
+of the remaining arguments is templated out separately, to allow all
+eight combinations of constants and variables as arguments.  The
+return type is the promotion of the argument types.  The fully
+specified signature is
+\begin{smallcode}
+template <bool propto, typename T1, typename T2, typename T3>
+typename return_type<T1, T2, T3>::type
+normal_log(const T1& y, const T2& mu, const T3& sigma) {
+  ...
+\end{smallcode}
+For scalar arguments, the \code{return\_type} traits metaprogram has
+the same behavior as Boost's \code{promote\_args}; generalizations to
+container arguments such as vectors and arrays will be discussed in
+\refsection{vectorization}.
+
+Without going into the details of error handling, the body of the
+function uses a further metaprogram to decide which terms to include
+in the result.  Not considering generalizations to containers and
+analytic gradients, the body of the function behaves as
+follows:
+\begin{smallcode}
+  include stan::math::square;
+  include std::log;
+  typename return_type<T1, T2, T3>::type lp = 0;
+  if (include_summand<propto>::value)
+    lp += NEGATIVE_LOG_2_PI;
+  if (include_summand<propto,T3>::value)
+    lp -= log(sigma);
+  if (include_summand<propto, T1, T2, T3>::value)
+    lp -= 0.5 * square((y - mu) / sigma);
+  return lp;
+}
+\end{smallcode}
+The \code{include\_summand} traits metaprogram is quite simple,
+defining an enum with a true value if any of the types is not
+primitive (integer or floating point).  Although it allows up to 10
+arguments and supports container types, the following implementation
+of \code{include\_summand} suffices for the current example.
+\begin{smallcode}
+template <boolean propto,
+          typename T1 = double, 
+          typename T2 = double, 
+          typename T3 = double>
+struct include_summand {
+  enum { value  = !propto  
+                  || !is_constant<T1>::value
+                  || !is_constant<T2>::value
+                  || !is_constant<T3>::value;  }
+};
+\end{smallcode}
+The template specification requires a boolean template parameter
+\code{propto}, which is true if calculations are to be done up to a
+constant multiplier.  The remaining template typename parameters have
+default values of \code{double}, which are the base return value type.
+The structure defines a single enum \code{value}, the value of which
+will be true if the \code{propto} is false or if any of the remaining
+template parameters are not constant values.  For scalar types,
+\code{is\_constant} behaves like Boost's \code{is\_arithmetic} trait
+metaprogram (from the TypeTraits library); it is extended for
+container types as described in \refsection{vectorization}.
+
+
+\section{Vectorization of Reductions}\label{vectorization.section}
+
+The Stan Math Library was developed to facilitate probabilistic
+modeling and inference by making it easy to define density functions
+on the log scale with derivative support.  A common use case is
+modeling a sequence of independent observations  from
+some parametric likelihood function  with shared
+parameters .  In this case, the joint likelihood function for
+all the observations is
+
+or on the log scale,
+
+Thus the log joint likelihood is the sum of the log likelihoods
+for the observations .
+
+\subsection{Argument Broadcasting}
+
+The normal log density function takes three arguments, the variate or
+outcome along with a location (mean) and scale (standard deviation)
+parameter.  Without vectorization, each of these arguments could be a
+scalar of type \code{int}, \code{double}, or \code{stan::math::var}.
+
+With vectorization, each argument may also be a standard library
+vector, \code{vector<T>}, an Eigen matrix, \code{Matrix<T,~Dynamic,~1>},
+or an Eigen row matrix, \code{Matrix<T,~1,~Dynamic>}, where \code{T} is
+any of the scalar types.  All container arguments must be the same
+size, and any scalar arguments are broadcast to behave as if they were
+containers with the scalar in every position.
+
+\subsection{Vector Views}
+
+Rather than implement 27 different versions of the normal log density,
+the Stan Math Library introduces an expression template allowing any
+of the types to be treated as a vector-like container holding its
+contents.  The view provides a scalar typedef, a size, and an operator
+to access elements using bracket notation.  Fundamentally, it stores a
+pointer, which will in practice be to a single element or to an array.
+Simplifying a bit, the code is as follows.
+\begin{smallcode}
+template <typename T,
+          bool is_array = stan::is_vector_like<T>::value>
+class VectorView {
+public: 
+  typedef typename scalar_type<T>::type scalar_t;
+
+  VectorView(scalar_t& c) : x_(&c) { }
+
+  VectorView(std::vector<scalar_t>& v) : x_(&v[0]) { }
+
+  template <int R, int C>
+  VectorView(Eigen::Matrix<scalar_t,R,C>& m) : x_(&m(0)) { }
+
+  VectorView(scalar_t* x) : x_(x) { }
+
+  scalar_t& operator[](int i) {
+    if (is_array) return x_[i];
+    else return x_[0]; 
+  }
+private:
+  scalar_t* x_;
+};
+\end{smallcode}
+There are two template parameters, \code{T} being the type of object
+being viewed and \code{is\_array} being true if the object being
+viewed is to be treated like a vector when accessing members. The
+second argument can always be set by default; it acts as a typedef to
+enable a simpler definition of \code{operator[]}.  The traits
+metaprogram \code{is\_vector\_like<T>::value} determines if the viewed
+type \code{T} acts like a container.
+
+The typedef \code{scalar\_t} uses the metaprogram
+\code{scalar\_type<T>::type} to calculate the underlying scalar type
+for the viewed type \code{T}.  
+
+The constructor takes either a scalar reference, a standard vector, or
+an Eigen matrix and stores either a pointer to the scalar or the first
+element of an array in private member variable \code{x\_}.
+
+There is a single member function, \code{operator[]}, which defines
+how the view returns elements for a given index \code{i}.  If the
+viewed type is a container as defined by template parameter
+\code{is\_array}, then it returns the element at index \code{i}; if it
+is a scalar type, then the value is returned (\code{x\_[0]} is
+equivalent to \code{*x\_}).
+
+Once a view is constructed, its \code{operator[]} can be used just
+like any other container.   This pattern would be easy to extend to
+further containers, such as Boost sequences.  After this code is
+executed, 
+\begin{smallcode}
+vector<var> y(3); ...
+VectorView<vector<var> > y_vw(y);
+\end{smallcode}
+the value of \code{y\_vw[i]} tracks \code{y[i]}, and
+the typedef \code{y\_vw::scalar\_t} is \code{var}.  
+
+For a scalar, the construction is similar.  After this code is
+executed,
+\begin{smallcode}
+double z;
+VectorView<double> z_vw(z);
+\end{smallcode}
+the value of \code{z\_vw[i]} tracks the value of \code{z} no matter
+what \code{i} is---the index is simply ignored.  
+
+No copy is made of the contents of \code{y} and it is up to the
+constructor of \code{VectorView} to ensure that the contents of
+\code{y} does not change, for instance by resizing.  Furthermore, a
+non-constant reference is returned by the \code{operator[]}, meaning
+that clients of the view can change the contained object that is being
+viewed.  This is all standard in such a view pattern, examples of
+which are the \code{block}, \code{head}, and \code{tail} functions in
+Eigen, which provide mutable views of matrices or vectors.
+
+\subsection{Value Extractor}
+
+The helper function \code{value\_of} is defined to extract the
+\code{double}-based value of either an autodiff variable or a
+primitive value.  The definition for primitive types is in the
+\code{stan::math} namespace.
+\begin{smallcode}
+template <typename T>
+inline double value_of(const T x) {
+  return static_cast<double>(x);
+}
+\end{smallcode}
+The function is overloaded for autodiff variables.
+\begin{smallcode}
+inline double value_of(const var& v) {
+  return v.vi_->val_;
+}
+\end{smallcode}
+The definition for autodiff variables is in the \code{stan::math}
+namespace to allow argument-dependent lookup.
+
+It is crucial for many of the templated definitions to be able to pull
+out \code{double} values no matter what the type of argument is.  
+The function \code{value\_of} allows
+\begin{smallcode}
+T x;
+double x_d = value_of(x);
+\end{smallcode}
+with \code{T} instantiated to \code{stan::math::var}, \code{double}, or
+\code{int}.  
+
+\subsection{Vector Builder Generic Container}
+
+By itself, the vector view does not provide a way to generate
+intermediate quantities needed in calculations and store them in an
+efficient way.  For the normal density, if  is a single value,
+then  and  can be computed once and reused.
+
+The class \code{VectorBuilder} is used as a container for intermediate
+values.  In the following code, from the normal density, it is used as
+the type of intermediate containers for  and .\footnote{Stan's version of these functions is slightly more
+  complicated in that they also support forward-mode autodiff.  The
+  details of return type manipulation for forward-mode is sidestepped
+  here by dropping template parameters and their helper template
+  metaprograms and fixing types as \code{double}.}
+\begin{smallcode}
+VectorBuilder<true> inv_sigma(length(sigma));
+
+VectorBuilder<include_summand<propto,T_scale>::value>
+  log_sigma(length(sigma));
+\end{smallcode}
+The template parameter indicates whether the variable needs to be
+stored or not.  If the parameter is false, no storage will be
+allocated.  The intermediate value \code{inv\_sigma} is always
+computed because it will be needed for the normal density even if no
+derivatives are taken.  The intermediate value \code{log\_sigma}, on
+the other hand, is only computed and memory is only allocated for it
+if a term only involving a type \code{T\_scale} is included; see
+\refsection{probability-functions} for the definition of
+\code{include\_summand}.
+
+The code for \code{VectorBuilder} itself is relatively straightforward
+\begin{smallcode}
+template <bool used, typename T1, 
+          typename T2=double, typename T3=double>
+struct VectorBuilder {
+  VectorBuilderHelper<used, contains_vector<T1, T2, T3>::value> a_;
+
+  VectorBuilder(size_t n) : a_(n) { }
+
+  T1& operator[](size_t i) { return a_[i]; }
+};
+\end{smallcode}
+The template struct \code{VectorBuilderHelper} provides the type of
+the value \code{a}; it is passed a boolean template parameter
+indicating whether any of the types is a vector and thus requires a
+vector rather than scalar to be allocated for storage.  The constructor for
+\code{VectorBuilder} just passes the requested size to the helper's
+constructor.  This will either construct a container of the requested
+size or return a dummy, depending on the value of the template
+parameter \code{used}.  The definition of \code{operator[]} just
+returns the value at index \code{i} produced by the helper.
+
+There are three use cases for efficiency for the vector.  The simplest
+is the dummy, which is employed when \code{used} is false.  It also
+defines the primary template structure.
+\begin{smallcode}
+template <bool used, bool is_vec>
+struct VectorBuilderHelper {
+  VectorBuilderHelper(size_t /* n */) { }
+
+  double& operator[](size_t /* i */) {
+    throw std::logic_error("used is false.");
+  }
+};
+\end{smallcode}
+The two template parameters are booleans indicating whether the
+storage is used, and if it is used, whether it is a vector or not.
+For the base case, there is no allocation.  Because there are no
+virtual functions declared, the size of \code{VectorBuilderHelper} is
+zero bytes and it can be optimized out of the definition of
+\code{VectorBuilder}.  The definition of the operator raises a
+standard library logic error because it should never be called;  it is
+only defined because it is required to be so that it can be used in
+alternation with helper implementations that do return values.
+
+For the case where \code{used} is true but \code{is\_vec} is false,
+the following specialization stores a \code{double} value.
+\begin{smallcode}
+template <>
+struct VectorBuilderHelper<true,false> {
+  double x_;
+
+  VectorBuilderHelper(size_t /* n */) : x_(0.0) { }
+
+  T1& operator[](size_t /* i */) {
+    return x_;
+  }
+};
+\end{smallcode}
+Note that like \code{VectorView}, it returns the value \code{x\_} no
+matter what index is provided.
+
+For the case where \code{used} is true and \code{is\_vec} is true, a
+standard library vector is used to store values, allocating the memory
+in the constructor.
+\begin{smallcode}
+template <>
+struct VectorBuilderHelper<true,true> {
+  std::vector<T1> x_;
+
+  VectorBuilderHelper(size_t n) : x_(n) { }
+
+  T1& operator[](size_t i) {
+    return x_[i];
+  }
+};
+\end{smallcode}
+Instances only live on the C++ stack, so the memory is managed
+implicitly when instances of \code{VectorBuilder} go out of scope.
+
+\subsection{Operands and Partials}
+
+The last piece of the puzzle in defining flexible functions for
+automatic differentiation is a general purpose structure
+\code{operands\_and\_partials}.  The key to this structure is that it
+stores the operands to a function or operator as an array of
+\code{vari} and stores the partial of the result with respect to the
+operand in a parallel array of \code{double} values.  That is, it
+allows general eager programming of partials, which allows
+straightforward metaprograms in many contexts such as vectorized
+density functions.  A simplified definition is as follows.\footnote{As with other aspects of the probability functions, the
+  implementation in Stan is more general, allowing for forward-mode
+  autodiff variables of varying order as well as reverse-mode autodiff
+  variables and primitives.  It also allows more or fewer template
+  parameters, giving all but the first default \code{double} values.}
+\begin{smallcode}
+template <typename T1, typename T2, typename T3>
+struct OperandsAndPartials {
+  size_t n_;
+  vari** ops_;
+  double* partials_;
+  VectorView<is_vector<T1>::value, 
+             is_constant_struct<T1>::value> d_x1_;
+  VectorView<is_vector<T2>::value, 
+             is_constant_struct<T2>::value> d_x2_;
+  VectorView<is_vector<T3>::value, 
+             is_constant_struct<T3>::value> d_x3_;
+  ...
+};
+\end{smallcode}
+The vector views are views into the \code{partial\_} array.  The
+constructor is as follows.
+\begin{smallcode}
+OperandsAndPartials(const T1& x1, const T2& x2, const T3& x3)
+: n_(!is_constant_struct<T1>::value * length(x1)
+     + !is_constant_struct<T2>::value * length(x2)
+     + !is_constant_struct<T3>::value * length(x3)),
+  ops_(memalloc_.array_alloc<vari*>(n_)),
+  partials_(memalloc_.array_alloc<double>(n_)),
+  d_x1_(partials_),
+  d_x2_(partials_
+        + !is_constant_struct<T1>::value * length(x1)),
+  d_x3_(partials_
+        + !is_constant_struct<T1>::value * length(x1)),
+        + !is_constant_struct<T2>::value * length(x2)) 
+{ 
+  size_t base = 0;
+  if (!is_constant_struct<T1>::value)
+    base += set_varis<T1>::set(&ops_[base], x1);
+  if (!is_constant_struct<T2>::value)
+    base += set_varis<T2>::set(&ops_[base], x2);
+  if (!is_constant_struct<T3>::value)
+    base += set_varis<T3>::set(&ops_[base], x3);
+
+  std::fill(partials_, partials_ + n, 0);
+}
+\end{smallcode}
+The class template parameters \code{T1}, \code{T2}, and \code{T3}
+define the argument types for the constructor; these will be the
+arguments to a probability function and may be vectors or scalars of
+either primitive or autodiff type.  The size \code{n\_} of the
+operands and partials arrays is computed by summing the non-constant
+argument sizes; the function \code{length} is trivial and not shown.
+The operands \code{ops\_} and partials \code{partials\_} are allocated
+in the arena using a template function that allocates the right size
+memory and casts it to an array with elements of the specified
+template type.  The first partials view, \code{d\_x1\_}, starts at the
+start of \code{partials\_} itself.  Each subsequent view is started
+by incrementing the start of the last view;  this could perhaps be
+made more efficient by extracting the pointer from the previous view.
+
+The body of the constructor sets the operator values in \code{ops\_}
+and fills the partials array with zero values.  The operands are set
+using the static function \code{set} in the template class
+\code{set\_varis}, which extracts the \code{vari*} from the
+arguments.  
+
+The member function \code{to\_var} returns a \code{var} with
+an implementation of the following class, which stores the
+operands and partials and uses them for the chain rule.
+\begin{smallcode}
+struct partials_vari : public vari {
+  const size_t N_;
+  vari** operands_;   
+  double* partials_;
+
+  partials_vari(double value, size_t N,
+                vari** operands, double* partials)
+  : vari(value), N_(N),
+    operands_(operands), partials_(partials) { }
+
+  void chain() {
+    for (size_t n = 0; n < N_; ++n)
+      operands_[n]->adj_ += adj_ * partials_[n];
+  }
+};
+\end{smallcode}
+The constructor passes the value to the superclass's constructor,
+\code{vari(double)}, then stores the size, operands, and partials.
+The \code{chain()} implementation increments each operand's
+adjoint by the result's adjoint times the partial derivative of the
+result relative to the operand.
+
+\subsection{Example: Vectorization of the Normal Log Density}
+
+Continuing with the example of the normal probability density function
+introduced in \refsection{probability-functions}, the pieces are now
+all in place to see how \code{normal\_log} is defined for reverse-mode
+autodiff with vectorization.
+
+The function signature is as follows
+\begin{smallcode}
+template <bool propto, 
+          typename T_y, typename T_loc, typename T_scale>
+typename return_type<T_y,T_loc,T_scale>::type
+normal_log(const T_y& y, const T_loc& mu, const T_scale& sigma);
+... 
+\end{smallcode}
+The first boolean template parameter will be true if calculations are
+allowed to drop constant terms.  The remaining template parameters are
+the types of the arguments for the variable and the location and scale
+parameters.  The result is the calculated return type, which will be
+\code{var} if any of the arguments is a (container of) \code{var} and
+\code{double} otherwise.
+
+The function begins by validating all of the inputs.
+\begin{smallcode}
+  static const char* function("stan::prob::normal_log");
+  check_not_nan(function, "Random variable", y);
+  check_finite(function, "Location parameter", mu);
+  check_positive(function, "Scale parameter", sigma);
+  check_consistent_sizes(function, "Random variable", y,
+      "Location parameter", mu, "Scale parameter", sigma);
+\end{smallcode}
+The function name itself is provided as a static constant.  These
+functions raise exceptions with warning messages indicating where the
+problem arose.  The consistent size check ensures that all of the
+container types (if any) are of the same size.  For example, if both
+\code{y} and \code{mu} are vectors and \code{sigma} is a scalar, then
+\code{y} and \code{mu} must be of the same size.
+
+Next, the function returns zero if any of the container sizes is zero,
+or if none of the argument types is an autodiff variable and
+\code{propto} is true.  In either case, the function returns zero.
+\begin{smallcode}
+  if (!(stan::length(y) && stan::length(mu) 
+        && stan::length(sigma)))
+    return 0.0;
+
+  if (!include_summand<propto,T_y,T_loc,T_scale>::value)
+    return 0.0;
+\end{smallcode}
+Only then is the accumulator \code{logp} for the result initialized.
+\begin{smallcode}
+  double logp = 0;
+\end{smallcode}
+Next, the operands and partials accumulator is initialized along with
+vector views of each of the arguments.  The size \code{N} is set to
+the maximum of the argument sizes (scalars are treated as size 1).
+\begin{smallcode}
+  OperandsAndPartials<T_y, T_loc, T_scale> 
+    operands_and_partials(y, mu, sigma);
+
+  VectorView<const T_y> y_vec(y);
+  VectorView<const T_loc> mu_vec(mu);
+  VectorView<const T_scale> sigma_vec(sigma);
+
+  size_t N = max_size(y, mu, sigma);
+\end{smallcode}
+Next, the vector builders for  and  are
+constructed and filled.
+\begin{smallcode}
+  VectorBuilder<true, T_partials_return, T_scale> 
+    inv_sigma(length(sigma));
+  for (size_t i = 0; i < length(sigma); i++)
+    inv_sigma[i] = 1.0 / value_of(sigma_vec[i]);
+\end{smallcode}
+Although \code{inv\_sigma} is always filled, \code{log\_sigma} is not
+filled if the calculation is being done up to a proportion and the
+scale parameter is a constant.
+\begin{smallcode}
+  VectorBuilder<include_summand<propto,T_scale>::value, 
+                T_partials_return, T_scale> 
+    log_sigma(length(sigma));
+  if (include_summand<propto,T_scale>::value)
+    for (size_t i = 0; i < length(sigma); i++)
+      log_sigma[i] = log(value_of(sigma_vec[i]));
+\end{smallcode}
+The value of \code{length(sigma)} will be 1 if \code{sigma} is a
+scalar and the size of the container otherwise.  Because the
+\code{include\_summand} traits metaprogram is evaluated statically,
+the compiler is smart enough to simply drop this whole loop if the
+summand should not be included.  As a result, exactly as many
+logarithms and inversions are calculated as necessary.  These values
+are then used in a loop over \code{N}, the size of the largest
+argument (1 if they are all scalars).
+\begin{smallcode}
+  for (size_t n = 0; n < N; n++) {
+    double y_dbl = value_of(y_vec[n]);
+    double mu_dbl = value_of(mu_vec[n]);
+
+    double y_minus_mu_over_sigma 
+      = (y_dbl - mu_dbl) * inv_sigma[n];
+    double y_minus_mu_over_sigma_squared 
+      = y_minus_mu_over_sigma * y_minus_mu_over_sigma;
+
+    if (include_summand<propto>::value)
+      logp += NEG_LOG_SQRT_TWO_PI;
+    if (include_summand<propto,T_scale>::value)
+      logp -= log_sigma[n];
+    if (include_summand<propto,T_y,T_loc,T_scale>::value)
+      logp += NEGATIVE_HALF * y_minus_mu_over_sigma_squared;
+
+    double scaled_diff = inv_sigma[n] * y_minus_mu_over_sigma;
+    if (!is_constant_struct<T_y>::value)
+      operands_and_partials.d_x1_[n] -= scaled_diff;
+    if (!is_constant_struct<T_loc>::value)
+      operands_and_partials.d_x2_[n] += scaled_diff;
+    if (!is_constant_struct<T_scale>::value)
+      operands_and_partials.d_x3_[n] 
+        += inv_sigma[n] * (y_minus_mu_over_sigma_squared - 1);
+  }
+  return operands_and_partials.to_var(logp,y,mu,sigma);
+}
+\end{smallcode}
+In each iteration, the value of \code{y[n]} and \code{mu[n]} is
+extracted as a \code{double}.  Then the intermediate terms are
+calculated.  These are needed for every iteration (as long as not all
+arguments are constants, which was checked earlier in the function).  
+Then depending on the argument types, various terms are added or
+subtracted from the log density accumulator \code{logp}.  The
+normalizing term is only included if the \code{propto} template
+parameter is false.  The  term is only included if
+ is not a constant.  The remaining conditional should always
+succeed, but is written this way for consistency;  the compiler will
+remove it as its condition is evaluated statically.
+
+After the result is calculated, the derivatives are calculalted.  These
+are added to the \code{OperandsAndPartials} data structure using the
+views \code{d\_x1\_}, \code{d\_x2\_}, and \code{d\_x3\_}.  These are
+all analytical partial derivatives of the normal density with respect
+to its arguments.  The operands and partials structure initialized all
+derivatives to zero.  Here, they are incremented (or decremented).  If
+any of the arguments is a scalar, then the view is always of the same
+element and this effectively increments the single derivative.  Thus
+the same code works for a scalar or vector \code{sigma}, either
+breaking the partial across each argument, or reusing \code{sigma} and
+incrementing the partial.
+
+The final line just converts the result, with value and arguments, to
+a \code{var} for return.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{Evaluation}
+
+In this section, Stan's reverse-mode automatic differentation is
+evaluated for speed and memory usage.  The evaluated version of Stan
+is version 2.6.3.
+
+
+
+\subsection{Systems and Versions}
+
+In addition to Stan, the following operator overloading, reverse-mode
+automatic differentiation systems are evaluated.
+\begin{itemize}
+\item Adept, version 1.0:
+  \smallurl{http://www.met.reading.ac.uk/clouds/adept}
+\\ see \citep{Hogan:2014}
+\item Adol-C, version 2.5.2:
+  \smallurl{https://projects.coin-or.org/ADOL-C}
+\\ see \citep{GriewankWalther:2008}
+\item CppAD, version 1.5: \smallurl{http://www.coin-or.org/CppAD}
+\\ see \citep{Bell:2012}
+\item Sacado (Trilinos), version 11.14: \smallurl{http://trilinos.org}
+\\ see \citep{Gay:2005}
+\item Stan, version 2.6.3: \smallurl{http://mc-stan.org}
+\\ see this paper
+\end{itemize}
+
+
+
+Like Stan, CppAD is purely header only.  Although Sacado is
+distributed as part of the enormous (150MB compressed) Trilinos
+library, which comes with a complex-to-configure CMake file, Sacado
+itself is header only and can be run as such by including the proper
+header files.  Adept requires a library archive to be built and linked
+with client code.  Adol-C requires a straightforward CMake
+configuration step to generate a makefile, which then compiles object
+files from C and C++ code; the object files are then linked with the
+client code.  Detailed instructions for building all of these
+libraries from source are included with the evaluation code for this
+paper and the source versions used for the evaluations are included in
+the Git repository.
+
+\subsubsection{Systems Excluded}
+
+Other C++ systems for computing derivatives were excluded from the
+evaluation for various reasons:
+\begin{itemize}
+\item lack of reverse-mode automatic differentation
+\begin{itemize}
+\item ADEL: \smallurl{https://github.com/eleks/ADEL}
+\item CeresSolver: \smallurl{http://ceres-solver.org}
+\item CTaylor: \smallurl{https://ctaylor.codeplex.com}
+\item FAD:
+  \smallurl{http://pierre.aubert.free.fr/software/software.php3}
+\end{itemize}
+\item lack of operator overloading to allow differentiation of
+  existing C++ programs
+\begin{itemize}
+\item ADIC2: \smallurl{http://www.mcs.anl.gov/adic}
+\item ADNumber: \smallurl{https://code.google.com/p/adnumber}
+\item AutoDiff\_Library: \smallurl{https://github.com/fqiang/autodiff_library}
+\item CasADi: \smallurl{http://casadi.org}
+\item CppAdCodeGen:
+  \smallurl{https://github.com/joaoleal/CppADCodeGen}
+\item Rapsodia: \smallurl{http://www.mcs.anl.gov/Rapsodia}
+\item TAPENADE:
+  \smallurl{http://tapenade.inria.fr:8080/tapenade/index.jsp}
+\item Theano: \smallurl{http://deeplearning.net/software/theano}
+\end{itemize}
+\item require graphics processing unit (GPU)
+\begin{itemize}
+\item AD4CL: \smallurl{https://github.com/msupernaw/AD4CL}
+\end{itemize}
+\item lack of open-source licensing
+\begin{itemize}
+\item ADC: \smallurl{http://www.vivlabs.com}
+\item AMPL: \smallurl{http://ampl.com}
+\item COSY INFINITY: \smallurl{http://cosy.pa.msu.edu}
+\item FADBAD++: \smallurl{http://www.imm.dtu.dk/~kajm/FADBAD}
+\end{itemize}
+\end{itemize}
+
+\subsection{What is being Evaluated}\label{retaping.section}
+
+The evaluations in this paper are based on simple gradients with
+retaping for each evaluation.
+
+\subsubsection{Gradients vs.\ Jacobians}
+
+All of the evaluations are for simple gradient calculations for
+functions  with multiple inputs and a
+single output.  That is the primary use case for which Stan's
+automatic differentiation was designed.
+
+Stan's reverse-mode automatic differentiation can be used to compute
+Jacobians as shown in \refsection{jacobians}.
+
+Stan's lazy evaluation of partial derivatives in the reverse pass over
+expression graph is designed to save memory in the gradient case, but
+requires recomputations of gradients when calculating Jacobians of
+functions  with multiple inputs and
+multiple outputs.
+
+\subsubsection{Retaping}
+
+Adol-C and CppAD allow the expression graph created in a forward pass
+through the code (which they call a ``tape'') to be reused.  This can
+speed up subsequent reverse-mode passes.  The drawback to reusing the
+expression graph is that if there are conditionals or while loops in
+the program being evaluated, the expression grpah cannot be reused.  The
+second drawback is that to evaluate the function and gradients
+requires what is effectively an interpreted forward pass to be rerun.
+A major advantage comes in Jacobian calculations, where all of the
+expression derivatives computed in the initial expression graph
+construction can be reused.
+
+Stan is not ideally set up to exploit retaping because of the lazy
+evaluation of partial derivatives.  For the lazy evaluation cases
+involving expensive functions (multiplications, transcendentals,
+iterative algorihtms, etc.), this would have to be carried out each
+time, just as in the Jacobian case.
+
+CppAD goes even further in allowing functions with static expression
+graphs to be taped once and reused by gluing them together into larger
+functions.\footnote{CppAD calls this checkpointing; see
+  \url{http://www.coin-or.org/CppAD/Doc/checkpoint.htm} for details.}
+An related approach to compiling small pieces of larger
+functions is provided by the expression templates of Adept.
+
+\subsubsection{Memory}
+
+Stan is very conservative with memory usage compared to other systems.
+We do not actually evaluate memory because we don't know how to do it.
+We can analytically evaluate the amount of memory required.  In
+continuous runs, Stan's underlying memory allocation is stored by
+default and reused, so that there should not actually be any
+underlying system memory thrashing other than for the Eigen and
+standard library vectors, which manage their own memory in the C++
+heap.
+
+\subsubsection{Compile Time}
+
+We also have not evaluated compile time.  Stan is relatively slow to
+compile, especially for the probability functions and matrix
+operations, because of its extensive use of templating.  But this cost
+is only paid once in the system.  Once the code is compiled, it can be
+reused.  The use case for which Stan is designed typically involves
+tens of thousands or even millions of gradient calculations, for which
+compilation is only performed once.
+
+
+\subsubsection{Systems Still under Consideration}
+
+The following systems are open source and provide operator
+overloading, but the authors of this paper have not (yet) been able to
+figure out how to install them and get a simple example working.
+\begin{itemize}
+\item AUTODIF (ADMB): \smallurl{http://admb-project.org}
+\item OpenAD: \smallurl{http://www.mcs.anl.gov/OpenAD/}
+\end{itemize}
+
+
+\subsection{Functors to Differentiate}\label{functors-to-diff.section}
+
+To make evaluations easy and to ensure the same code is being
+evaluated for each system, a functional is provided for each
+system being evaluated that allows it to compute gradients of a
+functor.  
+
+The functors to differentiate define the following method signature.
+\begin{smallcode}
+template <typename T>
+T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x) const;
+\end{smallcode}
+Each functor also defines a static name function used in displaying results.
+\begin{smallcode}
+static std::string name() const; 
+\end{smallcode}
+Each functor further defines a static function that fills in the
+values to differentiate.
+\begin{smallcode}
+template <typename T>
+static void fill(Eigen::Matrix<T, Eigen::Dynnamic, 1>& x);
+\end{smallcode}
+The \code{fill()} function is called once for each size before timing.
+
+For example, the following functor sums the elements of its argument vector.
+\begin{smallcode}
+struct sum_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T sum_x = 0;
+    for (int i = 0; i < x.size(); ++i)
+      sum_x += x(i);
+    return sum;
+  }
+
+  static void fill(Eigen::VectorXd& x) const {
+    for (int i = 0; i < x.size(); ++i)
+      x(i) = i;
+  }
+
+  static std::string name() const {
+    return "sum";
+  }
+};
+\end{smallcode}
+
+
+\subsection{Functionals for Differentiation}
+
+The functionals to perform the differentiation of functors for each
+system are defined as follows.
+
+\subsubsection{Adept Gradient Functional}
+
+The functional using Adept to calculate gradients of functors is
+defined as follows.
+
+\begin{smallcode}
+template <typename F>
+void adept_gradient(const F& f,
+                    const Eigen::VectorXd& x,
+                    double& fx,
+                    Eigen::VectorXd& grad_fx) {
+  Eigen::Matrix<adept::adouble, Eigen::Dynamic, 1> x_ad(x.size());
+  for (int i = 0; i < x.size(); ++i)
+    x_ad(i) = x(i);
+  adept::active_stack()->new_recording();
+  adept::adouble fx_ad = f(x_ad);
+  fx = fx_ad.value();
+  fx_ad.set_gradient(1.0);
+  adept::active_stack()->compute_adjoint();
+  grad_fx.resize(x.size());
+  for (int i = 0; i < x.size(); ++i)
+    grad_fx(i) = x_ad[i].get_gradient();
+}
+\end{smallcode}
+A new tape is explicitly started using \code{new\_recording()}, the
+top variable's adjoint is set to 1 using \code{set\_gradient()}, and
+derivatives are propagated by calling \code{compute\_adjoint()}.  At
+this point, the gradients can be read out of the automatic
+diffeentiation variables.
+
+\subsubsection{Adol-C Gradient Functional}
+
+The functional using Adol-C to calculate gradients of functors is
+defined as follows.
+
+\begin{smallcode}
+template <typename F>
+void adolc_gradient(const F& f,
+                    const Eigen::VectorXd& x,
+                    double& fx,
+                    Eigen::VectorXd& grad_fx) {
+  grad_fx.resize(x.size());
+  trace_on(1);
+  Eigen::Matrix<adouble, Eigen::Dynamic, 1> x_ad(x.size());
+  for (int n = 0; n < x.size(); ++n)
+    x_ad(n) <<= x(n);
+  adouble y = f(x_ad);
+  y >>= fx;
+  trace_off();
+  gradient(1, x.size(), &x(0), &grad_fx(0));
+}
+\end{smallcode}
+The Adol-C library signals a new tape recording with the
+\code{trace\_on()} function.  The operator \Verb|<<=| is overloaded to
+create new dependent variables, which are then used to compute the
+result.  The result is written into value \code{fx} using the
+\Verb|>>=| operator to signal the dependent variable and the recording
+is turned off using \code{trace\_off()}.  Then a function
+\code{gradient()} calculates the gradients from the recording.
+
+\subsubsection{CppAD Gradient Functional}
+
+The functional using CppAD to calculate gradients of functors is
+defined as follows.
+
+\begin{smallcode}
+template <typename F>
+void cppad_gradient(const F& f,
+                    const Eigen::VectorXd& x,
+                    double& fx,
+                    Eigen::VectorXd& grad_fx) {
+  Eigen::Matrix<CppAD::AD<double>, Eigen::Dynamic, 1>
+    x_ad(x.size());
+  for (int n = 0; n < x.size(); ++n)
+    x_ad(n) = x[n];
+  Eigen::Matrix<CppAD::AD<double>, Eigen::Dynamic, 1> y(1);
+  CppAD::Independent(x_ad);
+  y[0] = f(x_ad);
+  CppAD::ADFun<double> g = CppAD::ADFun<double>(x_ad, y);
+  fx = Value(y[0]);
+  Eigen::VectorXd w(1);
+  w(0) = 1.0;
+  grad_fx =  g.Reverse(1, w);
+}
+\end{smallcode}
+CppAD builds-in utilities for working directly with Eigen vectors.
+CppAD requires a declaration of the independent (input) variables with
+\code{Independent()}.  Then a function-like object is defined by
+constructing a \code{CppAD::ADFun}.  The value is extracted using
+\code{Value()} and gradients are calculated using the \code{Reverse}
+method of the \code{ADFun} constructed, \code{g}.
+
+\subsubsection{Sacado Gradient Functional}
+
+The functional using Sacado to calculate gradients of functors is
+defined as follows.
+\begin{smallcode}
+template <typename F>
+void sacado_gradient(const F& f,
+                     const Eigen::VectorXd& x,
+                     double& fx,
+                     Eigen::VectorXd& grad_fx) {
+  Eigen::Matrix<Sacado::Rad::ADvar<double>, Eigen::Dynamic, 1> 
+    x_ad(x.size());
+  for (int n = 0; n < x.size(); ++n)
+    x_ad(n) = x[n];
+  fx = f(x_ad).val();
+  Sacado::Rad::ADvar<double>::Gradcomp();
+
+  grad_fx.resize(x.size());
+  for (int n = 0; n < x.size(); ++n)
+    grad_fx(n) = x_ad(n).adj();
+}
+\end{smallcode}
+The execution and memory management of Sacado are very similar to
+those of Stan.  Nothing is required to start recoding other than the
+use of automatic differentiation variables (here
+\code{ADvar<double>}).  Functors are applied as expected and values
+extracted using the method \code{val()}. Then gradients are computed with a global
+function call (here \code{Gradcomp()}).  This functional was
+implemented without the \code{try}-\code{catch} logic for recovering
+memory shown in the Stan version, because memory is managed by Sacado
+inside the call to \code{Gradcomp()}.
+
+\subsubsection{Stan Gradient Functional}
+
+The functional using Stan to calculate gradients of functors was
+defined in \refsection{functionals}.
+
+\subsection{Test Harness}
+
+A single file with the test harness code is provided.  The test itself
+is run with the following function, which includes a template
+parameter for the type of the functor being differentiated.
+\begin{smallcode}
+template <typename F>
+inline void run_test() {
+  adept::Stack adept_global_stack_;
+  F f;
+  std::string file_name = F::name() + "_eval.csv";
+  std::fstream fs(file_name, std::fstream::out);
+  print_results_header(fs);
+  int max = 16 * 1024;
+  for (int N = 1; N <= max; N *= 2) {
+    std::cout << "N = " << N << std::endl;
+    Eigen::VectorXd x(N);
+    F::fill(x);
+    time_gradients(f, x, fs);
+  }
+  fs.close();
+}
+\end{smallcode}
+Adept requires a global stack to be allocated by calling its nullary
+constructor, which is done at the very top of the \code{run\_test()}
+function.  
+
+The key feature here is that a \code{double}-based vector \code{x} is
+defined of size \code{N}, starting at 1 and doubling through size
+ (16,384) to show how the speed varies as a function of
+problem size; larger sizes are not provided because  was
+enough to establish the trends with larger data.  For each size
+\code{N}, the functor's static \code{fill()} function is applied to
+\code{x}, then the gradients are timed.
+The routine \code{time\_gradients}, which is called for each size of
+input, is defined as follows.
+\begin{smallcode}
+template <typename F>
+inline void time_gradients(const F& f, const Eigen::VectorXd& x, 
+                           std::ostream& os) {
+  int N = x.size();
+  Eigen::VectorXd grad_fx(N);
+  double fx = 0;
+  clock_t start;
+  std::string f_name = F::name();
+  double z = 0;
+
+  z = 0;
+  start = clock();
+  for (int m = 0; m < NUM_CALLS; ++m) {
+    adept_gradient(f, x, fx, grad_fx);
+    z += fx;
+  }
+  print_result(start, F::name(), "adept", N, os);
+
+  z = 0;
+  start = clock();
+  for (int m = 0; m < NUM_CALLS; ++m) {
+    adolc_gradient(f, x, fx, grad_fx);
+    z += fx;
+  }
+  print_result(start, F::name(), "adolc", N, os);
+
+  z = 0;
+  start = clock();
+  for (int m = 0; m < NUM_CALLS; ++m) {
+    cppad_gradient(f, x, fx, grad_fx);
+    z += fx;
+  }
+  print_result(start, F::name(), "cppad", N, os);
+
+  z = 0;
+  start = clock();
+  for (int m = 0; m < NUM_CALLS; ++m) {
+    sacado_gradient(f, x, fx, grad_fx);
+    z += fx;
+  }
+  print_result(start, F::name(), "sacado", N, os);
+
+  z = 0;
+  start = clock();
+  for (int m = 0; m < NUM_CALLS; ++m) {
+    stan::math::gradient(f, x, fx, grad_fx);
+    z += fx;
+  }
+  print_result(start, F::name(), "stan", N, os);
+
+  z = 0;
+  start = clock();
+  for (int m = 0; m < NUM_CALLS; ++m)
+    z += f(x);
+  print_result(start, F::name(), "double", N, os);
+}
+\end{smallcode}
+This function defines the necessary local variables for timing
+and printing results to a file output stream, prints the header for
+the output.  Then t times each system's functional call to the functor to
+differentiate and prints the results.  
+
+Timing is performed using the \code{ctime} library \code{clock()}
+function, with 100,000 (or 10,000) repeated calls to each automatic differentiation
+system with the only user programs executing being the Mac OS X
+Terminal (version 2.5.3).
+
+A variable is defined to pull the value out to ensure that the entire
+function is not compiled away because results are not used.  The final
+call applies the functor to a vector of \code{double} values without
+computing gradients to provide a baseline measurement of function
+execution time.\footnote{This doesn't seem to make a difference with any compilers;
+  each function was also run in such a way to print the result to
+  ensure that each system was properly configured to compute
+  gradients.}
+
+The Adol-C and CppAD systems have alternative versions that do not
+recompute the ``tape'' for subsequent function calls, but this is not
+the use case we are evaluating.  There is some savings for doing this
+because Adol-C in particular is relatively slow during the taping
+stage;  see \refsection{retaping}.
+
+\subsection{Test Hardware and Compilation}
+
+This section provides actual performance numbers for the various
+systems using 
+\begin{itemize}
+\item Hardware: Macbook Pro computer (Retina, Mid 2012), with a 2.3
+GHz Intel Core i7 with 16 GB of 1600 MHz DDR3 memory
+\item Compiler: clang version 3.7.0 (trunk 233481)
+\item Compiler Flags: \\
+{\small \Verb|-O3 -DNDEBUG -DEIGEN_NO_DEBUG -DADEPT_STACK_THREAD_UNSAFE|}
+\item Libraries:  Eigen 3.2.4, Boost 1.55.0
+\end{itemize}
+The compiler flags turn on optimization level 3 and turn off system
+and Eigen-level debugging.  They also put Adept into thread-unsafe
+mode for its stack, which matches the way Stan runs; like Adept, Stan
+can be run in thread safe mode at roughly a 20\% penalty in
+performance by using thread-local instances of the stack representing
+the expression graph.
+
+The makefile included with the code for this paper also includes the
+ability to test with GCC version 3.9.  Results were similar enough for
+GCC that they are not included in this paper.
+
+
+\subsection{Basic Function and Operator Evaluations}
+
+This section provides evaluations of basic operators and functions
+defined as part of the C++ language or as part of the standard
+\code{cmath} library.  The next section considers evaluations of
+Stan-specific functions and optimized alternatives to basic functions.
+
+\subsubsection{Sums and Products}
+
+The simplest functions just add or multiply a sequence of numbers.
+The sum functor was defined in \refsection{functors-to-diff}.  The
+remaining functors will be shown without their \code{name()}
+methods.  For products, the following functor is used.
+\begin{smallcode}
+struct product_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T product_x = 1;
+    for (int i = 0; i < x.size(); ++i)
+      product_x *= x(i);
+    return product_x;
+  }
+
+  static void fill(Eigen::VectorXd& x) {
+    for (int i = 0; i < x.size(); ++i) 
+      x(i) = pow(1e10, 1.0 / x.size()); 
+  }
+};
+\end{smallcode}
+The fill function ensures that the total product is .  
+
+\begin{figure}
+\vspace*{-6pt}
+\begin{center}
+\includegraphics[width=2.5in]{sum_eval.pdf}\includegraphics[width=2.5in]{product_eval.pdf}
+\includegraphics[width=2.5in]{sum_rel_eval.pdf}\includegraphics[width=2.5in]{product_rel_eval.pdf}
+\end{center}
+\vspace*{-12pt}
+\caption{\small\it Evaluation of sums (left) and products (right).
+  The top plots provide a measurement of time per 100,000 gradient
+  calculations.  The bottom plots shows the speed of each
+  system relative to Stan's time.}\label{sum-product-eval.figure}
+\end{figure}
+The evaluation results for sums and products
+are plotted in \reffigure{sum-product-eval}, with actual time taken
+shown as well as time relative to Stan's time.\footnote{Given the difficulty in reading the actual time plots, only
+  relative plots will be shown going forward.}
+For sums and products, the time taken for \code{double}-based function
+evaluation versus evaluation with gradient calculations ranges from a
+factor of 100 for a handful of dimensions to roughly a factor of 10 to
+15 for evaluations with 200 or more dimensions.  Sacado is the fastest
+syste for problems with fewer than 8 (sums) or 16 (products)
+dimensions, Stan is faster for larger problems.  It is clear from the
+plots thtat both CppAD and Adol-C have large constant overheads that
+make them relatively slow for smaller problems; they are still slower
+than Sacado, Adept, and Stan for problems of 1000 variables or more
+where their relative speed seems to stabilize.  These overall results
+are fairly consistent through the evaluations.
+
+\subsubsection{Power Function}
+
+The following functor is evaluated to test the built-in \code{pow()}
+function;  because of the structure, a long chain of derivatives is
+created and both the mantissa and exponent are differentiated.  
+\begin{smallcode}
+struct powers_fun {
+  static void fill(Eigen::VectorXd& x) {
+    for (int i = 0; i < x.size(); ++i)
+      x(i) = i }
+
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x) 
+    const {
+
+    T result = 10.0;
+    for (int i = 1; i < x.size(); ++i)
+      result = pow(result, x(i));
+    return result;
+  }
+};
+\end{smallcode}
+\begin{figure}
+\vspace*{-6pt}
+\begin{center}
+\includegraphics[width=2.5in]{powers_rel_eval.pdf}\includegraphics[width=2.5in]{powers_vd_rel_eval.pdf}
+\end{center}
+\vspace*{-12pt}
+\caption{\small\it Relative evaluation of power
+  function.  (Left) Plot is for a function with repeated
+  application of \code{pow} to two variable arguments.  (Right) 
+  The sum of a sequence of \code{pow} applications to a variable with
+  a fixed exponent.}\label{powers-eval.figure}
+\end{figure}
+The evaluation is shown in \reffigure{powers-eval}.  Here, Sacado and
+Stan have almost identical performance, which is about 40\% faster
+than Adept and much faster than CppAD or Adol-C.  Adol-C seems to
+particularly struggle with this example, being roughly 15 times slower
+than Stan.  Because of the time taken for the \code{double}-based
+calculation of \code{pow()} for fractional powers, for problems of
+more than 8 dimensions, the gradients are calculated in only about
+50\% more time than the \code{double}-based function itself.
+
+The second evaluation of powers is for a fixed exponent with a
+summation of the results, as would be found in an iterative
+algorithm.  
+\begin{smallcode}
+struct powers_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T result = 10.0;
+    for (int i = 1; i < x.size(); ++i)
+      result = pow(result, x(i));
+    return result;
+  }
+
+  static void fill(Eigen::VectorXd& x) {
+    for (int i = 0; i < x.size(); ++i)
+      x(i) = i }
+};
+\end{smallcode}
+The evaluation of this gradient calculation is shown on the right side
+of \reffigure{powers-eval}.  The relative speeds are similar other
+than for Adol-C, which is much faster in this case.  In this case, the
+gradient calculations in Stan take about twice as long as the function
+itself. 
+
+
+\subsubsection{Logarithm and Exponentiation Functions}
+
+\begin{figure}
+\vspace*{-6pt}
+\begin{center}
+\includegraphics[width=2.5in]{log_sum_exp_rel_eval.pdf}\includegraphics[width=2.5in]{log_sum_exp_2_rel_eval.pdf}
+\end{center}
+\vspace*{-12pt}
+\caption{\small\it Relative evaluation of the log sum of exponents
+  function written recursively (left) and directy
+  (right).}\label{log-sum-exp-eval.figure}
+\end{figure}
+The log sum of exponents function is a commonly used function in
+numerical computing to avoid overflow when adding two numbers on a log
+scale.  Here, a simpler form of it is defined that does not attempt to
+avoid overflow, though the functor is set up so that results will not
+overflow.  
+\begin{smallcode}
+struct log_sum_exp_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T total = 0.0;
+    for (int i = 0; i < x.size(); ++i)
+      total = log(exp(total) + exp(x(i)));
+    return total;
+  }
+
+  static void fill(Eigen::VectorXd& x) {
+    for (int i = 0; i < x.size(); ++i) 
+      x(i) = i / static_cast<double>(x.size());
+  }
+};
+\end{smallcode}
+Results are shown in \reffigure{log-sum-exp-eval}.  For this operation, the
+expression templates used in Adept prove their worth and it is about
+40\% faster than Stan.  Sacado is a bit faster than Stan, and again,
+Adol-C and CppAd are more than twice as slow.  Because each
+calculation is so slow on \code{double} values, for problems of more
+than eight dimensions, the gradients are calculated in about double
+the time it takes to evaluate the function itself on \code{double}
+values.  
+
+To see that it's Adept's expression templates that make the difference
+and to illustrate how important the way a function is formulated is,
+consider this alternative implementation of the same log sum of
+exponents function.
+\begin{smallcode}
+struct log_sum_exp_2_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T total = 0.0;
+    for (int i = 0; i < x.size(); ++i)
+      total += exp(x(i));
+    return log(total);
+  }
+  ...
+}
+\end{smallcode}
+The result is shown in \reffigure{log-sum-exp-eval}; with this
+implementation, performance of Stan and Adept are similar.  The second
+(direct) implementation is also much faster for \code{double}-based
+function evaluation because of fewer applications of the expensive
+\code{log} and \code{exp} functions.
+
+\subsubsection{Matrix Products}
+
+This section provides evaluations of taking gradients of matrix
+products.  The first two evaluations are for a naive looping
+implementation.  The first evaluation involves differentiating both
+matrices in the product.
+\begin{smallcode}
+struct matrix_product_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x) 
+    const {
+
+    using Eigen::Matrix;
+    using Eigen::Dynamic;
+    using Eigen::Map;
+    int N = static_cast<int>(std::sqrt(x.size() / 2));
+    Matrix<T, Dynamic, Dynamic> a(N,N);
+    Matrix<T, Dynamic, Dynamic> b(N,N);
+    int i = 0;
+    for (int m = 0; m < N; ++m) {
+      for (int n = 0; n < N; ++n) {
+        a(m,n) = x(i++);
+        b(m,n) = x(i++);
+      }
+    }
+    Matrix<T, Dynamic, Dynamic> ab(N,N);
+    for (int m = 0; m < N; ++m) {
+      for (int n = 0; n < N; ++n) {
+        ab(m,n) = 0;
+        for (int k = 0; k < N; ++k)
+          ab(m,n) += a(m,k) * b(k,n);
+      }
+    }
+    T sum = 0;
+    for (int m = 0; m < N; ++m)
+      for (int n = 0; n < N; ++n)
+        sum += ab(m,n);
+    return sum;
+  }
+
+  static void fill(Eigen::VectorXd& x) {
+    int N = static_cast<int>(sqrt(x.size() / 2));
+    if (N < 1) N = 1;
+    x.resize(N * N * 2);
+    for (int i = 0; i < x.size(); ++i)
+      x(i) = static_cast<double>(i + 1) / (x.size() + 1);
+  }
+};
+\end{smallcode}
+The \code{fill()} implementation is different than what came before,
+because the evaluation requires two square matrices.  Thus the vector
+to be filled is resized to the largest vector of variables that can
+fill two matrices.  For a case involving  variables, the
+matrices being multiplied , because .
+
+The implementation of matrix product itself is just straightforward
+looping, first to compute the matrix product and assign it to the
+matrix \code{ab}, then to reduce the matrix to a single value through
+summation.  The resulting expression graph has much higher
+connectivity, with each variable being repeated  times for 
+an  matrix product.  
+
+For the product of an  matrix, there are  parameters
+if one matrix has \code{double} scalar values and  if they are
+both automatic differentiation variables.  From the definition of
+matrix products, it is clear that there are a total of  products
+and  sums required to multiply two  matrices.  Thus
+multiplying two  matrices requires over 90,000
+products to be calculated, each of which involves a further
+multiplication during automatic differentiation.  
+
+When considering the evaluations, the number of dimensions is the
+number of parameters---the matrices have dimensionality equal to the
+square root of that size. 
+
+\begin{figure}
+\vspace*{-6pt}
+\begin{center}
+\includegraphics[width=2.5in]{matrix_product_rel_eval.pdf}\includegraphics[width=2.5in]{matrix_product_vd_rel_eval.pdf}
+\end{center}
+\vspace*{-12pt}
+\caption{\small\it Relative evaluation of naive loop-based matrix
+  products with derivatives of both matrix (left) and just the first
+  matrix (right).  The number of dimensions on the  axis is the total
+  number of entries in the matrix; the number of subexpressions
+  evaluated grows proportionally to the square root of the number of
+  entries.}\label{matrix-product-eval.figure}
+\end{figure}
+The relative timing results are shown in
+\reffigure{matrix-product-eval}.  Because the matrices are resized to
+accomodate two square matrices, the points do not fall exactly on even
+powers of two.  Also, because iterating through powers of two sizes,
+the largest pair of matrices is the same for successive lower orders,
+so there are duplicated evaluations, which show some variation due to
+the relatively small number of loops evaluated.  It can be seen that
+Stan is faster for small matrices, with Adept being faster for larger
+matrices.  Sacado fares relatively poorly compared to the less
+connected evaluations.  
+
+The following functor is for the evaluation of matrix products with
+gradients taken only of the first matrix.
+\begin{smallcode}
+struct matrix_product_vd_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    using Eigen::Matrix;
+    using Eigen::Dynamic;
+    using Eigen::Map;
+    int N = static_cast<int>(std::sqrt(x.size()));
+    Matrix<T, Dynamic, Dynamic> a(N,N);
+    Matrix<double, Dynamic, Dynamic> b(N,N);
+    int i = 0;
+    for (int m = 0; m < N; ++m) {
+      for (int n = 0; n < N; ++n) {
+        a(m,n) = x(i++);
+        b(m,n) = 1.02;
+      }
+    }
+    Matrix<T, Dynamic, Dynamic> ab(N,N);
+    for (int m = 0; m < N; ++m) {
+      for (int n = 0; n < N; ++n) {
+        ab(m,n) = 0;
+        for (int k = 0; k < N; ++k)
+          ab(m,n) += a(m,k) * b(k,n);
+      }
+    }
+    T sum = 0;
+    for (int m = 0; m < N; ++m)
+      for (int n = 0; n < N; ++n)
+        sum += ab(m,n);
+    return sum;
+  }
+
+  static void fill(Eigen::VectorXd& x) {
+    int N = static_cast<int>(sqrt(x.size()));
+    if (N < 1) N = 1;
+    x.resize(N * N);
+    for (int i = 0; i < x.size(); ++i)
+      x(i) = static_cast<double>(i + 1) / (x.size() + 1);
+  }
+};
+\end{smallcode}
+Here, the resizing is to a single square matrix, so the case of 
+variables involves two  matrices.  As with
+differentiating both sides, Stan is faster for smaller matrices, with
+Adept being faster for larger matrices.  
+
+To demonstrate the utility of a less naive implementation of matrix
+product, consider the results of using Eigen's built-in matrix
+product, which is tuned to maximize memory locality.  The following
+functor is used for the evaluation; the \code{fill()} function is the
+same as the first matrix example for taking gradients of both
+components.
+\begin{smallcode}
+struct matrix_product_eigen_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    using Eigen::Matrix;
+    using Eigen::Dynamic;
+    int N = static_cast<int>(std::sqrt(x.size() / 2));
+    Matrix<T, Dynamic, Dynamic> a(N,N);
+    Matrix<T, Dynamic, Dynamic> b(N,N);
+    int i = 0;
+    for (int m = 0; m < N; ++m) {
+      for (int n = 0; n < N; ++n) {
+        a(m,n) = x(i++);
+        b(m,n) = x(i++);
+      }
+    }
+    return (a * b).sum();
+  }
+};
+\end{smallcode}
+Both CppAD and Stan specialize \code{std::numeric\_limits}, which is
+used by Eigen to calculate memory sizes and optimize memory locality
+in matrix product calculations.  The difference in relative speed is
+striking, as shown in \reffigure{matrix-product-eigen-eval}.
+\begin{figure}
+\vspace*{-6pt}
+\begin{center}
+\includegraphics[width=2.5in]{matrix_product_eigen_rel_eval.pdf}\includegraphics[width=2.5in]{matrix_product_stan_rel_eval.pdf}
+\end{center}
+\vspace*{-12pt}
+\caption{\small\it Evaluation of matrix products using Eigen's
+  built-in \code{operator*()} and \code{sum()} functions (left), and
+  with Stan's built-in \code{multiply()} and \code{sum()} functions
+  (right).  The number of dimensions on the  axis is the total
+  number of entries in the matrix; the number of subexpressions
+  evaluated grows proportionally to the square root of the number of
+  entries.}\label{matrix-product-eigen-eval.figure}
+\end{figure}
+Despite the rather large number of operations required for gradients,
+relative speed compared to a pure \code{double}-based implementation
+is better by a factor of 50\%.
+
+The next evaluation replaces Eigen's \code{operator*} and \code{sum}
+methods with customized versions in Stan.  Specifically, for Stan the
+final implementation is done with
+\begin{smallcode}
+stan::math::sum(stan::math::multiply(a, b));
+\end{smallcode}
+rather than with the built-in Eigen operations, as in the previous
+evaluation: 
+\begin{smallcode}
+(a * b).sum();
+\end{smallcode}
+Eigen's direct implementation is about 50\% faster, but will consume
+roughly twice as much memory as Stan's custom dot-products and
+summation, which rely on custom \code{vari} implementations.
+
+\subsubsection{Normal Log Density}
+
+The next function is closer to the applications for which Stan was
+designed, being the log of the normal density function.  The functor
+to be evaluated is the following.
+\begin{smallcode}
+struct normal_log_density_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T mu = -0.56;
+    T sigma = 1.37;
+    T lp = 0;
+    for (int i = 0; i < x.size(); ++i)
+      lp += normal_log_density(x(i), mu, sigma);
+    return lp;
+  }
+
+  static void fill(Eigen::VectorXd& x) {
+    for (int i = 0; i < x.size(); ++i) 
+      x(i) = static_cast<double>(i + 1 - x.size()/2) / (x.size() + 1);
+  }
+};
+\end{smallcode}
+The density function itself is defined up to an additive
+constant () by the following function.
+\begin{smallcode}
+template <typename T>
+inline 
+T normal_log_density(const T& y, const T& mu, const T& sigma) {
+  T z = (y - mu) / sigma;
+  return -log(sigma) - 0.5 * z * z;
+}
+\end{smallcode}
+\begin{figure}
+\vspace*{-6pt}
+\begin{center}
+\includegraphics[width=2.5in]{normal_log_density_rel_eval.pdf}\includegraphics[width=2.5in]{normal_log_density_stan_rel_eval.pdf}
+\end{center}
+\vspace*{-12pt}
+\caption{\small\it Evaluation of the normal log density function
+  implemented directly (left) and using Stan's built-in function
+  \code{normal\_log()} for the Stan version (right). Stan's approach
+  shows increasing speed relative to the naive double evaluation
+  because the proportion of logarithm evaluations shrinks as
+  the dimensionality grows.}\label{normal-log-density-eval.figure}
+\end{figure}
+The timing results are given in \reffigure{normal-log-density-eval}.
+For this function, Stan is roughly 50\% faster than the next
+fastest system, Adept, with the advantage declining a bit as the
+problem size gets larger.  For problems with ten or more evaluations,
+Stan's gradient calculation takes a bit more than twenty times as long
+as the \code{double}-based evaluation.  Althoug roughly the same speed
+as Stan for small problems, Sacado falls further behind as the number
+of gradients evaluated increases, whereas CppAd starts very far behind
+and asymptotes at roughly half the speed of Stan. 
+
+The second plot in \reffigure{normal-log-density-eval} shows the
+relative speed of Stan's built-in, vectorized version of the normal
+log density function.  For this evaluation, the functor's operator is
+the following;  the \code{fill()} function remains the same as before.
+\begin{smallcode}
+struct normal_log_density_stan_fun {
+  template <typename T>
+  T operator()(const Eigen::Matrix<T, Eigen::Dynamic, 1>& x)
+    const {
+
+    T mu = -0.56;
+    T sigma = 1.37;
+    return normal_log_density(x, mu, sigma);
+  }
+};
+\end{smallcode}
+The implementation of the log density function for Stan is the following.
+\begin{smallcode}
+inline stan::math::var 
+normal_log_density(const Eigen::Matrix<stan::math::var, 
+                                       Eigen::Dynamic, 1>& y, 
+                   const stan::math::var& mu, 
+                   const stan::math::var& sigma) {
+  return stan::prob::normal_log<true>(y, mu, sigma);
+}
+\end{smallcode}
+For the other systems, a standalone \code{normal\_log\_density}
+provides the same definition as in the previous evaluation.
+\begin{smallcode}
+template <typename T>
+inline T 
+normal_log_density(const Eigen::Matrix<T, Eigen::Dynamic, 1>& y, 
+                   const T& mu, const T& sigma) {
+  T lp = 0;
+  for (int i = 0; i < y.size(); ++i) {
+    T z = (y(i) - mu) / sigma;
+    lp += -log(sigma) - 0.5 * z * z;
+  }
+  return lp;
+}
+\end{smallcode}
+The comparison with the \code{double}-based version shows that the
+custom version of the normal log density is roughly a factor of six
+faster than the naive implementation.  
+
+\section{Previous Work}
+
+Stan's basic pointer-to-implementation pattern and arena-based memory
+design was based on Gay's original system RAD \cite{Gay:2005}; RAD is
+also the basis for the Sacado automatic differentiation package, which
+is part of the Trilinos project \cite{HerouxEtAl:2005}.  The
+arena-based memory usage pattern is described in more detail in
+\cite{GayAiken:2001}.  In addition to coding slightly different base
+classes and memory data structures and responsibilities for recovery,
+Stan uses \code{vari} specializations to allow lazy evaluation of
+partials and thus save memory and reduce the number of assignments.
+Stan also has a value-based return type for its client class
+\code{var} rather than the reference-based return approach of RAD for
+its function and operator overloads.
+
+
+\section{Summary and Future Work}
+
+This paper demonstrated the usability of Stan's automatic
+differentiation library through simple examples, which showed how to
+use the data structures directly or fully encapsulate gradient
+calculations of templated C++ functors using Stan's gradient
+functional.  The efficiency of Stan was compared to other open-source
+C++ libraries, which showed varying relative performance drops
+compared to Stan in the different problems evaluated.
+
+The memory usage of Stan's gradient calculations was described
+in detail, with various techniques being employed to reduce memory
+usage through lazy evaluation and vectorization of operations such as
+log density functions.  The Stan automatic differentiation library is
+part of the sandalone Stan Math Library, which is extensively tested
+for accuracy and instantiability, and has presented a stable interface
+through dozens of releases of the larger Stan package.  The Stan Math
+Library is distributed under the BSD license, which is compatible with
+other open-source licesense such as GPL.  Stan's open-source
+development community ensures continued growth of the library in the
+future.
+
+Adept's use of expression templates to unfold derivative propagations
+at compile time makes it more efficient than Stan at run time in cases
+where there are complex expressions on the right-hand sides of
+assignments.  The advantage grows as the right-hand side expression
+size grows.  There is no reason in principle why the expression
+templates of Adept and the underlying efficiency of Stan's data
+structures and memory management could not be combined to improve both
+systems.
+
+Although not the use case that Stan was developed for, CppAD and
+Adol-C's ability to re-use a ``tape'' is potentially useful in some
+applications where there are no general while loops or conditionals
+that can evaluate differently on different evaluations.
+
+It is clear from the matrix evaluations that there is also more
+performance gains to be had for larger matrices, presumably through
+enhanced memory locality considerations in both expression graph
+construction and in derivative propagation.
+
+The next major features planned for the stan Math Library are inverse
+cumulative distribution functions and stiff differential equation
+solver(s).  In order to avoid expensive, imprecise, and unstable finite
+difference calculations, the latter requires second-order automatic
+differentiation to compute Jacobians of a differential equation system
+coupled with its sensitivities.
+
+\section*{Acknowledgements}
+
+We would like to thank Brad Bell (author of CppAD), Robin Hogan
+(author of Adept), and Andrew Walther (author of Adol-C) for useful
+comments on our evaluations of their systems and comments on a draft
+of this paper.  We never heard back from the authors of Sacado.
+
+\clearpage
+\appendix
+
+\section{Stan Functions}
+
+The following is a comprehensive list of functions supported by Stan
+as of version 2.6.  
+
+\subsection{Type Conventions}
+
+\subsubsection{Scalar Functions}
+
+Where argument type \code{real} occurs, any of \code{double},
+\code{int}, or \code{stan::math::var} may be used.  Result types with
+\code{real} denote \code{var} if any of the arguments contain a
+\code{var} and \code{double} otherwise.
+
+\subsubsection{Vector or Array Functions}
+
+Where value type \code{reals} is used, any of the following types may
+be used.
+\begin{itemize}
+\item  Scalars: \
+{\small
+\code{double},  \
+\code{int}, \
+\code{var} 
+}
+\item  Standard vectors: \
+{\small
+\code{vector<double>}, \
+\code{vector<int>}, \
+\code{vector<var>}
+}
+\item Eigen vectors: \
+{\small
+\code{Matrix<double,\,Dynamic,\,1>}, \
+\code{Matrix<var,\,Dynamic,\,1>}
+}
+\item Eigen row vectors: \\
+{\small
+\code{Matrix<double,\,Dynamic,\,1>}, \
+\code{Matrix<var,\,1,\,Dynamic>}
+}
+\end{itemize}
+If any of the arguments contains a \code{var}, the return type
+\code{real} is a \code{var}, otherwise it is \code{double}.
+
+\subsection{C++ Built-in Arithmetic Operators}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} \\
+\hline
+\code{operator*} & \code{(real x, real y)} & \code{real} \\
+\code{operator+} & \code{(real)} & \code{real} \\
+\code{operator+} & \code{(real x, real y)} & \code{real} \\
+\code{operator-} & \code{(real x)} & \code{real} \\
+\code{operator-} & \code{(real x, real y)} & \code{real} \\
+\code{operator/} & \code{(real x, real y)} & \code{real} \\
+\end{tabular}
+}
+
+\subsection{C++ Built-in Relational Operators}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{operator!} & \code{(real x)} & \code{int} \\
+\code{operator!=} & \code{(real x, real y)} & \code{int} \\
+\code{operator\&\&} & \code{(real x, real y)} & \code{int} \\
+\code{operator<} & \code{(real x, real y)} & \code{int} \\
+\code{operator<=} & \code{(real x, real y)} & \code{int} \\
+\code{operator==} & \code{(real x, real y)} & \code{int} \\
+\code{operator>} & \code{(real x, real y)} & \code{int} \\
+\code{operator>=} & \code{(real x, real y)} & \code{int} \\
+\code{operator} & \code{(real x, real y)} & \code{int} \\
+\end{tabular}
+}
+
+\subsection{C++ \code{cmath} Library Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} 
+\\ \hline
+\code{abs} & \code{(real x)} & \code{real} \\
+\code{acos} & \code{(real x)} & \code{real} \\
+\code{acosh} & \code{(real x)} & \code{real} \\
+\code{asin} & \code{(real x)} & \code{real}  \\
+\code{asinh} & \code{(real x)} & \code{real} \\
+\code{atan2} & \code{(real x, real y)} & \code{real} \\
+\code{atan} & \code{(real x)} & \code{real} \\
+\code{atanh} & \code{(real x)} & \code{real} \\
+\code{cos} & \code{(real x)} & \code{real} \\
+\code{cosh} & \code{(real x)} & \code{real} \\
+\code{cbrt} & \code{(real x)} & \code{real} \\
+\code{ceil} & \code{(real x)} & \code{real} \\
+\code{erf} & \code{(real x)} & \code{real} \\
+\code{erfc} & \code{(real x)} & \code{real} \\
+\code{exp2} & \code{(real x)} & \code{real} \\
+\code{exp} & \code{(real x)} & \code{real} \\
+\code{fdim} & \code{(real x, real y)} & \code{real} \\
+\code{floor} & \code{(real x)} & \code{real} \\
+\code{fma} & \code{(real x, real y, real z)} & \code{real} \\
+\code{fmax} & \code{(real x, real y)} & \code{real} \\
+\code{fmin} & \code{(real x, real y)} & \code{real} \\
+\code{fmod} & \code{(real x, real y)} & \code{real} \\
+\code{hypot} & \code{(real x, real y)} & \code{real} \\
+\code{log} & \code{(real x)} & \code{real} \\
+\code{log10} & \code{(real x)} & \code{real} \\
+\code{log1p} & \code{(real x)} & \code{real} \\
+\code{log2} & \code{(real x)} & \code{real} \\
+\code{pow} & \code{(real x, real y)} & \code{real} \\
+\code{round} & \code{(real x)} & \code{real} \\
+\code{sin} & \code{(real x)} & \code{real} \\
+\code{sinh} & \code{(real x)} & \code{real} \\
+\code{sqrt} & \code{(real x)} & \code{real} \\
+\code{tan} & \code{(real x)} & \code{real} \\
+\code{tanh} & \code{(real x)} & \code{real} \\
+\code{trunc} & \code{(real x)} & \code{real} \\
+\end{tabular}
+}
+
+\subsection{Special Mathematical Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} 
+\\ \hline
+\code{bessel\_first\_kind} & \code{(int v, real x)} & \code{real} \\
+\code{bessel\_second\_kind} & \code{(int v, real x)} & \code{real} \\
+\code{binary\_log\_loss} & \code{(int y, real y\_hat)} & \code{real} \\
+\code{binomial\_coefficient\_log} & \code{(real x, real y)} & \code{real} \\
+\code{digamma} & \code{(real x)} & \code{real} \\
+\code{expm1} & \code{(real x)} & \code{real} \\
+\code{fabs} & \code{(real x)} & \code{real} \\
+\code{falling\_factorial} & \code{(real x, real n)} & \code{real} \\
+\code{gamma\_p} & \code{(real a, real z)} & \code{real} \\
+\code{gamma\_q} & \code{(real a, real z)} & \code{real} \\
+\code{inv} & \code{(real x)} & \code{real} \\
+\code{inv\_cloglog} & \code{(real y)} & \code{real} \\
+\code{inv\_logit} & \code{(real y)} & \code{real} \\
+\code{inv\_sqrt} & \code{(real x)} & \code{real} \\
+\code{inv\_Phi} & \code{(real x)} & \code{real} \\
+\code{inv\_square} & \code{(real x)} & \code{real} \\
+\code{lbeta} & \code{(real alpha, real beta)} & \code{real} \\
+\code{lgamma} & \code{(real x)} & \code{real} \\
+\code{lmgamma} & \code{(int n, real x)} & \code{real} \\
+\code{log1m} & \code{(real x)} & \code{real} \\
+\code{log1m\_exp} & \code{(real x)} & \code{real} \\
+\code{log1m\_inv\_logit} & \code{(real x)} & \code{real} \\
+\code{log1p\_exp} & \code{(real x)} & \code{real} \\
+\code{log\_diff\_exp} & \code{(real x, real y)} & \code{real} \\
+\code{log\_falling\_factorial} & \code{(real x, real n)} & \code{real} \\
+\code{log\_inv\_logit} & \code{(real x)} & \code{real} \\
+\code{log\_mix} & \code{(real theta, real lp1, real lp2)} & \code{real} \\
+\code{log\_rising\_factorial} & \code{(real x, real n)} & \code{real} \\
+\code{log\_sum\_exp} & \code{(real x, real y)} & \code{real} \\
+\code{logit} & \code{(real x)} & \code{real} \\
+\code{modified\_bessel\_first\_kind} & \code{(int v, real z)} & \code{real} \\
+\code{modified\_bessel\_second\_kind} & \code{(int v, real z)} & \code{real} \\
+code{multiply\_log} & \code{(real x, real y)} & \code{real} \\
+\code{owens\_t} & \code{(real h, real a)} & \code{real} \\
+\code{Phi} & \code{(real x)} & \code{real} \\
+\code{Phi\_approx} & \code{(real x)} & \code{real} \\
+\code{rising\_factorial} & \code{(real x, real n)} & \code{real} \\
+\code{square} & \code{(real x)} & \code{real} \\
+\code{step} & \code{(real x)} & \code{real} \\
+\code{tgamma} & \code{(real x)} & \code{real} \\
+\code{trigamma} & \code{(real x)} & \code{real} \\
+\end{tabular}
+}
+
+\subsection{Special Control and Test Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} 
+\\ \hline
+\code{if\_else} & \code{(int cond, real x, real y)} & \code{real} \\
+\code{int\_step} & \code{(real x)} & \code{int} \\
+\code{is\_inf} & \code{(real x)} & \code{int} \\
+\code{is\_nan} & \code{(real x)} & \code{int} \\
+\end{tabular}
+}
+
+
+
+\subsection{Matrix Arithmetic Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} \\
+\hline
+\code{add} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{add} & \code{(matrix x, real y)} & \code{matrix} \\
+\code{add} & \code{(real x, matrix y)} & \code{matrix} \\
+\code{add} & \code{(real x, row\_vector y)} & \code{row\_vector} \\
+\code{add} & \code{(real x, vector y)} & \code{vector} \\
+\code{add} & \code{(row\_vector x, real y)} & \code{row\_vector} \\
+\code{add} & \code{(row\_vector x, row\_vector y)} & \code{row\_vector} \\
+\code{add} & \code{(vector x, real y)} & \code{vector} \\
+\code{add} & \code{(vector x, vector y)} & \code{vector} 
+\\ \hline
+\code{columns\_dot\_product} & \code{(matrix x, matrix y)} & \code{row\_vector} \\
+\code{columns\_dot\_product} & \code{(row\_vector x, row\_vector y)} & \code{row\_vector} \\
+\code{columns\_dot\_product} & \code{(vector x, vector y)} & \code{row\_vector} \\
+\hline
+\code{columns\_dot\_self} & \code{(matrix x)} & \code{row\_vector} \\
+\code{columns\_dot\_self} & \code{(row\_vector x)} & \code{row\_vector} \\
+\code{columns\_dot\_self} & \code{(vector x)} & \code{row\_vector} \\
+\hline
+\code{crossprod} & \code{(matrix x)} & \code{matrix} \\
+\hline
+\code{diag\_post\_multiply} & \code{(matrix m, row\_vector rv)} & \code{matrix} \\
+\code{diag\_post\_multiply} & \code{(matrix m, vector v)} & \code{matrix} \\
+\code{diag\_pre\_multiply} & \code{(row\_vector rv, matrix m)} & \code{matrix} \\
+\code{diag\_pre\_multiply} & \code{(vector v, matrix m)} & \code{matrix} \\
+\hline
+\code{divide} & \code{(matrix x, real y)} & \code{matrix} \\
+\code{divide} & \code{(row\_vector x, real y)} & \code{row\_vector} \\
+\code{divide} & \code{(vector x, real y)} & \code{vector} \\
+\hline
+\code{dot\_product} & \code{(row\_vector x, row\_vector y)} & \code{real} \\
+\code{dot\_product} & \code{(row\_vector x, vector y)} & \code{real} \\
+\code{dot\_product} & \code{(vector x, row\_vector y)} & \code{real} \\
+\code{dot\_product} & \code{(vector x, vector y)} & \code{real} \\
+\hline
+\code{dot\_self} & \code{(row\_vector x)} & \code{real} \\
+\code{dot\_self} & \code{(vector x)} & \code{real} \\
+\hline
+\code{elt\_divide} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{elt\_divide} & \code{(matrix x, real y)} & \code{matrix} \\
+\code{elt\_divide} & \code{(real x, matrix y)} & \code{matrix} \\
+\code{elt\_divide} & \code{(real x, row\_vector y)} & \code{row\_vector} \\
+\code{elt\_divide} & \code{(real x, vector y)} & \code{vector} \\
+\code{elt\_divide} & \code{(row\_vector x, real y)} & \code{row\_vector} \\
+\code{elt\_divide} & \code{(row\_vector x, row\_vector y)} & \code{row\_vector} \\
+\code{elt\_divide} & \code{(vector x, real y)} & \code{vector} \\
+\code{elt\_divide} & \code{(vector x, vector y)} & \code{vector} \\
+\end{tabular}
+}
+
+
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} \\
+\hline
+\code{elt\_multiply} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{elt\_multiply} & \code{(row\_vector x, row\_vector y)} & \code{row\_vector} \\
+\code{elt\_multiply} & \code{(vector x, vector y)} & \code{vector} \\
+\hline
+\code{multiply\_lower\_tri\_self\_transpose} & \code{(matrix x)} & \code{matrix} \\
+\hline
+\code{multiply} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{multiply} & \code{(matrix x, real y)} & \code{matrix} \\
+\code{multiply} & \code{(matrix x, vector y)} & \code{vector} \\
+\code{multiply} & \code{(real x, matrix y)} & \code{matrix} \\
+\code{multiply} & \code{(real x, row\_vector y)} & \code{row\_vector} \\
+\code{multiply} & \code{(real x, vector y)} & \code{vector} \\
+\code{multiply} & \code{(row\_vector x, matrix y)} & \code{row\_vector} \\
+\code{multiply} & \code{(row\_vector x, real y)} & \code{row\_vector} \\
+\code{multiply} & \code{(row\_vector x, vector y)} & \code{real} \\
+\code{multiply} & \code{(vector x, real y)} & \code{vector} \\
+\code{multiply} & \code{(vector x, row\_vector y)} & \code{matrix} \\
+\hline
+\code{mdivide\_right} & \code{(matrix B, matrix A)} & \code{matrix} \\
+\code{mdivide\_right} & \code{(row\_vector b, matrix A)} & \code{row\_vector} \\
+\hline
+\code{mdivide\_left} & \code{(matrix A, matrix B)} & \code{matrix} \\
+\code{mdivide\_left} & \code{(matrix A, vector b)} & \code{vector} \\
+\hline
+\code{quad\_form} & \code{(matrix A, matrix B)} & \code{matrix} \\
+\code{quad\_form} & \code{(matrix A, vector B)} & \code{real} \\
+\hline
+\code{quad\_form\_diag} & \code{(matrix m, row\_vector rv)} & \code{matrix} \\
+\code{quad\_form\_diag} & \code{(matrix m, vector v)} & \code{matrix} \\
+\hline
+\code{quad\_form\_sym} & \code{(matrix A, matrix B)} & \code{matrix} \\
+\code{quad\_form\_sym} & \code{(matrix A, vector B)} & \code{real} \\
+\hline
+\code{rows\_dot\_product} & \code{(matrix x, matrix y)} & \code{vector} \\
+\code{rows\_dot\_product} & \code{(row\_vector x, row\_vector y)} & \code{vector} \\
+\code{rows\_dot\_product} & \code{(vector x, vector y)} & \code{vector} \\
+\hline
+\code{rows\_dot\_self} & \code{(matrix x)} & \code{vector} \\
+\code{rows\_dot\_self} & \code{(row\_vector x)} & \code{vector} \\
+\code{rows\_dot\_self} & \code{(vector x)} & \code{vector} \\
+\hline
+\code{subtract} & \code{(matrix x)} & \code{matrix} \\
+\code{subtract} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{subtract} & \code{(matrix x, real y)} & \code{matrix} \\
+\code{subtract} & \code{(real x)} & \code{real} \\
+\code{subtract} & \code{(real x, matrix y)} & \code{matrix} \\
+\code{subtract} & \code{(real x, row\_vector y)} & \code{row\_vector} \\
+\code{subtract} & \code{(real x, vector y)} & \code{vector} \\
+\code{subtract} & \code{(row\_vector x)} & \code{row\_vector} \\
+\code{subtract} & \code{(row\_vector x, real y)} & \code{row\_vector} \\
+\code{subtract} & \code{(row\_vector x, row\_vector y)} & \code{row\_vector} \\
+\code{subtract} & \code{(vector x)} & \code{vector} \\
+\code{subtract} & \code{(vector x, real y)} & \code{vector} \\
+\code{subtract} & \code{(vector x, vector y)} & \code{vector} \\
+\hline
+\code{tcrossprod} & \code{(matrix x)} & \code{matrix} \\
+\end{tabular}
+}
+
+\subsection{Special Matrix Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}  
+\\ \hline
+\code{cumulative\_sum} & \code{(real[] x)} & \code{real[]} \\
+\code{cumulative\_sum} & \code{(row\_vector rv)} & \code{row\_vector} \\
+\code{cumulative\_sum} & \code{(vector v)} & \code{vector} \\
+\hline
+\code{dims} & \code{(T x)} & \code{int[]} \\
+\hline
+\code{distance} & \code{(row\_vector x, row\_vector y)} & \code{real} \\
+\code{distance} & \code{(row\_vector x, vector y)} & \code{real} \\
+\code{distance} & \code{(vector x, row\_vector y)} & \code{real} \\
+\code{distance} & \code{(vector x, vector y)} & \code{real} \\
+\hline
+\code{exp} & \code{(matrix x)} & \code{matrix} \\
+\code{exp} & \code{(row\_vector x)} & \code{row\_vector} \\
+\code{exp} & \code{(vector x)} & \code{vector} \\
+\hline
+\code{log} & \code{(matrix x)} & \code{matrix} \\
+\code{log} & \code{(row\_vector x)} & \code{row\_vector} \\
+\code{log} & \code{(vector x)} & \code{vector} \\
+\hline
+\code{log\_softmax} & \code{(vector x)} & \code{vector} \\
+\hline
+\code{log\_sum\_exp} & \code{(matrix x)} & \code{real} \\
+\code{log\_sum\_exp} & \code{(real x[])} & \code{real} \\
+\code{log\_sum\_exp} & \code{(row\_vector x)} & \code{real} \\
+\code{log\_sum\_exp} & \code{(vector x)} & \code{real} \\
+\hline
+\code{max} & \code{(matrix x)} & \code{real} \\
+\code{max} & \code{(real x[])} & \code{real} \\
+\code{max} & \code{(row\_vector x)} & \code{real} \\
+\code{max} & \code{(vector x)} & \code{real} \\
+\hline
+\code{mean} & \code{(matrix x)} & \code{real} \\
+\code{mean} & \code{(real x[])} & \code{real} \\
+\code{mean} & \code{(row\_vector x)} & \code{real} \\
+\code{mean} & \code{(vector x)} & \code{real} \\
+\hline
+\code{min} & \code{(int x[])} & \code{int} \\
+\code{min} & \code{(matrix x)} & \code{real} \\
+\code{min} & \code{(real x[])} & \code{real} \\
+\code{min} & \code{(row\_vector x)} & \code{real} \\
+\code{min} & \code{(vector x)} & \code{real} \\
+\end{tabular}
+}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}  \\
+
+\hline
+\code{num\_elements} & \code{(T[] x)} & \code{int} \\
+\code{num\_elements} & \code{(matrix x)} & \code{int} \\
+\code{num\_elements} & \code{(row\_vector x)} & \code{int} \\
+\code{num\_elements} & \code{(vector x)} & \code{int} \\
+\hline
+\code{prod} & \code{(int x[])} & \code{real} \\
+\code{prod} & \code{(matrix x)} & \code{real} \\
+\code{prod} & \code{(real x[])} & \code{real} \\
+\code{prod} & \code{(row\_vector x)} & \code{real} \\
+\code{prod} & \code{(vector x)} & \code{real} \\
+\hline
+\code{sd} & \code{(matrix x)} & \code{real} \\
+\code{sd} & \code{(real x[])} & \code{real} \\
+\code{sd} & \code{(row\_vector x)} & \code{real} \\
+\code{sd} & \code{(vector x)} & \code{real} \\
+\hline
+\code{softmax} & \code{(vector x)} & \code{vector} \\
+\hline
+\code{squared\_distance} & \code{(row\_vector x, row\_vector y[])} & \code{real} \\
+\code{squared\_distance} & \code{(row\_vector x, vector y[])} & \code{real} \\
+\code{squared\_distance} & \code{(vector x, row\_vector y[])} & \code{real} \\
+\code{squared\_distance} & \code{(vector x, vector y)} & \code{real} \\
+\hline
+\code{sum} & \code{(int x[])} & \code{int} \\
+\code{sum} & \code{(matrix x)} & \code{real} \\
+\code{sum} & \code{(real x[])} & \code{real} \\
+\code{sum} & \code{(row\_vector x)} & \code{real} \\
+\code{sum} & \code{(vector x)} & \code{real} \\
+\hline
+\code{variance} & \code{(matrix x)} & \code{real} \\
+\code{variance} & \code{(real x[])} & \code{real} \\
+\code{variance} & \code{(row\_vector x)} & \code{real} \\
+\code{variance} & \code{(vector x)} & \code{real} \\
+\end{tabular}
+}
+
+
+\subsection{Matrix and Array Manipulation Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{append\_col} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{append\_col} & \code{(matrix x, vector y)} & \code{matrix}  \\
+\code{append\_col} & \code{(row\_vector x, row\_vector y)} & \code{row\_vector} \\
+\code{append\_col} & \code{(vector x, matrix y)} & \code{matrix}  \\
+\code{append\_col} & \code{(vector x, vector y)} & \code{matrix}  \\
+\hline
+\code{append\_row} & \code{(matrix x, matrix y)} & \code{matrix} \\
+\code{append\_row} & \code{(matrix x, row\_vector y)} & \code{matrix}   \\
+\code{append\_row} & \code{(row\_vector x, matrix y)} & \code{matrix}   \\
+\code{append\_row} & \code{(row\_vector x, row\_vector y)} & \code{matrix}   \\
+\code{append\_row} & \code{(vector x, vector y)} & \code{vector}   \\
+\hline
+\code{block} & \code{(matrix x, int i, int j, int n\_rows, int n\_cols)} & \code{matrix} \\
+\hline
+\code{col} & \code{(matrix x, int n)} & \code{vector} \\
+\code{cols} & \code{(matrix x)} & \code{int} \\
+\code{cols} & \code{(row\_vector x)} & \code{int} \\
+\code{cols} & \code{(vector x)} & \code{int} \\
+\hline
+\code{diag\_matrix} & \code{(vector x)} & \code{matrix} \\
+\hline
+\code{diagonal} & \code{(matrix x)} & \code{vector} \\
+\hline
+\code{head} & \code{(T[] sv, int n)} & \code{T[]} \\
+\code{head} & \code{(row\_vector rv, int n)} & \code{row\_vector} \\
+\code{head} & \code{(vector v, int n)} & \code{vector} \\
+\hline
+\code{transpose} & \code{(matrix x)} & \code{matrix} \\
+\code{transpose} & \code{(row\_vector x)} & \code{vector} \\
+\code{transpose} & \code{(vector x)} & \code{row\_vector} \\
+\hline
+\code{rank} & \code{(int[] v, int s)} & \code{int} \\
+\code{rank} & \code{(real[] v, int s)} & \code{int} \\
+\code{rank} & \code{(row\_vector v, int s)} & \code{int} \\
+\code{rank} & \code{(vector v, int s)} & \code{int} \\
+\hline
+\code{rep\_array} & \code{(T x, int k, int m, int n)} & \code{T[]} \\
+\code{rep\_array} & \code{(T x, int m, int n)} & \code{T[]} \\
+\code{rep\_array} & \code{(T x, int n)} & \code{T[]} \\
+\hline
+\code{rep\_matrix} & \code{(real x, int m, int n)} & \code{matrix} \\
+\code{rep\_matrix} & \code{(row\_vector rv, int m)} & \code{matrix} \\
+\code{rep\_matrix} & \code{(vector v, int n)} & \code{matrix} \\
+\hline
+\code{rep\_row\_vector} & \code{(real x, int n)} & \code{row\_vector} \\
+\hline
+\code{rep\_vector} & \code{(real x, int m)} & \code{vector} \\
+\end{tabular}
+}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{row} & \code{(matrix x, int m)} & \code{row\_vector} \\
+\hline
+\code{rows} & \code{(matrix x)} & \code{int} \\
+\code{rows} & \code{(row\_vector x)} & \code{int} \\
+\code{rows} & \code{(vector x)} & \code{int} \\
+\hline
+\code{segment} & \code{(T[] sv, int i, int n)} & \code{T[]} \\
+\code{segment} & \code{(row\_vector v, int i, int n)} & \code{row\_vector} \\
+\code{segment} & \code{(vector v, int i, int n)} & \code{vector} \\
+\hline
+\code{sort\_asc} & \code{(int[] v)} & \code{int[]} \\
+\code{sort\_asc} & \code{(real[] v)} & \code{real[]} \\
+\code{sort\_asc} & \code{(row\_vector v)} & \code{row\_vector} \\
+\code{sort\_asc} & \code{(vector v)} & \code{vector} \\
+\hline
+\code{sort\_desc} & \code{(int[] v)} & \code{int[]} \\
+\code{sort\_desc} & \code{(real[] v)} & \code{real[]} \\
+\code{sort\_desc} & \code{(row\_vector v)} & \code{row\_vector} \\
+\code{sort\_desc} & \code{(vector v)} & \code{vector} \\
+\hline
+\code{sort\_indices\_asc} & \code{(int[] v)} & \code{int[]} \\
+\code{sort\_indices\_asc} & \code{(real[] v)} & \code{int[]} \\
+\code{sort\_indices\_asc} & \code{(row\_vector v)} & \code{int[]} \\
+\code{sort\_indices\_asc} & \code{(vector v)} & \code{int[]} \\
+\hline
+\code{sort\_indices\_desc} & \code{(int[] v)} & \code{int[]} \\
+\code{sort\_indices\_desc} & \code{(real[] v)} & \code{int[]} \\
+\code{sort\_indices\_desc} & \code{(row\_vector v)} & \code{int[]} \\
+\code{sort\_indices\_desc} & \code{(vector v)} & \code{int[]} \\
+\hline
+\code{sub\_col} & \code{(matrix x, int i, int j, int n\_rows)} & \code{vector} \\
+\hline
+\code{sub\_row} & \code{(matrix x, int i, int j, int n\_cols)} & \code{row\_vector} \\
+\hline
+\code{tail} & \code{(T[] sv, int n)} & \code{T[]} \\
+\code{tail} & \code{(row\_vector rv, int n)} & \code{row\_vector} \\
+\code{tail} & \code{(vector v, int n)} & \code{vector} \\
+\hline
+\code{to\_array\_1d} & \code{(int[...] a)} & \code{int[]} \\
+\code{to\_array\_1d} & \code{(matrix m)} & \code{real[]} \\
+\code{to\_array\_1d} & \code{(real[...] a)} & \code{real[]} \\
+\code{to\_array\_1d} & \code{(row\_vector v)} & \code{real[]} \\
+\code{to\_array\_1d} & \code{(vector v)} & \code{real[]} \\
+\hline
+\code{to\_array\_2d} & \code{(matrix m)} & \code{real[,]} \\
+\hline
+\code{to\_matrix} & \code{(int[,] a)} & \code{matrix} \\
+\code{to\_matrix} & \code{(matrix m)} & \code{matrix} \\
+\code{to\_matrix} & \code{(real[,] a)} & \code{matrix} \\
+\code{to\_matrix} & \code{(row\_vector v)} & \code{matrix} \\
+\code{to\_matrix} & \code{(vector v)} & \code{matrix} \\
+\hline
+\code{to\_row\_vector} & \code{(int[] a)} & \code{row\_vector} \\
+\code{to\_row\_vector} & \code{(matrix m)} & \code{row\_vector} \\
+\code{to\_row\_vector} & \code{(real[] a)} & \code{row\_vector} \\
+\code{to\_row\_vector} & \code{(row\_vector v)} & \code{row\_vector} \\
+\code{to\_row\_vector} & \code{(vector v)} & \code{row\_vector} \\
+\hline
+\code{to\_vector} & \code{(int[] a)} & \code{vector} \\
+\code{to\_vector} & \code{(matrix m)} & \code{vector} \\
+\code{to\_vector} & \code{(real[] a)} & \code{vector} \\
+\code{to\_vector} & \code{(row\_vector v)} & \code{vector} \\
+\code{to\_vector} & \code{(vector v)} & \code{vector} \\
+\end{tabular}
+}
+
+\subsection{Linear Algebra Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return} 
+\\ \hline
+\code{cholesky\_decompose} & \code{(matrix A)} & \code{matrix} \\
+\code{determinant} & \code{(matrix A)} & \code{real} \\
+\code{eigenvalues\_sym} & \code{(matrix A)} & \code{vector} \\
+\code{eigenvectors\_sym} & \code{(matrix A)} & \code{matrix} \\
+\code{inverse} & \code{(matrix A)} & \code{matrix} \\
+\code{inverse\_spd} & \code{(matrix A)} & \code{matrix} \\
+\code{log\_determinant} & \code{(matrix A)} & \code{real} \\
+\code{mdivide\_left\_tri\_low} & \code{(matrix A, matrix B)} & \code{matrix} \\
+\code{mdivide\_left\_tri\_low} & \code{(matrix A, vector B)} & \code{vector} \\
+\code{mdivide\_right\_tri\_low} & \code{(matrix B, matrix A)} & \code{matrix} \\
+\code{mdivide\_right\_tri\_low} & \code{(row\_vector B, matrix A)} & \code{row\_vector} \\
+\code{qr\_Q} & \code{(matrix A)} & \code{matrix} \\
+\code{qr\_R} & \code{(matrix A)} & \code{matrix} \\
+\code{singular\_values} & \code{(matrix A)} & \code{vector} \\
+\code{trace} & \code{(matrix A)} & \code{real} \\
+\code{trace\_gen\_quad\_form} & \code{(matrix D,matrix A, matrix B)} & \code{real} \\
+\code{trace\_quad\_form} & \code{(matrix A, matrix B)} & \code{real} \\
+\end{tabular}
+}
+
+\subsection{Probability Functions}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{bernoulli\_ccdf\_log} & \code{(ints y, reals theta)} & \code{real}  \\
+\code{bernoulli\_cdf} & \code{(ints y, reals theta)} & \code{real}  \\
+\code{bernoulli\_cdf\_log} & \code{(ints y, reals theta)} & \code{real}  \\
+\code{bernoulli\_log} & \code{(ints y, reals theta)} & \code{real} \\
+\code{bernoulli\_logit\_log} & \code{(ints y, reals alpha)} & \code{real}  \\
+\hline
+\code{beta\_binomial\_ccdf\_log} & \code{(ints n, ints N, reals alpha, reals beta)} & \code{real} \\
+\code{beta\_binomial\_cdf} & \code{(ints n, ints N, reals alpha, reals beta)} & \code{real} \\
+\code{beta\_binomial\_cdf\_log} & \code{(ints n, ints N, reals alpha, reals beta)} & \code{real} \\
+\code{beta\_binomial\_log} & \code{(ints n, ints N, reals alpha, reals beta)} & \code{real} \\
+\hline
+\code{beta\_ccdf\_log} & \code{(reals theta, reals alpha, reals beta)} & \code{real} \\
+\code{beta\_cdf} & \code{(reals theta, reals alpha, reals beta)} & \code{real} \\
+\code{beta\_cdf\_log} & \code{(reals theta, reals alpha, reals beta)} & \code{real} \\
+\code{beta\_log} & \code{(reals theta, reals alpha, reals beta)} & \code{real} \\
+\hline 
+\code{binomial\_ccdf\_log} & \code{(ints n, ints N, reals theta)} & \code{real} \\
+\code{binomial\_cdf} & \code{(ints n, ints N, reals theta)} & \code{real} \\
+\code{binomial\_cdf\_log} & \code{(ints n, ints N, reals theta)} & \code{real} \\
+\code{binomial\_log} & \code{(ints n, ints N, reals theta)} & \code{real} \\
+\hline
+\code{binomial\_logit\_log} & \code{(ints n, ints N, reals alpha)} & \code{real} \\
+\hline
+\code{categorical\_log} & \code{(ints y, vector theta)} & \code{real} \\
+\hline
+\code{categorical\_logit\_log} & \code{(ints y, vector beta)} & \code{real} \\
+\hline
+\code{cauchy\_ccdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{cauchy\_cdf} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{cauchy\_cdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{cauchy\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\hline
+\code{chi\_square\_ccdf\_log} & \code{(reals y, reals nu)} & \code{real} \\
+\code{chi\_square\_cdf} & \code{(reals y, reals nu)} & \code{real} \\
+\code{chi\_square\_cdf\_log} & \code{(reals y, reals nu)} & \code{real} \\
+\code{chi\_square\_log} & \code{(reals y, reals nu)} & \code{real} \\
+\hline
+\code{dirichlet\_log} & \code{(vector theta, vector alpha)} & \code{real} \\
+\hline
+\code{double\_exponential\_ccdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{double\_exponential\_cdf} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{double\_exponential\_cdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{double\_exponential\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\hline
+\code{exp\_mod\_normal\_ccdf\_log} & \code{(reals y, reals mu,} \\ 
+& \code{\ reals sigma reals lambda)} & \code{real} \\
+\code{exp\_mod\_normal\_cdf} & \code{(reals y, reals mu,} \\
+& \code{\ reals sigma reals lambda)} & \code{real} \\
+\code{exp\_mod\_normal\_cdf\_log} & \code{(reals y, reals mu,} \\
+& \code{\ reals sigma reals lambda)} & \code{real} \\
+\code{exp\_mod\_normal\_log} & \code{(reals y, reals mu,} \\
+& \code{\ reals sigma reals lambda)} & \code{real} \\
+\hline
+\code{exponential\_ccdf\_log} & \code{(reals y, reals beta)} & \code{real} \\
+\code{exponential\_cdf} & \code{(reals y, reals beta)} & \code{real} \\
+\code{exponential\_cdf\_log} & \code{(reals y, reals beta)} & \code{real} \\
+\code{exponential\_log} & \code{(reals y, reals beta)} & \code{real} \\
+\end{tabular}
+}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{frechet\_ccdf\_log} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\code{frechet\_cdf} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\code{frechet\_cdf\_log} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\code{frechet\_log} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\hline
+\code{gamma\_ccdf\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{gamma\_cdf} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{gamma\_cdf\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{gamma\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\hline
+\code{gaussian\_dlm\_obs\_log} & \code{(matrix y, matrix F, matrix G,}
+\\
+& \code{\ matrix V, matrix W, vector m0, matrix C0)} & \code{real} \\
+\code{gaussian\_dlm\_obs\_log} & \code{(matrix y, matrix F, matrix G,} \\
+& \code{\ vector V, matrix W, vector m0, matrix C0)} & \code{real} \\
+\hline
+\code{gumbel\_ccdf\_log} & \code{(reals y, reals mu, reals beta)} & \code{real} \\
+\code{gumbel\_cdf} & \code{(reals y, reals mu, reals beta)} & \code{real} \\
+\code{gumbel\_cdf\_log} & \code{(reals y, reals mu, reals beta)} & \code{real} \\
+\code{gumbel\_log} & \code{(reals y, reals mu, reals beta)} & \code{real} \\
+\hline
+\code{hypergeometric\_log} & \code{(int n, int N, int a, int b)} & \code{real} \\
+\hline
+\code{inv\_chi\_square\_ccdf\_log} & \code{(reals y, reals nu)} & \code{real} \\
+\code{inv\_chi\_square\_cdf} & \code{(reals y, reals nu)} & \code{real} \\
+\code{inv\_chi\_square\_cdf\_log} & \code{(reals y, reals nu)} & \code{real} \\
+\code{inv\_chi\_square\_log} & \code{(reals y, reals nu)} & \code{real} \\
+\hline
+\code{inv\_gamma\_ccdf\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{inv\_gamma\_cdf} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{inv\_gamma\_cdf\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{inv\_gamma\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\hline
+\code{inv\_wishart\_log} & \code{(matrix W, real nu, matrix Sigma)} & \code{real} \\
+\hline
+\code{lkj\_corr\_cholesky\_log} & \code{(matrix L, real eta)} & \code{real} \\
+\code{lkj\_corr\_log} & \code{(matrix y, real eta)} & \code{real} \\
+\hline
+\code{logistic\_ccdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{logistic\_cdf} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{logistic\_cdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{logistic\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\hline
+\code{lognormal\_ccdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{lognormal\_cdf} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{lognormal\_cdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{lognormal\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\end{tabular}
+}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{multi\_gp\_cholesky\_log} & \code{(matrix y, matrix L, vector w)} & \code{real} \\
+\code{multi\_gp\_log} & \code{(matrix y, matrix Sigma, vector w)} & \code{real} \\
+\hline
+\code{multi\_normal\_cholesky\_log} & \code{(row\_vectors y, row\_vectors mu, matrix L)} & \code{real} \\
+\code{multi\_normal\_cholesky\_log} & \code{(row\_vectors y, vectors mu, matrix L)} & \code{real} \\
+\code{multi\_normal\_cholesky\_log} & \code{(vectors y, row\_vectors mu, matrix L)} & \code{real} \\
+\code{multi\_normal\_cholesky\_log} & \code{(vectors y, vectors mu, matrix L)} & \code{real} \\
+\hline
+\code{multi\_normal\_log} & \code{(row\_vectors y, row\_vectors mu, matrix Sigma)} & \code{real} \\
+\code{multi\_normal\_log} & \code{(row\_vectors y, vectors mu, matrix Sigma)} & \code{real} \\
+\code{multi\_normal\_log} & \code{(vectors y, row\_vectors mu, matrix Sigma)} & \code{real} \\
+\code{multi\_normal\_log} & \code{(vectors y, vectors mu, matrix Sigma)} & \code{real} \\
+\hline
+\code{multi\_normal\_prec\_log} & \code{(row\_vectors y, row\_vectors mu, matrix Omega)} & \code{real} \\
+\code{multi\_normal\_prec\_log} & \code{(row\_vectors y, vectors mu, matrix Omega)} & \code{real} \\
+\code{multi\_normal\_prec\_log} & \code{(vectors y, row\_vectors mu, matrix Omega)} & \code{real} \\
+\code{multi\_normal\_prec\_log} & \code{(vectors y, vectors mu, matrix Omega)} & \code{real} \\
+\hline
+\code{multi\_student\_t\_log} & \code{(row\_vectors y, real nu, row\_vectors mu,} \\
+& \code{\ matrix Sigma)} & \code{real} \\
+\code{multi\_student\_t\_log} & \code{(row\_vectors y, real nu, vectors mu,} \\
+& \code{\ matrix Sigma)} & \code{real} \\
+\code{multi\_student\_t\_log} & \code{(vectors y, real nu, row\_vectors mu,} \\
+& \code{\ matrix Sigma)} & \code{real} \\
+\code{multi\_student\_t\_log} & \code{(vectors y, real nu, vectors mu,} \\
+& \code{\ matrix Sigma)} & \code{real} \\
+\hline
+\code{multinomial\_log} & \code{(int[] y, vector theta)} & \code{real} \\
+\hline
+\code{neg\_binomial\_2\_ccdf\_log} & \code{(ints n, reals mu, reals phi)} & \code{real} \\
+\code{neg\_binomial\_2\_cdf} & \code{(ints n, reals mu, reals phi)} & \code{real} \\
+\code{neg\_binomial\_2\_cdf\_log} & \code{(ints n, reals mu, reals phi)} & \code{real} \\
+\code{neg\_binomial\_2\_log} & \code{(ints y, reals mu, reals phi)} & \code{real} \\
+\hline
+\code{neg\_binomial\_2\_log\_log} & \code{(ints y, reals eta, reals phi)} & \code{real} \\
+\hline
+\code{neg\_binomial\_ccdf\_log} & \code{(ints n, reals alpha, reals beta)} & \code{real} \\
+\code{neg\_binomial\_cdf} & \code{(ints n, reals alpha, reals beta)} & \code{real} \\
+\code{neg\_binomial\_cdf\_log} & \code{(ints n, reals alpha, reals beta)} & \code{real} \\
+\code{neg\_binomial\_log} & \code{(ints n, reals alpha, reals beta)} & \code{real} \\
+\hline
+\code{normal\_ccdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{normal\_cdf} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{normal\_cdf\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\code{normal\_log} & \code{(reals y, reals mu, reals sigma)} & \code{real} \\
+\hline
+\code{ordered\_logistic\_log} & \code{(int k, real eta, vector c)} & \code{real} \\
+\hline
+\code{pareto\_ccdf\_log} & \code{(reals y, reals y\_min, reals alpha)} & \code{real} \\
+\code{pareto\_cdf} & \code{(reals y, reals y\_min, reals alpha)} & \code{real} \\
+\code{pareto\_cdf\_log} & \code{(reals y, reals y\_min, reals alpha)} & \code{real} \\
+\code{pareto\_log} & \code{(reals y, reals y\_min, reals alpha)} & \code{real} \\
+\hline
+\code{pareto\_type\_2\_ccdf\_log} & \code{(reals y, reals mu, reals lambda, reals alpha)} & \code{real} \\
+\code{pareto\_type\_2\_cdf} & \code{(reals y, reals mu, reals lambda, reals alpha)} & \code{real} \\
+\code{pareto\_type\_2\_cdf\_log} & \code{(reals y, reals mu, reals lambda, reals alpha)} & \code{real} \\
+\code{pareto\_type\_2\_log} & \code{(reals y, reals mu, reals lambda, reals alpha)} & \code{real} \\
+\end{tabular}
+}
+
+{\footnotesize
+\begin{tabular}{lll}
+{\it function} & {\it arguments} & {\it return}
+\\ \hline
+\code{poisson\_ccdf\_log} & \code{(ints n, reals lambda)} & \code{real} \\
+\code{poisson\_cdf} & \code{(ints n, reals lambda)} & \code{real} \\
+\code{poisson\_cdf\_log} & \code{(ints n, reals lambda)} & \code{real} \\
+\code{poisson\_log} & \code{(ints n, reals lambda)} & \code{real} \\
+\hline
+\code{poisson\_log\_log} & \code{(ints n, reals alpha)} & \code{real} \\
+\hline
+\code{rayleigh\_ccdf\_log} & \code{(real y, real sigma)} & \code{real} \\
+\code{rayleigh\_cdf} & \code{(real y, real sigma)} & \code{real} \\
+\code{rayleigh\_cdf\_log} & \code{(real y, real sigma)} & \code{real} \\
+\code{rayleigh\_log} & \code{(reals y, reals sigma)} & \code{real} \\
+\hline
+\code{scaled\_inv\_chi\_square\_ccdf\_log} & \code{(reals y, reals nu, reals sigma)} & \code{real} \\
+\code{scaled\_inv\_chi\_square\_cdf} & \code{(reals y, reals nu, reals sigma)} & \code{real} \\
+\code{scaled\_inv\_chi\_square\_cdf\_log} & \code{(reals y, reals nu, reals sigma)} & \code{real} \\
+\code{scaled\_inv\_chi\_square\_log} & \code{(reals y, reals nu, reals sigma)} & \code{real} \\
+\hline
+\code{skew\_normal\_ccdf\_log} & \code{(reals y, reals mu, reals sigma,} \\
+& \code{\ reals alpha)} & \code{real} \\
+\code{skew\_normal\_cdf} & \code{(reals y, reals mu, reals sigma,} \\
+\code{\ reals alpha)} & \code{real} \\
+\code{skew\_normal\_cdf\_log} & \code{(reals y, reals mu, reals sigma,} \\
+& \code{\ reals alpha)} & \code{real} \\
+\code{skew\_normal\_log} & \code{(reals y, reals mu, reals sigma,} \\
+& \code{\ reals alpha)} & \code{real} \\
+\hline
+\code{student\_t\_ccdf\_log} & \code{(reals y, reals nu, reals mu,} \\
+& \code{\ reals sigma)} & \code{real} \\
+\code{student\_t\_cdf} & \code{(reals y, reals nu, reals mu,} \\
+& \code{\ reals sigma)} & \code{real} \\
+\code{student\_t\_cdf\_log} & \code{(reals y, reals nu, reals mu,} \\
+& \code{\ reals sigma)} & \code{real} \\
+\code{student\_t\_log} & \code{(reals y, reals nu, reals mu,} \\
+& \code{\ reals sigma)} & \code{real} \\
+\hline
+\code{uniform\_ccdf\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{uniform\_cdf} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{uniform\_cdf\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\code{uniform\_log} & \code{(reals y, reals alpha, reals beta)} & \code{real} \\
+\hline
+\code{von\_mises\_log} & \code{(reals y, reals mu, reals kappa)} & \code{real} \\
+\hline
+\code{weibull\_ccdf\_log} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\code{weibull\_cdf} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\code{weibull\_cdf\_log} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\code{weibull\_log} & \code{(reals y, reals alpha, reals sigma)} & \code{real} \\
+\hline
+\code{wiener\_log} & \code{(reals y, reals alpha, reals tau,} 
+\\
+& \code{\ reals beta, reals delta)} & \code{real}
+\\
+\hline
+\code{wishart\_log} & \code{(matrix W, real nu, matrix Sigma)} & \code{real} \\
+\end{tabular}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\clearpage
+
+\bibliographystyle{apalike}
+\bibliography{../../bibtex/all}
+
+
+\end{document}

@@ -1,0 +1,1405 @@
+
+
+\documentclass[final]{cvpr}
+
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{amsthm}
+\usepackage{bm}
+\usepackage{fixmath}
+\usepackage{booktabs}
+\usepackage{xspace}
+\usepackage{tabularx}
+\usepackage{cases}
+\usepackage{subfigure}
+\usepackage{indentfirst}
+\usepackage{multirow}
+\usepackage{boldline}
+\usepackage{enumitem}
+\usepackage{mathrsfs}
+\usepackage{algorithmic}
+\usepackage[table]{xcolor}
+\usepackage{pifont}
+
+
+
+\usepackage[pagebackref=true,breaklinks=true,colorlinks,bookmarks=false]{hyperref}
+\usepackage{url}
+
+
+\def\cvprPaperID{5629} \def\confYear{CVPR 2021}
+
+
+\renewcommand{\vec}[1]{\boldsymbol{#1}}
+\newcommand{\mat}[1]{\boldsymbol{#1}}
+
+\newcommand{\ournet}{MoViNet\xspace} \newcommand{\ournets}{\ournet{}s\xspace}
+\newcommand{\ournas}{MoViNAS\xspace}
+
+\newcommand{\bg}[1]{\textcolor{blue}{BG: #1}}
+\newcommand{\lzyuan}[1]{\textcolor{green}{LY: #1}}
+\newcommand{\zhl}[1]{\textcolor{magenta}{ZHL: #1}}
+\newcommand{\yl}[1]{\textcolor{purple}{YL: #1}}
+\newcommand{\dk}[1]{\textcolor{cyan}{DK: #1}}
+\newcommand{\todo}[1]{\textcolor{red}{TODO: #1}}
+
+\newcommand{\eat}[1]{}
+
+\newcommand{\appendixsearchspace}{\ref{appendix:search-space}}
+\newcommand{\appendixarchitectures}{\ref{appendix:architectures}}
+\newcommand{\appendixmoreresults}{\ref{appendix:more-results}}
+
+\setlength{\tabcolsep}{2pt}
+
+
+\begin{document}
+
+\title{\ournets: Mobile Video Networks for Efficient Video Recognition}
+
+\author{
+    Dan Kondratyuk\thanks{Work done as a part of the Google AI Residency.},
+    Liangzhe Yuan,
+    Yandong Li,
+    Li Zhang,
+    Mingxing Tan,
+    Matthew Brown,
+    Boqing Gong\\
+    Google Research\\
+    {\tt\small \{dankondratyuk,lzyuan,yandongli,zhl,tanmingxing,mtbr,bgong\}@google.com}
+}
+
+
+\maketitle
+
+
+\begin{abstract}
+    We present Mobile Video Networks (\ournets), a family of computation and memory efficient video networks that can operate on streaming video for online inference.
+    3D convolutional neural networks (CNNs) are accurate at video recognition but require large computation and memory budgets and do not support online inference, making them difficult to work on mobile devices.
+We propose a three-step approach to improve computational efficiency while substantially reducing the peak memory usage of 3D CNNs.
+    First, we design a video network search space and employ neural architecture search to generate efficient and diverse 3D CNN architectures.
+    Second, we introduce the Stream Buffer technique that decouples memory from video clip duration, allowing 3D CNNs to embed arbitrary-length streaming video sequences for both training and inference with a small constant memory footprint.
+    Third, we propose a simple ensembling technique to improve accuracy further without sacrificing efficiency.
+    These three progressive techniques allow \ournets to achieve state-of-the-art accuracy and efficiency on the Kinetics, Moments in Time, and Charades video action recognition datasets.
+    For instance, \ournet-A5-Stream achieves the same accuracy as X3D-XL on Kinetics 600 while requiring 80\% fewer FLOPs and 65\% less memory.
+    Code will be made available at \url{https://github.com/tensorflow/models/tree/master/official/vision}.
+\end{abstract}
+
+
+\vspace{-12pt}
+\section{Introduction} \label{sec:intro}
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=1.0\linewidth]{images/movinet_k600_flops_comparison_v5.pdf}
+    \end{center}
+        \vspace{-5pt}
+        \caption{
+            {\bf Accuracy vs. FLOPs and Memory on Kinetics 600}.
+            \ournets are more accurate than 2D networks and more efficient than 3D networks.
+            Top (log scale): \ournet-A2 achieves {\bf 6\% higher} accuracy than MobileNetV3~\cite{howard2019searching} at the same FLOPs while \ournet-A6 achieves state-of-the-art 83.5\% accuracy being {\bf 5.1x faster} than X3D-XL~\cite{feichtenhofer2020x3d}.
+            Bottom: Streaming \ournets require {\bf 10x less memory} at the cost of 1\% accuracy.
+            Note that we only train on the ~93\% of Kinetics 600 examples that are available at the time of writing.
+            Best viewed in color.
+        }
+        \vspace{-12pt}
+    \label{fig:k600-comparison}
+\end{figure}
+
+Efficient video recognition models are opening up new opportunities for mobile camera, IoT, and self-driving applications where efficient and accurate on-device processing is paramount.
+Despite recent advances in deep video modeling, it remains difficult to find models that run on mobile devices and achieve high video recognition accuracy.
+On the one hand, 3D convolutional neural networks (CNNs)~\cite{tran2018closer, wang2018non, feichtenhofer2019slowfast, feichtenhofer2020x3d, ryoo2019assemblenet} offer state-of-the-art accuracy, but consume copious amounts of memory and computation.
+On the other hand, 2D CNNs~\cite{lin2019tsm, zhu2020faster} require far fewer resources suitable for mobile and can run online using frame-by-frame prediction, but fall short in accuracy.
+
+Many operations that make 3D video networks accurate (e.g., temporal convolution, non-local blocks~\cite{wang2018non}, etc.) require all input frames to be processed at once, limiting the opportunity for accurate models to be deployed on mobile devices.
+The recently proposed X3D networks~\cite{feichtenhofer2020x3d} provide a significant effort to increase the efficiency of 3D CNNs.
+However, they require large memory resources on large temporal windows which incur high costs, or small temporal windows which reduce accuracy.
+Other works aim to improve 2D CNNs' accuracy using temporal aggregation~\cite{lin2019tsm, fan2019more, wu2020dynamic, liu2020tam, fan2020rubiksnet}, however their limited inter-frame interactions reduce these models' abilities to adequately model long-range temporal dependencies like 3D CNNs.
+
+This paper introduces {\it three progressive steps} to design efficient video models which we use to produce Mobile Video Networks ({\bf \ournets}), a family of memory and computation efficient 3D CNNs.
+
+
+\begin{enumerate}
+    \item We first define a {\bf \ournet search space} to allow Neural Architecture Search (NAS) to efficiently trade-off spatiotemporal feature representations.
+    \item We then introduce {\bf Stream Buffers} for \ournets, which process videos in small consecutive subclips, requiring constant memory without sacrificing long temporal dependencies, and which enable online inference.
+    \item Finally, we create {\bf Temporal Ensembles} of streaming \ournets, regaining the slightly lost accuracy from the stream buffers.
+\end{enumerate}
+
+First, we design the \ournet search space to explore how to mix spatial, temporal, and spatiotemporal operations such that NAS can find optimal feature combinations to trade-off efficiency and accuracy.
+Figure~\ref{fig:k600-comparison} visualizes the efficiency of the generated \ournets.
+\ournet-A0 achieves similar accuracy to MobileNetV3-large+TSM~\cite{howard2019searching, lin2019tsm} on Kinetics 600~\cite{kay2017kinetics} with 75\% fewer FLOPs.
+\ournet-A6 achieves state-of-the-art 83.5\% accuracy, 1.6\% higher than X3D-XL~\cite{feichtenhofer2020x3d}, requiring 60\% fewer FLOPs.
+
+Second, we create streaming \ournets by introducing the stream buffer to reduce memory usage from linear to constant in the number of input frames for both training and inference, allowing \ournets to run with substantially fewer memory bottlenecks.
+E.g., the stream buffer reduces \ournet-A5's memory usage by 90\%.
+In contrast to traditional multi-clip evaluation (test-time data augmentation) approaches~\cite{simonyan2014two, wang2015towards} which also reduce memory, a stream buffer carries over temporal dependencies between consecutive non-overlapping subclips by caching feature maps at subclip boundaries.
+The stream buffer allows for a larger class of operations to enhance online temporal modeling than the recently proposed temporal shift~\cite{lin2019tsm}.
+We equip the stream buffer with temporally unidirectional causal operations like causal convolution~\cite{oord2016wavenet}, cumulative pooling, and causal squeeze-and-excitation~\cite{hu2018squeeze} with positional encoding to force temporal receptive fields to look only into past frames, enabling \ournets to operate incrementally on streaming video for online inference.
+However, the causal operations come at a small cost, reducing accuracy on Kinetics 600 by 1\% on average.
+
+Third, we temporally ensemble \ournets, showing that they are more accurate than single large networks while achieving the same efficiency.
+We train two streaming \ournets independently with the same total FLOPs as a single model and average their logits.
+This simple technique gains back the loss in accuracy when using stream buffers.
+
+Taken together, these three techniques create \ournets that are high in accuracy, low in memory usage, efficient in computation, and support online inference.
+We search for \ournets using the Kinetics 600 dataset~\cite{carreira2018short} and test them extensively on Kinetics 400~\cite{kay2017kinetics}, Kinetics 700~\cite{carreira2019short}, Moments in Time~\cite{monfort2019moments}, Charades~\cite{sigurdsson2016hollywood}, and Something-Something~V2~\cite{goyal2017something}.
+ 
+\section{Related Work} \label{sec:related-work}
+\paragraph{Efficient Video Modeling.}
+
+Deep neural networks have made remarkable progress for video understanding~\cite{ji20123d,simonyan2014two,tran2015learning, wang2016temporal,carreira2017quo, wang2018non,qiu2019learning,feichtenhofer2020x3d,feichtenhofer2019slowfast}.
+They extend 2D image models with a temporal dimension, most notably incorporating 3D convolution~\cite{ji20123d,taylor2010convolutional,tran2015learning,xie2017rethinking,hara2018can,qiu2017learning,jiang2019stm,ryoo2019assemblenet}.
+
+
+Improving the efficiency of video models has gained increased attention~\cite{feichtenhofer2019slowfast,tran2019video,feichtenhofer2017spatiotemporal,feichtenhofer2020x3d,lin2019tsm,fan2019more,bhardwaj2019efficient,chen2018big,li2020smallbignet,piergiovanni2020tiny}.
+Some works explore the use of 2D networks for video recognition by processing videos in smaller segments followed by late fusion~\cite{karpathy2014large,donahue2015long,yue2015beyond,wang2016temporal,feichtenhofer2017spatiotemporal,sun2017lattice,li2018recurrent,li2018videolstm,wang2018non,zhou2018temporal,zhu2020faster}. 
+The Temporal Shift Module~\cite{lin2019tsm} uses early fusion to shift a portion of channels along the temporal axis, boosting accuracy while supporting online inference.
+
+
+
+
+\vspace{-12pt}
+\paragraph{Causal Modeling.}
+WaveNet~\cite{oord2016wavenet} introduces causal convolution, where the receptive field of a stack of 1D convolutions only extends to features up to the current time step.
+We take inspiration from other works using causal convolutions~\cite{carreira2018massively,chang2018temporal,dai2019transformer,cheng2019sparse,daiya2020stock} to design stream buffers for online video model inference, allowing frame-by-frame predictions with 3D kernels.
+
+
+\vspace{-12pt}
+\paragraph{Multi-Objective NAS.}
+The use of NAS~\cite{zoph2016neural,liu2018progressive,pham2018efficient,tan2019mnasnet,cai2018proxylessnas,kandasamy2018neural} with multi-objective architecture search has also grown in interest, producing more efficient models in the process for image recognition~\cite{tan2019mnasnet, cai2018proxylessnas, bender2020can} and video recognition~\cite{piergiovanni2020tiny, ryoo2019assemblenet}.
+We make use of TuNAS~\cite{bender2020can}, a one-shot NAS framework which uses aggressive weight sharing that is well-suited for computation intensive video models.
+
+\vspace{-12pt}
+\paragraph{Efficient Ensembles.}
+Deep ensembles are widely used in classification challenges to boost the performance of CNNs~\cite{bian2017revisiting,simonyan2014very,Szegedy_2015_CVPR,he2016deep}.
+More recent results indicate that deep ensembles of small models can be more efficient than single large models on image classification~\cite{kondratyuk2020ensembling,lobacheva2020power,NIPS2016_c51ce410, NIPS2016_20d135f0,furlanello2018born}, and we extend these findings to video classification.
+ 
+\section{Mobile Video Networks (\ournets)} \label{sec:approach}
+
+This section describes our progressive three-step approach to \ournets.
+We first detail the design space to search for \ournets.
+Then we define the stream buffer and explain how it reduces the networks' memory footprints, followed by the temporal ensembling to improve accuracy.
+
+\subsection{Searching for \ournet} \label{sec:nas}
+Following the practice of 2D mobile network search~\cite{tan2019mnasnet, tan2019efficientnet}, we start with the TuNAS framework~\cite{bender2020can}, which is a scalable implementation of one-shot NAS with weight sharing on a supernetwork of candidate models, and repurpose it for 3D CNNs for video recognition.
+We use Kinetics 600~\cite{kay2017kinetics} as the video dataset to search over for all of our models, consisting of 10-second video sequences each at 25fps for a total of 250 frames.
+
+\begin{table}[t]
+    \footnotesize
+\newcommand{\blocks}[3]{
+        \multirow{3}{*}{
+            -.1em] 
+                \text{13, #2}\#3
+        }
+    }
+    \newcommand{\blocket}[4]{\multirow{3}{*}{-.1em] \text{3, #2}\#4}
+    }
+    \newcommand{\blockt}[3]{\multirow{3}{*}{-.1em] \text{13, #2}\#3}
+    }
+    \newcommand{\blockseq}[3]{\text{#1#2, #3}\\left[
+                \begin{array}{c}
+                    \blockseq{{}}{{}}{{, }}
+                \end{array}
+                \right]\times L_nT\times \frac{S^\text{2}}{2^n}_{n+1}1\times1^\text{2}c_{n+1}^\text{base}T\times \frac{S^\text{2}}{2^n}_{n+2}T\times \frac{S^\text{2}}{2^n}1\times1^\text{2}_{n+3}1\times1^\text{2}c_{n+3}^\text{base}1\times1^\text{2}_{n+4}1\times1^\text{2}1\times1^\text{2}TS^\text{2}ic_i^{\text{base}}L_ic_i^{\text{expand}}k_{i}^{\text{time}}\times(k_{i}^{\text{space}})^2 \in \{1, 3, 5, 7\} \times \{1, 3, 5, 7\}^2T \times S^2 = 50 \times 224^2\tau = 5c^{\text{base}}L \leq 10\{0.75, 1, 1.25\}n = 57^2\{16, 24, 48, 96, 96, 192\}5122048k^{\text{time}}\times(k^{\text{space}})^2c^{\text{expand}}\{1.5, 2.0, 2.5, 3.0, 3.5, 4.0\}c^{\text{base}}c^{\text{base}}c^{\text{expand}}S^2\tauc^{\text{base}}L\vec{x}TnT^{\text{clip}} < TO(T^{\text{clip}})\vec{x}_{i}^{\text{clip}}i < nnT^\text{clip}Bb\vec{x}_{i}^{\text{clip}}F_{i}\oplusf[-b:]bO(b + T^{\text{clip}})Tnb = 1fB_t = \vec{x}_{t-1}\vec{x}_{t}t\vec{x}_i^{\text{clip}}kb = k - 1k = 3b = 2T'\vec{x}T't\operatorname{CGAP}(\vec{x}, t)nT = nT^{\text{clip}}nT^{\text{clip}}T^{\text{clip}} \in \{8, 16, 32\}T^{\text{clip}} = 1224^230\times4\tau\times^2\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times\times^\text{2}\times^\text{2}\times^\text{2}\left[\begin{array}{c}\text{11, #1}\\times^\text{2}\times^\text{2}\left[\begin{array}{c}\text{\underline{31}, #2}\-.1em] \text{11, #1}\end{array}\right]-.1em]}
+
+    \begin{center}
+    \resizebox{0.7\columnwidth}{!}{\begin{tabularx}{1.0 \columnwidth}{@{}Xcl@{}}
+        \toprule
+        \sc Stage & \sc Operation & \sc Output size \\
+        \midrule
+        data & stride 5, RGB &  \\
+        conv & \multicolumn{1}{c}{, {16}}
+        &  \\
+        \midrule
+block & \multirow{3}{*}{
+            } & 
+            \multirow{3}{*}{}  \\
+&  & \\
+        &  & \\
+        block & \multirow{5}{*}{
+            } & 
+            \multirow{5}{*}{}  \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+        block & \multirow{5}{*}{
+            } & 
+            \multirow{5}{*}{}  \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+        block & \multirow{6}{*}{
+            } & 
+            \multirow{6}{*}{}  \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+        block & \multirow{7}{*}{
+            } & 
+            \multirow{7}{*}{}  \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+        &  & \\
+\midrule
+        conv & \multicolumn{1}{c}{, {640}}
+        &  \\
+        pool & \multicolumn{1}{c}{}
+        &  \\
+        dense & \multicolumn{1}{c}{, {2048}}
+        &  \\
+        dense & \multicolumn{1}{c}{, {600}}
+        &  \\
+        \bottomrule
+    \end{tabularx}
+}
+    \end{center}
+    \vspace{-5pt}
+    \caption{
+        {\bf \ournet-A2 Architecture} searched by TuNAS, running 50 frames on Kinetics 600.
+        See Table~\ref{table:nas-ssd} for the search space definition detailing the meaning of each component.
+    }
+    \label{table:a2-architecture}
+    \vspace{-10pt}
+\end{table}
+
+
+\vspace{-10pt}
+\paragraph{\ournet Architectures.}
+We provide the architecture description of \ournet-A2 in Table~\ref{table:a2-architecture} --- Appendix~\appendixarchitectures has the detailed architectures of other \ournets.
+Most notably, the network prefers large bottleneck width multipliers in the range [2.5, 3.5], often expanding or shrinking them after each layer.
+In contrast, X3D-M with similar compute requirements has a wider base feature width with a smaller constant bottleneck multiplier of 2.25.
+The searched network prefers balanced 3x3x3 kernels, except at the first downsampling layers in the later blocks, which have 5x3x3 kernels.
+The final stage almost exclusively uses spatial kernels of size 1x5x5, indicating that high-level features for classification benefit from mostly spatial features.
+This comes at a contrast to S3D~\cite{xie2018rethinking}, which reports improved efficiency when using 2D convolutions at lower layers and 3D convolutions at higher layers.
+
+
+
+
+\vspace{-10pt}
+\subsubsection{Hardware Benchmark}
+
+\ournets A0, A1, and A2 represent the fastest models that would most realistically be used on mobile devices.
+We compare them with MobileNetV3 in Figure~\ref{fig:x86-comparison} with respect to both FLOPs and real-time latency on an x86 Intel Xeon W-2135 CPU at 3.70GHz.
+These models are comparable in per-frame computation cost, as we evaluate on 50 frames for all models.
+From these results we can conclude that streaming \ournets can run faster on CPU while being more accurate at the same time, even with temporal modifications like TSM.
+While there is a discrepancy between FLOPs and latency, searching over a latency target explicitly in NAS can reduce this effect.
+However, we still see that FLOPs is a reasonable proxy metric for CPU latency, which would translate well for mobile devices.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{images/movinet_k600_x86_flops_latency_comparison_v2.pdf}
+    \caption{
+        {\bf CPU Latency Comparison} on Kinetics 600.
+        We compare the efficiency of \ournets  (A0, A1, A2) vs. MobileNetV3~\cite{howard2019searching} using FLOPs and benchmarked latency on an x86 Xeon CPU at 3.70GHz.
+    }
+    \label{fig:x86-comparison}
+\end{figure}
+
+\begin{table}[t]
+    \begin{center}
+    \newcommand{\ck}{\checkmark}
+    \newcommand{\xmark}{\ding{55}}
+\resizebox{250pt}{!}{\begin{tabular}{@{}lcrrr@{}}
+\toprule
+        \sc Model & \sc Streaming & \sc Video (ms) & \sc Frame (ms) & \sc Top-1 \\
+    \midrule
+        MoViNet-A0-Stream & \ck & 183 & 3.7 & 70.3 \\
+        MoViNet-A1-Stream & \ck & 315 & 6.3 & 75.6 \\
+        MoViNet-A2-Stream & \ck & 325 & 6.5 & 76.5 \\
+        MoViNet-A3-Stream & \ck & 1110 & 9.2 & 79.6 \\
+        MoViNet-A4-Stream & \ck & 1130 & 14.1 & 80.5 \\
+        MoViNet-A5-Stream & \ck & 2310 & 19.2 & 82.0 \\
+    \midrule
+        MobileNetV3-S* & \ck & 68 & 1.4 & 61.3 \\
+        MobileNetV3-L* & \ck & 81 & 1.6 & 68.1 \\
+    \midrule
+        X3D-M* (Single Clip) & \xmark  & 345 & 6.9 & 76.9 \\
+        X3D-XL* (Single Clip) & \xmark & 943 & 18.9 & 80.3 \\
+\bottomrule
+    \end{tabular}
+    }
+    \end{center}
+    \caption{
+        {\bf Runtime on an Nvidia V100 GPU on Kinetics 600}. Latency is given for the entire video clip and per frame in ms. * denotes reproduced models.
+    }
+    \label{table:runtime-v100-comparison}
+    \vspace{-10pt}
+\end{table}
+
+We also show benchmarks for \ournets running on an Nvidia V100 GPU in Table~\ref{table:runtime-v100-comparison}.
+Similar to mobile CPU, our streaming model latency is comparable to single-clip X3D models.
+However, we do note that MobileNetV3 can run faster than our networks on GPU, showing that the FLOPs metric for NAS has its limitations.
+\ournets can be made more efficient by targeting real hardware instead of FLOPs, which we leave for future work.
+
+%
+ 
+\vspace{-2pt}
+\section{Conclusion} \label{sec:conclusion}
+\vspace{-2pt}
+\ournets provide a highly efficient set of models that transfer well across different video recognition datasets.
+Coupled with stream buffers, \ournets significantly reduce training and inference memory cost while also supporting online inference on streaming video.
+We hope our approach to designing \ournets can provide improvements to future and existing models, reducing memory and computation costs in the process. 
+ 
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{efficient_video}
+}
+
+\newpage
+\section*{Appendices} \label{sec:appendix}
+\addcontentsline{toc}{section}{Appendix}
+\renewcommand{\thesubsection}{\Alph{subsection}}
+
+We supplement the main text by the following materials. 
+\begin{itemize}
+    \item {\bf Appendix~\ref{appendix:search-space}} provides more details of the search space, the technique to scale the search space, and the search algorithm.
+    \item {\bf Appendix~\ref{appendix:architectures}} is about the neural architectures of \ournets A0-A7. 
+    \item {\bf Appendix~\ref{appendix:more-results}} reports additional results on the datasets studied in the main text along with ablation studies.
+\end{itemize}
+
+
+
+
+
+\subsection{\ournet Architecture Search} \label{appendix:search-space}
+
+
+
+
+
+
+
+
+
+
+\subsubsection{Scaling Algorithm for the Search Space}
+
+To produce models that scale well, we progressively expand the search space across width, depth, input resolution, and frame rate, like EfficientNet~\cite{tan2019efficientnet}.
+Specifically, we use a single scaling parameter  to define the size of our search space.
+Then we define the following coefficients:
+
+such that .
+This will ensure that an increase in  by 1 will multiply the average model size in the search space by 4.
+Here we use a multiplier of 4 (instead of 2) to spread out our search spaces so that we can run the same search space with multiple efficiency targets and sample our desired target model size from it.
+
+As a result, our parameters for a given search space is the following:
+
+We round each of the above parameters to the nearest multiple of 8.
+If , this forms the base search space for \ournet-A2.
+Note that  is defined relative to , so we do not need coefficients for it.
+
+We found coefficients  using a random search over these parameters.
+More specifically, we select values in the range  at increments of 0.05 to represent possible values of the coefficients.
+We ensure that the choice of coefficients is such that , where the initial computation target for each frame is 300 MFLOPs.
+For each combination, we scale the search space by the coefficients where , and randomly sample three architectures from each search space.
+We train models for a selected search space for 10 epochs, averaging the results of the accuracy for that search space.
+Then we select the coefficients that maximize the resulting accuracy.
+Instead of selecting a single set of coefficients, we average the top 5 candidates to produce the final coefficients.
+While the sample size of models is small and would be prone to noise, we find that the small averages work well in practice.
+
+
+
+\subsubsection{Search Algorithm}
+
+During search, we train a one-shot model using TuNAS~\cite{bender2020can} that overlaps all possible architectures into a hypernetwork.
+At every step during optimization, we alternate between learning the network weights and learning a policy  which we use to randomly sample a path through the hypernetwork to produce an initially random network architecture.
+ is learned using REINFORCE~\cite{williams1992simple}, optimized on the quality of sampled architectures, defined as the absolute reward consisting of the sampled network's accuracy and cost.
+At each stage, the RL controller must choose a single categorical decision to select an architectural component.
+The network architecture is a result of binding a value to each decision.
+For example, the decision might choose between a spatial 1x3x3 convolution and a temporal 5x1x1 convolution.
+We use FLOPs as the cost metric for architecture search, and use Kinetics 600 as the dataset to optimize for efficient video networks. During search, we obtain validation set accuracies on a held-out subset of the Kinetics 600 training set, training for a total of 90 epochs.
+
+
+The addition of SE~\cite{hu2018squeeze} to our search space increases FLOPs by such a small amount (\%) that the search enables it for all layers.
+SE plays a similar role as the feature gating in S3D-G~\cite{xie2017rethinking}, except with a nonlinear squeeze inside the projection operation.
+
+
+
+\subsubsection{Stream Buffers for NAS}
+We apply the stream buffers to \ournets as a separate step after NAS in the main text.
+We can also leverage them for NAS to reduce memory usage during search.
+Memory poses one of the biggest challenges for NAS, as models are forced to use a limited number of frames and small batch sizes to be able to keep the models in memory during optimization.
+While this does not prevent us from performing search outright, it requires the use of accelerators with very high memory requirements, requiring a high cost of entry.
+To circumvent this, we can use stream buffers with a small clip size to reduce memory. 
+As a result, we can increase the total embedded frames and increase the batch size to provide better model accuracy estimation while running NAS.
+Table~\ref{table:nas-stream} provides an example of an experiment where the use of a stream buffer can reduce memory requirements in this manner.
+Using a stream buffer, we can reduce the input size from a single clip of 16 frames to 2 clips of 8 frames each, and double the batch size.
+This results in a relatively modest increase in memory, compared to not using the buffer where we can run into out-of-memory (OOM) issues.
+
+We note that the values of  in each layer influences the memory consumption of the model.
+This is dependent entirely on the temporal kernel width of the 3D convolution.
+If , then we only need to cache the last 4 frames. 
+ could be larger, but but it will result in extra frames we will discard, so we set it to the smallest value to conserve memory.
+Therefore, it is not necessary to specify it directly with NAS, as NAS is only concerned with the kernel sizes.
+However, we can add an objective to NAS to minimize memory usage, which will apply pressure to reduce the temporal kernel widths and therefore will indirectly affect the value of  in each layer. 
+Reducing memory consumption even further by keeping kernel sizes can be explored in future work.
+
+
+
+\begin{table}[tbp]
+    \newcommand{\frameinput}[2]{#1#2}
+    \footnotesize
+    \begin{center}
+    \begin{tabularx}{\columnwidth}{@{}Xrrrrrr@{}}
+    \toprule
+        \sc Config & \sc Full Input & \sc Batch Size & Memory & \sc Top-1 \\
+    \midrule
+        No Buffer & \frameinput{16}{172} & 8 & 5.8 GB & 55.9  \\
+        Buffer (8 frames) & \frameinput{16}{172} & 16 & 6.6 GB & 58.5 \\
+        No Buffer & \frameinput{16}{172} & 16 & 10.4 GB & OOM  \\
+    \bottomrule
+    \end{tabularx}
+    \end{center}
+    \caption{
+        {\bf Effect of Stream Buffer on NAS (Kinetics 600)}.
+        We measure the effect of NAS on \ournet-A0 when using a stream buffer vs. without on the same input.
+        By embedding half the input at a time, we can double the batch size to improve the average NAS held-out accuracy without significantly increasing GPU memory per device.
+    }
+    \label{table:nas-stream}
+\end{table}
+
+
+\subsection{Architectures of \ournets} \label{appendix:architectures}
+
+
+
+
+
+
+
+
+
+
+
+
+See Tables~\ref{table:a0-architecture-appendix}, \ref{table:a1-architecture-appendix}, \ref{table:a2-architecture-appendix}, \ref{table:a3-architecture-appendix}, \ref{table:a4-architecture-appendix}, and \ref{table:a5-architecture-appendix} for the architecture definitions of \ournet A0-A5 (we move the tables to the final pages of the Appendices to reduce clutter).
+For \ournet-A6, we ensemble architectures A4 and A5 using the strategy described in the main text, i.e., we train both models independently and apply an arithmetic mean on the logits during inference.
+All layers of all models have SE layers enabled, so we remove this search hyperparameter from all tables for brevity.
+
+
+
+\subsubsection{More Details of the Architectures and Training}
+
+We apply additional changes to our architectures and model training to improve performance even further.
+To improve convergence speed in searching and training we use ReZero \cite{bachlechner2020rezero} by applying zero-initialized learnable scalar weights that are multiplied with features before the final sum in a residual block.
+We also apply skip connections that are traditionally used in ResNets, adding a 1x1x1 convolution in the first layer of each block which may change the base channels or downsample the input.
+However, we modify this to be similar to ResNet-D \cite{he2019bag} where we apply 1x3x3 spatial average pooling before the convolution to improve feature representations.
+
+
+We apply Polyak averaging \cite{polyak1992acceleration} to the weights after every optimization step, using an Exponential Moving Average (EMA) with decay 0.99.
+We adopt the Hard Swish activation function, which is a variant of SiLU/Swish \cite{elfwing2018sigmoid, ramachandran2017searching} proposed by MobileNetV3 \cite{howard2019searching} that is friendlier to quantization and CPU inference. We use the RMSProp optimizer with momentum 0.9 and a base learning rate of 1.8. 
+We train for 240 epochs with a batch size of 1024 with synchronized batch normalization on all datasets and decay the learning rate using a cosine learning rate schedule~\cite{loshchilov2016sgdr} with a linear warm-up of 5 epochs.
+
+We use a softmax cross-entropy loss with label smoothing 0.1 during training, except for Charades where we apply sigmoid cross-entropy to handle the multiple-class labels per video.
+For Charades, we aggregate predictions across frames similar to AssembleNet~\cite{ryoo2019assemblenet}, where we apply a softmax across frames before applying temporal global average pooling to find multiple action classes that may occur in different frames.
+
+Some works also expand the resolution for inference. For instance, X3D-M trains with a  resolution while evaluating  when using spatial crops.
+We evaluate all of our models on the same resolution as training to make sure the FLOPs per frame during inference is unchanged from training.
+
+Our choice of frame-rates can vary from model to model, providing different optimality depending on the architecture.
+We plot the accuracy of training various \ournets on Kinetics 600 with different frame-rates in Figure~\ref{fig:frame-rate}.
+Most models have good efficiency at 50 frames (5fps) or 80 frames (8fps) per video.
+However, we can see \ournet-A4 benefits from a higher frame-rate of 12fps.
+For Charades, we use 64 frames at 6fps for both training and inference.
+
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=1.0\linewidth]{images/movinet_k600_frame_stride_comparison.pdf}
+    \end{center}
+    \caption{
+        {\bf Effect of Frame-Rate on Efficiency} on Kinetics 600.
+        We train and evaluate each model with 50, 80, and 120 frames at 5fps, 8fps, and 12fps respectively.
+    }
+    \label{fig:frame-rate}
+\end{figure}
+
+
+\subsection{More Implementation Details and  Experiments}  \label{appendix:more-results}
+
+
+\subsubsection{Implementing Causal Convolution by Padding}
+
+To make a temporal convolution operation causal, we can apply a simple padding trick which shifts the receptive field forward such that the convolutional kernel is centered at the frame furthest into the future.
+Figure~\ref{fig:causal-conv} illustrates this effect.
+With a normal 3D convolution operation with kernel size  and stride , the padding with respect to dimension  is given as:
+
+where  are the left and right padding amounts respectively.
+For causal convolutions, we transform  as:
+
+such that the effective temporal receptive field of a voxel at time position  only spans .
+
+
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=0.8\linewidth]{images/causal_conv.png}
+    \end{center}
+        \caption{
+            {\bf Standard Convolution vs. Causal Convolution}. The figure illustrates the effective receptive field along a sequence of frames.
+            The temporal kernel size is 3, with padding shown in white.
+            Causal convolution can be performed efficiently by padding only on one side of the time axis thus to force the output causality.
+}
+    \label{fig:causal-conv}
+\end{figure}
+
+
+
+\subsubsection{Additional Details of Datasets}
+
+We note that for all the Kinetics datasets are gradually shrinking over time due to videos being taken offline, making it difficult to compare against less recent works.
+We report on the most recently available videos.
+While putting our work at a disadvantage compared to previous work, we wish to make comparisons more fair for future work.
+Nevertheless, we report the numbers as-is and report the reduction of examples in the datasets in Table~\ref{table:kinetics-num-examples}.
+
+We report full results of all models in the following tables: Table~\ref{table:k400-comparison} for Kinetics 400, Table~\ref{table:k600-comparison-extra} for Kinetics 600 (with top-5 accuracy), Table~\ref{table:k700-comparison} for Kinetics 700, Table~\ref{table:mit-comparison} for Moments in Time, Table~\ref{table:charades-comparison} for Charades, Table~\ref{table:ssv2-comparison} for Something-Something V2, and Table~\ref{table:epic100-comparison} for Epic Kitchens 100.
+For a table of results on Kinetics 600, see Table~\ref{table:k600-comparison-extra} and also the main text.
+
+\begin{table}[tbp]
+    \footnotesize
+    \begin{center}
+    \begin{tabularx}{\columnwidth}{@{}Xrrr@{}}
+    \toprule
+        \sc Dataset & \sc Train & \sc Valid & \sc Released \\
+    \midrule
+        Kinetics 400 & 215,435 (87.5\%) & 17,686 (88.4\%) & May 2017 \\
+        Kinetics 600 & 364,305 (92.8\%) & 27,764 (92.5\%) & Aug 2018 \\
+        Kinetics 700 & 524,595 (96.2\%) & 33,567 (95.9\%) & Jul 2019 \\
+\bottomrule
+    \end{tabularx}
+    \end{center}
+    \caption{
+        The number of examples available for each of the Kinetics dataset splits at the time of writing (Sept 20, 2020) along with the percentages compared to examples available on release.
+        Each dataset loses about 4\% of its examples per year.
+    }
+    \label{table:kinetics-num-examples}
+\end{table}
+
+\begin{table}[tbp]
+    \newcommand{\frameinput}[2]{#1#2}
+    \begin{center}
+\footnotesize
+    \begin{tabularx}{0.8\columnwidth}{@{}Xrrrr@{}}
+    \toprule
+        \sc Model & \sc Top-1 & \sc Top-5 & \sc gflops & \sc Param \\
+    \midrule
+        \bf \ournet-A0 & \bf 65.8 & \bf 87.4 & \bf 2.71 & \bf 3.1M \\
+    \midrule
+        \bf \ournet-A1 & \bf 72.7 & \bf 91.2 & \bf 6.02 & 4.6M \\
+        X3D-XS \cite{feichtenhofer2020x3d} & 69.5 & - & 23.3 & \bf 3.8M \\
+    \midrule
+        \bf \ournet-A2 & \bf 75.0 & \bf 92.3 & \bf 10.3 & 4.8M \\
+        X3D-S \cite{feichtenhofer2020x3d} & 73.5 & - & 76.1 & \bf 3.8M \\
+    \midrule
+        \bf \ournet-A3 & \bf 78.2 & \bf 93.8 & \bf 56.9 & 5.3M \\
+        X3D-M \cite{feichtenhofer2020x3d} & 76.0 & 92.3 & \bf 186 & \bf 3.8M \\
+    \midrule
+        \bf \ournet-A4 & \bf 80.5 & \bf 94.5 & \bf 105 & \bf 5.9M \\
+        X3D-L \cite{feichtenhofer2020x3d} & 77.5 & 92.9 & 744 & 6.1M \\
+    \midrule
+        \bf \ournet-A5 & \bf 80.9 & \bf 94.9 & \bf 281 & 15.7M \\
+        X3D-XL \cite{feichtenhofer2020x3d} & 79.1 & 93.9 & 1452 & \bf 11.0M \\
+    \midrule
+        \bf \ournet-A6 & \bf 81.5 & \bf 95.3 & \bf 386 & 31.4M \\
+        X3D-XXL~\cite{feichtenhofer2020x3d} & 80.4 & 94.6 & 5800 & \bf 20.3M \\
+        TimeSformer-L~\cite{bertasius2021space} & 80.7 & 94.7 & 7140 & 120M \\
+        ViViT-L/16x2~\cite{arnab2021vivit} & 81.3 & 94.7 & 3990 & 88.9M \\
+    \bottomrule
+    \end{tabularx}
+\end{center}
+    \caption{
+        {\bf Accuracy of \ournet on Kinetics 400}.
+    }
+    \label{table:k400-comparison}
+\end{table}
+
+\begin{table}[tbp]
+    \begin{center}
+    \resizebox{0.7\columnwidth}{!}{\begin{tabular}{@{}lrrrr@{}}
+    \toprule
+        \sc Model & \sc Top-1 & Top-5 & \sc gflops & Param \\
+    \midrule
+        \bf \ournet-A0 & \bf 71.5 & \bf 90.4 & \bf 2.71 & \bf 3.1M \\
+        \bf \ournet-A0-Stream & 70.3 & 90.1 & 2.73 & \bf 3.1M \\
+    \midrule
+        \bf \ournet-A1 & \bf 76.0 & 92.6 & \bf 6.02 & \bf 4.6M \\
+        \bf \ournet-A1-Stream & 75.6 & \bf 92.8 & 6.06 & \bf 4.6M \\
+    \midrule
+        \bf \ournet-A2 & \bf 77.5 & \bf 93.4 & \bf 10.3 & \bf 4.8M \\
+        \bf \ournet-A2-Stream & 76.5 & 93.3 & 10.4 & \bf 4.8M \\
+    \midrule
+        \bf \ournet-A3 & 80.8 & 94.5 & \bf 56.9 & \bf 5.3M \\
+        \bf \ournet-A3 + AutoAugment & \bf 81.3 & \bf 95.3 & \bf 56.9 & \bf 5.3M \\
+\midrule
+        \bf \ournet-A4 & 81.2 & 94.9 & \bf 105 & 4.9M \\
+        \bf \ournet-A4  + AutoAugment & \bf 83.0 & \bf 96.0 & \bf 105 & 4.9M \\
+X3D-M \cite{feichtenhofer2020x3d} & 78.8 & 94.5 & 186 & \bf 3.8M \\
+    \midrule
+        \bf \ournet-A5 & 82.7 & 95.7 & \bf 281 & \bf 15.7M \\
+        \bf \ournet-A5 + AutoAugment & \bf 84.3 & \bf 96.4 & \bf 281 & \bf 15.7M \\
+\midrule
+        \bf \ournet-A6 & 83.5 & 96.2 & \bf 386 & 15.7M \\
+        \bf \ournet-A6 + AutoAugment & \bf 84.8 & \bf 96.5 & \bf 386 & 15.7M \\
+        X3D-XL \cite{feichtenhofer2020x3d} & 81.9 & 95.5 & 1452 & \bf 11.0M \\
+        SlowFast-R50 \cite{feichtenhofer2019slowfast} & 78.8 & 94.0 & 1080 & 34.4M \\
+        SlowFast-R101 \cite{feichtenhofer2019slowfast} & 81.8 & 95.1 & 7020 & 59.9M \\
+    \bottomrule
+    \end{tabular}
+    }
+    \end{center}
+    \caption{
+        {\bf Accuracy of \ournet on Kinetics 600} with additional top-5 data.
+    }
+    \label{table:k600-comparison-extra}
+\end{table}
+
+\begin{table}[tbp]
+    \newcommand{\frameinput}[2]{#1#2}
+    \begin{center}
+\footnotesize
+\begin{tabularx}{0.8\columnwidth}{@{}Xrrr@{}}
+    \toprule
+        \sc Model & \sc Top-1 & \sc gflops & \sc Param \\
+\midrule
+        \bf \ournet-A0 & \bf 58.5 & \bf 2.71 & \bf 3.1M \\
+    \midrule
+        \bf \ournet-A1 & \bf 63.5 & \bf 6.02 & \bf 4.6M \\
+    \midrule
+        \bf \ournet-A2 & \bf 66.7 & \bf 10.3 & \bf 4.8M \\
+    \midrule
+        \bf \ournet-A3 & \bf 68.0 & \bf 56.9 & \bf 5.3M \\
+    \midrule
+        \bf \ournet-A4 & \bf 70.7 & \bf 105 & \bf 4.9M \\
+    \midrule
+        \bf \ournet-A5 & \bf 71.7 & \bf 281 & \bf 15.7M \\
+    \midrule
+        \bf \ournet-A6 & \bf 72.3 & \bf 386 & \bf 31.4M \\
+        SlowFast-R101 \cite{feichtenhofer2019slowfast, activitynet2020} & 70.2 & 3200 & 30M \\
+        SlowFast-R152 \cite{feichtenhofer2019slowfast, activitynet2020} & 71.6 & 9500 & 80M \\
+    \midrule
+EfficientNet-L2 (pretrain) \cite{xie2020self, activitynet2020} & \bf 76.2 & \bf 15400 & \bf 480M \\
+    \bottomrule
+    \end{tabularx}
+\end{center}
+    \caption{
+        {\bf Accuracy of \ournet on Kinetics 700}.
+    }
+    \label{table:k700-comparison}
+\end{table}
+
+\begin{table}[tbp]
+    \footnotesize
+    \begin{center}
+    \begin{tabularx}{\columnwidth}{@{}Xrrrr@{}}
+    \toprule
+        \sc Model & \sc Top-1 & \sc gflops & \sc Param \\
+    \midrule
+        \bf \ournet-A0 & \bf 27.5 & \bf 4.07 & \bf 3.1M \\
+    \midrule
+        \bf \ournet-A1 & \bf 32.0 & \bf 9.03 & \bf 4.6M \\
+        TVN-1 \cite{piergiovanni2020tiny} & 23.1 & 13.0 & 11.1M \\
+    \midrule
+        \bf \ournet-A2 & \bf 34.3 & \bf 15.5 & \bf 4.8M \\
+        \bf \ournet-A2-Stream & 33.6 & 15.6 & \bf 4.8M \\
+        TVN-2 \cite{piergiovanni2020tiny} & 24.2 & 17.0 & 110M \\
+    \midrule
+        \bf \ournet-A3 & \bf 35.6 & \bf 35.6 & \bf 5.3M \\
+        TVN-3 \cite{piergiovanni2020tiny} & 25.4 & 69.0 & 69.4M \\
+    \midrule
+        \bf \ournet-A4 & \bf 37.9 & \bf 98.4 & \bf 4.9M \\
+        TVN-4 \cite{piergiovanni2020tiny} & 27.8 & \bf 106 & 44.2M \\
+    \midrule
+        \bf \ournet-A5 & \bf 39.1 & \bf 175 & \bf 15.7M \\
+        SRTG-R3D-34 \cite{stergiou2020learn} & 28.5 & 220 & - \\
+    \midrule
+        \bf \ournet-A6 & \bf 40.2 & \bf 274 & \bf 31.4M \\
+        ResNet3D-50 \cite{ryoo2019assemblenet} & 27.2 & - & - \\
+        SRTG-R3D-50 \cite{stergiou2020learn} & 30.7 & 300 & - \\
+        SRTG-R3D-101 \cite{stergiou2020learn} & 33.6 & 350 & - \\
+        AssembleNet-50 (RGB+Flow) \cite{ryoo2019assemblenet} & 31.4 & 480 & 37.3M \\
+        AssembleNet-101 (RGB+Flow) \cite{ryoo2019assemblenet} & 34.3 & 760 & 53.3M \\
+        ViViT-L/16x2~\cite{arnab2021vivit} & 38.0 & 3410 & 100M \\
+    \bottomrule
+    \end{tabularx}
+    \end{center}
+    \caption{
+        {\bf Accuracy of \ournet on Moments in Time}.
+        All \ournets are evaluated on 75 frames at 25 fps.
+    }
+    \label{table:mit-comparison}
+\end{table}
+
+\begin{table}[tbp]
+    \footnotesize
+    \begin{center}
+    \begin{tabularx}{\columnwidth}{@{}Xrrrr@{}}
+    \toprule
+        \sc Model & \sc mAP & \sc gflops & \sc Param \\
+    \midrule
+        \bf \ournet-A2 & \bf 32.5 & \bf 6.59 & \bf 4.8M \\
+        TVN-1 \cite{piergiovanni2020tiny} & 32.2 & 13.0 & 11.1M \\
+    \midrule
+        TVN-2 \cite{piergiovanni2020tiny} & \bf 32.5 & \bf 17.0 & \bf 110M \\
+    \midrule
+        TVN-3 \cite{piergiovanni2020tiny} & \bf 33.5 & \bf 69.0 & \bf 69.4M \\
+    \midrule
+        \bf \ournet-A4 & \bf 48.5 & \bf 90.4 & \bf 4.9M \\
+        TVN-4 \cite{piergiovanni2020tiny} & 35.4 & 106 & 44.2M \\
+    \midrule
+        \bf \ournet-A6 & \bf 63.2 & \bf 306 & \bf 31.4M \\
+        AssembleNet-50 (RGB+Flow) \cite{ryoo2019assemblenet} & 53.0 & 700 & 37.3M \\
+        AssembleNet-101 (RGB+Flow) \cite{ryoo2019assemblenet} & 58.6 & 1200 & 53.3M \\
+        AssembleNet++ (RGB+Flow+Seg)\cite{ryoo2020assemblenetpp} & 59.8 & 1300 & - \\
+        SlowFast 16x8 R101 \cite{feichtenhofer2019slowfast} & 45.2 & 7020 & 59.9M \\
+    \bottomrule
+    \end{tabularx}
+    \end{center}
+    \caption{
+        {\bf Accuracy of \ournet on Charades}.
+    }
+    \label{table:charades-comparison}
+\end{table}
+
+\begin{table}[tbp]
+    \begin{center}
+    \resizebox{0.8\columnwidth}{!}{\begin{tabular}{@{}lrrrr@{}}
+    \toprule
+        \sc Model & \sc Top-1 & Top-5 & \sc gflops & Param \\
+    \midrule
+        \bf \ournet-A0 & \bf 61.3 & 88.2 & \bf 2.71 & \bf 3.1M \\
+        \bf \ournet-A0-Stream & 60.9 & \bf 88.3 & 2.73 & \bf 3.1M \\
+        TRN~\cite{zhou2018temporal} & 48.8 & 77.6 & 33.0 & - \\
+    \midrule
+        \bf \ournet-A1 & \bf 62.7 & \bf 89.0 & \bf 6.02 & \bf 4.6M \\
+        \bf \ournet-A1-Stream & 61.6 & 87.3 & 6.06 & \bf 4.6M \\
+    \midrule
+        \bf \ournet-A2 & \bf 63.5 & \bf 89.0 & \bf 10.3 & 4.8M \\
+        \bf \ournet-A2-Stream & 63.1 & 89.0 & 10.4 & 4.8M \\
+        TSM~\cite{lin2019tsm} & 63.4 & 88.5 & 390 & 24.3M \\
+        VoV3D-M (16 frame)~\cite{lee2020diverse} & 63.2 & 88.2 & 34.2 & \bf 3.3M \\
+    \midrule
+        \bf \ournet-A3 & \bf 64.1 & \bf 88.8 & \bf 23.7 & \bf 5.3M \\
+\midrule
+VoV3D-M (32 frame)~\cite{lee2020diverse} & 65.2 & 89.4 & \bf 69.0 & \bf 3.3M \\
+        VoV3D-L (32 frame)~\cite{lee2020diverse} & \bf 67.3 & \bf 90.5 & 125 & 5.8M \\
+        ViViT-L/16x2~\cite{arnab2021vivit} & 65.4 & 89.8 & 3410 & 100M \\
+\bottomrule
+    \end{tabular}
+    }
+    \end{center}
+    \caption{
+        {\bf Accuracy of \ournet on Something-Something V2}.
+All \ournets are evaluated on 50 frames at 12 fps.
+        For shorter clips with fewer than 50 frames, we repeat the video sequence from the beginning.
+    }
+    \label{table:ssv2-comparison}
+\end{table}
+
+
+\begin{table}[tbp]
+    \newcommand{\frameinput}[2]{#1#2}
+    \begin{center}
+\footnotesize
+\begin{tabularx}{1\columnwidth}{@{}Xrrrrr@{}}
+    \toprule
+        \sc Model & \sc Action & \sc Verb & \sc Noun & \sc gflops & \sc Param \\
+\midrule
+        \bf \ournet-A0 & \bf 36.8 & \bf 64.8 & \bf 47.4 & \bf 1.74 & \bf 3.1M \\
+    \midrule
+        \bf \ournet-A2 & \bf 41.2 & \bf 67.1 & \bf 52.3 & \bf 7.59 & \bf 4.8M \\
+    \midrule
+        \bf \ournet-A4 & \bf 44.4 & \bf 68.8 & \bf 56.2 & \bf 42.2 & \bf 4.9M \\
+    \midrule
+        \bf \ournet-A5 & \bf 44.5 & \bf 69.1 & \bf 55.1 & \bf 74.9 & \bf 15.7M \\
+    \midrule
+        \bf \ournet-A6 & \bf 47.7 & \bf 72.2 & \bf 57.3 & \bf 117 & \bf 31.4M \\
+        ViViT-L/16x2~\cite{arnab2021vivit} & 44.0 & 66.4 & 56.8 & 3410 & 100M \\
+        TSM~\cite{lin2019tsm} & 38.3 & 67.9 & 49.0 & - & - \\
+        SlowFast~\cite{feichtenhofer2019slowfast} & 38.5 & 65.6 & 50.0 & - & - \\
+        TSN~\cite{wang2016temporal} & 33.2 & 60.2 & 46.0 & - & - \\
+    \bottomrule
+    \end{tabularx}
+\end{center}
+    \caption{
+        {\bf Top-1 Accuracy of \ournet on Epic Kitchens 100} on Action, Verb, and Noun classes.
+        All \ournets are evaluated on 32 frames at 12 fps.
+    }
+    \label{table:epic100-comparison}
+\end{table}
+
+
+
+\subsubsection{Single-Clip vs. Multi-Clip Evaluation}
+
+We report all of our results on a \emph{single} view without multi-clip evaluation.
+Additionally, we report the total number of frames used for evaluation and the frame rate (note that the evaluation frames can exceed the total number of frames in the reference video when subclips overlap).
+
+
+
+
+
+
+
+As seen in Figure~1 and Table~2 (in the main text), switching from a multi-clip to single-clip X3D model on Kinetics 600 (where we cover the entire 10-second clip) results in much higher computational efficiency per video.
+Existing work typically factors out FLOPs in terms of FLOPs per subclip, but it can hide the true cost of computation, since we can keep adding more clips to boost accuracy higher.
+
+We also evaluate the differences between training the same \ournet-A2 model on smaller clips vs. longer clips and evaluating the models with multi-clip vs. single-clip, as seen in Figure~\ref{fig:single-vs-multi-clip}.
+For multi-clip evaluation, we can see that accuracy improves when the number of clips fill the whole duration of the video (this can be seen at 5 clips for 8 training frames and at 3 clips for 16 training frames), and only very slightly improves as we add more clips.
+However, if we train \ournet-A2 on 16 frames and evaluate on 80 frames (so that we cover all 10 seconds of the video), this results in higher accuracy than the same number of frames using multi-clip eval.
+Furthermore, we can boost this accuracy even higher if we use 48 frames to train our model.
+Using stream buffers, we can reduce memory usage of training so that we can train using 48 frames while only using the memory of embedding 16 frames at a time.
+
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=1.0\linewidth]{images/movinet_k600_multi_clip_eval.pdf}
+    \end{center}
+    \caption{
+        {\bf Single vs. Multi-Clip Evaluation} on Kinetics 600.
+        A comparison between the number of training frames and the number of eval frames and clips.
+        The number of clips are shown inside each datapoint, where applicable.
+        Other datapoints are evaluated on single clips.
+        We use \ournet-A2 with frame stride 3 for all datapoints.
+    }
+    \label{fig:single-vs-multi-clip}
+\end{figure}
+
+
+\subsubsection{Streaming vs. Non-Streaming Evaluation}
+
+One question we have wondered is if the distribution of features learned is different from streaming and non-streaming architectures.
+In Figure~\ref{fig:frame-stream-pool}, we plot the average accuracy across Kinetics 600 of a model evaluated on a single frame by embedding an entire video, pooling across spatial dimensions, and applying the classification layers independently on each frame.
+
+We first notice that the accuracy MobileNetV3 and MoViNet-A2 exhibit a Laplace distribution, on average peaking at the center frame of each video.
+Since MobileNetV3 is evaluated on each frame independently, we can observe that the most salient part of the actions is on average in the video's midpoint.
+This is a good indicator that the videos in Kinetics are trimmed very well to center around the most salient part of each action.
+Likewise, MoViNet-A2, with balanced 3D convolutions, has the same characteristics as MobileNetV3, just with higher accuracy.
+
+However, the dynamics of streaming MoViNet-A2 with causal convolutions is entirely different.
+The distribution of accuracy fluctuates and varies more than non-streaming architectures.
+By removing the ability for the network to see all frames as a whole with causal convolutions, the aggregation of features is not the same as when using balanced convolutions.
+Despite this difference, overall, the accuracy difference across all videos is only about 1\%.
+And by looking at top-5 accuracy in Table~\ref{table:k600-comparison-extra}, we can notice that streaming architectures nearly perform the same, despite the apparent information loss when transitioning to a model with a time-unidirectional receptive field.
+
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=1.0\columnwidth]{images/movinet_frame_stream.pdf}
+    \end{center}
+    \caption{
+        {\bf Difference Between Streaming and Base MoViNets}.
+        The plot displays the average accuracy across the Kinetics 600 dataset of an embedded model by applying the classification layers independently on each frame.
+        Shading around each solid line indicates one standard deviation.
+    }
+    \label{fig:frame-stream-pool}
+\end{figure}
+
+
+
+\subsubsection{Long Video Sequences}
+
+Figure~\ref{fig:frame-generalization} shows how training clip duration affects the accuracy of a model evaluated at different durations.
+We can see that \ournet can generalize well beyond the original clip duration it was trained with, always improving in accuracy with more frames.
+However, the model does notably worse if evaluated on clips with shorter durations than it was trained on.
+Longer clip duration for training translates to better accuracy for evaluation on longer clips overall.
+And with a stream buffer, we can train on even longer sequences to boost evaluation performance even higher.
+
+However, we also see we can operate frame-by-frame with stream buffers, substantially saving memory, showing better memory efficiency than multi-clip approaches and requiring constant memory as the number of input frames increase (and therefore temporal receptive field).
+Despite the accuracy reduction, we can see \ournet-Stream models perform very well on long video sequences and are still more efficient than X3D which requires splitting videos into smaller subclips.
+We encourage future work using multi-clip evaluation to report results without overlapping subclips, which not only provides a much more representative accuracy measurement, tends to be more efficient as well.
+
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=1.0\linewidth]{images/movinet_k600_frame_generalization.pdf}
+    \end{center}
+    \caption{
+        {\bf Generalization to Longer Clips}. 
+        A display of how duration of a clip during training affects the evaluation accuracy of different clip durations during evaluation. 
+        We use \ournet-A2 with frame stride 3 for all datapoints.
+    }
+    \label{fig:frame-generalization}
+\end{figure}
+
+
+
+
+
+
+
+\begin{table}[tbp]
+    \footnotesize
+    \begin{center}
+    \begin{tabularx}{\columnwidth}{@{}Xrrr@{}}
+    \toprule
+        \sc Model & \sc Top-1 & \sc gflops & \sc Params \\
+    \midrule
+        \ournet-A2b-3D & 79.0 & 17.1 & 4.8M \\
+        \ournet-A2b-(2+1)D & 79.4 & 16.8 & 5.0M \\
+    \bottomrule
+    \end{tabularx}
+    \end{center}
+    \caption{
+        {\bf 3D vs. (2+1)D} on Kinetics 600.
+    }
+    \label{table:2p1d-vs-3d}
+\end{table}
+
+
+\subsubsection{Stream Buffers with Other Operations}
+
+WaveNet \cite{oord2016wavenet} introduces causal convolution, where the receptive field on a stack of 1D convolutions is forced to only see activations up to the current time step, as opposed to balanced convolutions which expand their receptive fields in both directions.
+We take inspiration from causal convolutions~\cite{cheng2019sparse,chang2018temporal,daiya2020stock} to design stream buffers.
+However, WaveNet only proposes 1D convolutions for generative modeling, using them for their autoregressive property.
+We generalize the idea of causal convolution to any local operation, and introduce stream buffers to be able to use causal operations for online inference, allowing frame-by-frame predictions.
+In addition, Transformer-XL \cite{dai2019transformer} caches activations in a temporal buffer much like our work, for use in long-range sequence modeling.
+However, the model is only causal across fixed sequences while our work can be causal across individual frames, and can even vary the number of frames in each clip (so long as frames are consecutive with no gaps or overlaps between clips).
+We can apply the same principle to other operations as well to generalize causal operations.
+Note that this approach is not inherently tied to any data type or modality.
+Stream buffers can also be used to model many kinds of temporal data, e.g., audio, text.
+
+
+
+
+
+
+\paragraph{(2+1)D CNNs.}
+Additionally, support for efficient 3D convolutions on mobile devices is currently fragmented, while 2D convolutions are well supported.
+We include the option to search for (2+1)D architectures, splitting up any 3D depthwise convolutions into a 2D spatial convolution followed by a 1D temporal convolution.
+We show that trivially changing a 3D architecture to (2+1)D decreases FLOPs while also keeping similar accuracy, as seen in table~\ref{table:2p1d-vs-3d}.
+Here we define \ournet-A2b as a searched model similar to \ournet-A2.
+
+
+\newpage
+
+\begin{table}[t]
+\newcommand{\baseframes}{50}
+    
+    \newcommand{\blockseq}[3]{\text{#1#2, #3}\\left[
+            \begin{array}{c}
+                #4
+            \end{array}
+            \right]-.1em]}
+    \newcommand{\bigblock}[5]{
+        block & 
+        \multirow{#3}{*}{
+            
+        } &
+        \multirow{#3}{*}{} \\
+        #5
+    }
+    \newcommand{\stemblock}[4]{
+        data & stride #1, RGB &  \\
+        conv & \multicolumn{1}{c}{, {#2}}
+        &  \\
+    }
+    \newcommand{\headblock}[3]{
+        conv & \multicolumn{1}{c}{, {#2}}
+        &  \\
+        pool & \multicolumn{1}{c}{}
+        &  \\
+        dense & \multicolumn{1}{c}{, {#3}}
+        &  \\
+        dense & \multicolumn{1}{c}{, {600}}
+        &  \\
+    }
+    
+
+    \begin{center}
+\scriptsize
+    \begin{tabularx}{0.8 \columnwidth}{@{}Xcl@{}}
+        \toprule
+        \sc Stage & \sc Operation & \sc Output size \\
+        \midrule
+        \stemblock{5}{16}{172}{86}
+        \midrule
+        \bigblock{2}{43}{2}{
+            \blockseq{{1}}{{5}}{{16, 40}}
+            \blockseq{{3}}{{3}}{{16, 40}}
+        }{
+            &  & \\
+        }
+        \bigblock{3}{21}{4}{
+            \blockseq{{3}}{{3}}{{40, 96}}
+            \blockseq{{3}}{{3}}{{40, 120}}
+            \blockseq{{3}}{{3}}{{40, 96}}
+            \blockseq{{3}}{{3}}{{40, 96}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{4}{10}{5}{
+            \blockseq{{5}}{{3}}{{64, 216}}
+            \blockseq{{3}}{{3}}{{64, 128}}
+            \blockseq{{3}}{{3}}{{64, 216}}
+            \blockseq{{3}}{{3}}{{64, 168}}
+            \blockseq{{3}}{{3}}{{64, 216}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{5}{10}{6}{
+            \blockseq{{5}}{{3}}{{64, 216}}
+            \blockseq{{3}}{{3}}{{64, 216}}
+            \blockseq{{3}}{{3}}{{64, 216}}
+            \blockseq{{3}}{{3}}{{64, 128}}
+            \blockseq{{1}}{{5}}{{64, 128}}
+            \blockseq{{3}}{{3}}{{64, 216}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{6}{5}{7}{
+            \blockseq{{5}}{{3}}{{136, 456}}
+            \blockseq{{1}}{{5}}{{136, 360}}
+            \blockseq{{1}}{{5}}{{136, 360}}
+            \blockseq{{1}}{{5}}{{136, 360}}
+            \blockseq{{1}}{{5}}{{136, 456}}
+            \blockseq{{3}}{{3}}{{136, 456}}
+            \blockseq{{1}}{{3}}{{136, 544}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \midrule
+        \headblock{5}{600}{2048}
+        \bottomrule
+    \end{tabularx}
+\end{center}
+\caption{
+        {\bf \ournet-A1 Architecture}.
+    }
+    \label{table:a1-architecture-appendix}
+\end{table}
+
+
+\begin{table}[t]
+\newcommand{\baseframes}{50}
+    
+    \newcommand{\blockseq}[3]{\text{#1#2, #3}\\left[
+            \begin{array}{c}
+                #4
+            \end{array}
+            \right]-.1em]}
+    \newcommand{\bigblock}[5]{
+        block & 
+        \multirow{#3}{*}{
+            
+        } &
+        \multirow{#3}{*}{} \\
+        #5
+    }
+    \newcommand{\stemblock}[4]{
+        data & stride #1, RGB &  \\
+        conv & \multicolumn{1}{c}{, {#2}}
+        &  \\
+    }
+    \newcommand{\headblock}[3]{
+        conv & \multicolumn{1}{c}{, {#2}}
+        &  \\
+        pool & \multicolumn{1}{c}{}
+        &  \\
+        dense & \multicolumn{1}{c}{, {#3}}
+        &  \\
+        dense & \multicolumn{1}{c}{, {600}}
+        &  \\
+    }
+    
+
+    \begin{center}
+\scriptsize
+    \begin{tabularx}{0.8 \columnwidth}{@{}Xcl@{}}
+        \toprule
+        \sc Stage & \sc Operation & \sc Output size \\
+        \midrule
+        \stemblock{5}{16}{256}{128}
+        \midrule
+        \bigblock{2}{64}{4}{
+            \blockseq{{1}}{{5}}{{16, 40}}
+            \blockseq{{3}}{{3}}{{16, 40}}
+            \blockseq{{3}}{{3}}{{16, 64}}
+            \blockseq{{3}}{{3}}{{16, 40}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{3}{32}{6}{
+            \blockseq{{3}}{{3}}{{48, 112}}
+            \blockseq{{3}}{{3}}{{48, 144}}
+            \blockseq{{3}}{{3}}{{48, 112}}
+            \blockseq{{1}}{{5}}{{48, 112}}
+            \blockseq{{3}}{{3}}{{48, 144}}
+            \blockseq{{3}}{{3}}{{48, 144}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{4}{16}{5}{
+            \blockseq{{5}}{{3}}{{80, 240}}
+            \blockseq{{3}}{{3}}{{80, 152}}
+            \blockseq{{3}}{{3}}{{80, 240}}
+            \blockseq{{3}}{{3}}{{80, 192}}
+            \blockseq{{3}}{{3}}{{80, 240}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{5}{16}{8}{
+            \blockseq{{5}}{{3}}{{88, 264}}
+            \blockseq{{3}}{{3}}{{88, 264}}
+            \blockseq{{3}}{{3}}{{88, 264}}
+            \blockseq{{3}}{{3}}{{88, 264}}
+            \blockseq{{1}}{{5}}{{88, 160}}
+            \blockseq{{3}}{{3}}{{88, 264}}
+            \blockseq{{3}}{{3}}{{88, 264}}
+            \blockseq{{3}}{{3}}{{88, 264}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{6}{8}{10}{
+            \blockseq{{5}}{{3}}{{168, 560}}
+            \blockseq{{1}}{{5}}{{168, 448}}
+            \blockseq{{1}}{{5}}{{168, 448}}
+            \blockseq{{1}}{{5}}{{168, 560}}
+            \blockseq{{1}}{{5}}{{168, 560}}
+            \blockseq{{3}}{{3}}{{168, 560}}
+            \blockseq{{1}}{{5}}{{168, 448}}
+            \blockseq{{1}}{{5}}{{168, 448}}
+            \blockseq{{3}}{{3}}{{168, 560}}
+            \blockseq{{1}}{{3}}{{168, 672}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \midrule
+        \headblock{8}{744}{2048}
+        \bottomrule
+    \end{tabularx}
+\end{center}
+\caption{
+        {\bf \ournet-A3 Architecture}.
+    }
+    \label{table:a3-architecture-appendix}
+\end{table}
+
+\begin{table}[t]
+\newcommand{\baseframes}{80}
+    
+    \newcommand{\blockseq}[3]{\text{#1#2, #3}\\left[
+            \begin{array}{c}
+                #4
+            \end{array}
+            \right]-.1em]}
+    \newcommand{\bigblock}[5]{
+        block & 
+        \multirow{#3}{*}{
+            
+        } &
+        \multirow{#3}{*}{} \\
+        #5
+    }
+    \newcommand{\stemblock}[4]{
+        data & stride #1, RGB &  \\
+        conv & \multicolumn{1}{c}{, {#2}}
+        &  \\
+    }
+    \newcommand{\headblock}[3]{
+        conv & \multicolumn{1}{c}{, {#2}}
+        &  \\
+        pool & \multicolumn{1}{c}{}
+        &  \\
+        dense & \multicolumn{1}{c}{, {#3}}
+        &  \\
+        dense & \multicolumn{1}{c}{, {600}}
+        &  \\
+    }
+    
+
+    \begin{center}
+\scriptsize
+    \begin{tabularx}{0.8 \columnwidth}{@{}Xcl@{}}
+        \toprule
+        \sc Stage & \sc Operation & \sc Output size \\
+        \midrule
+        \stemblock{5}{24}{320}{160}
+        \midrule
+        \bigblock{2}{80}{6}{
+            \blockseq{{1}}{{5}}{{24, 64}}
+            \blockseq{{1}}{{5}}{{24, 64}}
+            \blockseq{{3}}{{3}}{{24, 96}}
+            \blockseq{{3}}{{3}}{{24, 64}}
+            \blockseq{{3}}{{3}}{{24, 96}}
+            \blockseq{{3}}{{3}}{{24, 64}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{3}{40}{11}{
+            \blockseq{{5}}{{3}}{{64, 192}}
+            \blockseq{{3}}{{3}}{{64, 152}}
+            \blockseq{{3}}{{3}}{{64, 152}}
+            \blockseq{{3}}{{3}}{{64, 152}}
+            \blockseq{{3}}{{3}}{{64, 192}}
+            \blockseq{{3}}{{3}}{{64, 192}}
+            \blockseq{{3}}{{3}}{{64, 192}}
+            \blockseq{{3}}{{3}}{{64, 152}}
+            \blockseq{{3}}{{3}}{{64, 152}}
+            \blockseq{{3}}{{3}}{{64, 192}}
+            \blockseq{{3}}{{3}}{{64, 192}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{4}{20}{13}{
+            \blockseq{{5}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 224}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 296}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 224}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 296}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+            \blockseq{{3}}{{3}}{{112, 376}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{5}{20}{11}{
+            \blockseq{{5}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{1}}{{5}}{{120, 224}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 224}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+            \blockseq{{3}}{{3}}{{120, 376}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \bigblock{6}{10}{18}{
+            \blockseq{{5}}{{3}}{{224, 744}}
+            \blockseq{{3}}{{3}}{{224, 744}}
+            \blockseq{{1}}{{5}}{{224, 600}}
+            \blockseq{{1}}{{5}}{{224, 600}}
+            \blockseq{{1}}{{5}}{{224, 744}}
+            \blockseq{{1}}{{5}}{{224, 744}}
+            \blockseq{{3}}{{3}}{{224, 744}}
+            \blockseq{{1}}{{5}}{{224, 896}}
+            \blockseq{{1}}{{5}}{{224, 600}}
+            \blockseq{{1}}{{5}}{{224, 600}}
+            \blockseq{{1}}{{5}}{{224, 896}}
+            \blockseq{{1}}{{5}}{{224, 744}}
+            \blockseq{{3}}{{3}}{{224, 744}}
+            \blockseq{{1}}{{5}}{{224, 896}}
+            \blockseq{{1}}{{5}}{{224, 600}}
+            \blockseq{{1}}{{5}}{{224, 600}}
+            \blockseq{{1}}{{5}}{{224, 744}}
+            \blockseq{{3}}{{3}}{{224, 744}}
+        }{
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+            &  & \\
+        }
+        \midrule
+        \headblock{10}{992}{2048}
+        \bottomrule
+    \end{tabularx}
+\end{center}
+\caption{
+        {\bf \ournet-A5 Architecture}.
+    }
+    \label{table:a5-architecture-appendix}
+\end{table}
+ 
+
+\end{document}

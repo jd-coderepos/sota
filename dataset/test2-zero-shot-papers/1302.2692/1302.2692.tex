@@ -1,0 +1,1112 @@
+
+
+\section{Introduction}
+
+
+Exceptions are not exceptional enough.
+Thrown exceptions---or the possibility thereof---pervade the control-flow
+structure of modern object-oriented programs.
+A static analyzer grappling with
+Java must concede that even
+innocent-looking expressions like 
+\begin{code}
+ x / in.read() 
+\end{code}
+could throw four exceptions: 
+{\tt ArithmeticException} (for divide by 0);
+{\tt IOException} (for reading);
+{\tt NullPointerException} (for dereferencing {\tt in});
+and technically even
+{\tt MethodNotFoundException} (if
+the {\tt read} method
+was removed after this file was compiled).
+
+To make sense of a program, a static analyzer must exploit data-flow
+information to rule out exceptions (such as {\tt NullPointerException} and {\tt
+MethodNotFoundException} in the prior expression).
+Yet, precise data-flow information \emph{requires} a precise analysis of
+exceptions.
+Co-analyzing data- and exception-flow is essential for precision.
+Yet, even then, many exceptions (like {\tt IOException} or {\tt
+ArithmeticException} in the prior expression) cannot be ruled out statically.
+It is critical to precisely match catchers to throwers.
+
+
+Exception-flow fundamentally follows the structure of the program stack at
+run-time.
+Because the stack can grow without bound, traditional analysis regimes like
+-CFA~\cite{mattmight:Shivers:1991:CFA} and its many variants implicitly or
+explicitly finitize the stack during abstraction.
+In effect, analyzers carve up dynamic return points and exception-handling
+points among a finite number of abstract return contexts.
+When two dynamic return points map to the same abstract context, the analyzer loses
+the ability to distinguish them.
+This confusion 
+is a control-flow analog of the classic data-flow value merging problem.
+
+To ground this discussion, 
+consider the following Java fragment:
+\begin{code}
+try \{
+   maybeThrow() ; // Call 1
+\} catch (Exception e) \{
+   System.err.println("Got an exception") ; // Handler 1
+\}
+maybeThrow() ; // Call 2\end{code}
+Under a monovariant abstraction like 0CFA~\cite{mattmight:Shivers:1991:CFA}, where the distinction between different invocations of the same procedure are lost, it will seem as though exceptions
+thrown from {\tt Call 2} can be caught by {\tt Handler 1}.
+
+
+The fundamental problem with the analysis of exceptions is that the abstract
+program stack is finite.
+Our message is that pushdown analysis, which does not finitize the program
+stack, is critical for precise analysis of exception-handling, yet it remains
+computable.
+Simply switching to pushdown analysis yields orders of magnitude improvements
+in precision over \texttt{Doop}~\cite{mattmight:Bravenboer:2009:Exceptions},
+the current state of the art exception-flow analysis.
+
+
+Spotting an easy opportunity to improve running time, 
+we reduce the state-space via abstract garbage collection~\cite{mattmight:Might:2006:GammaCFA}.
+We then further improve running time and precision by
+combining abstract garbage collection with live-range analysis.
+In the end, we cut the time cost of pushdown exception-flow analysis by half.
+
+
+Our implementation for Java (which targets the Dalvik virtual machine for Android)
+ is publicly available:
+\begin{center}
+\verb+https://github.com/shuyingliang/pushdownoo+
+\end{center}
+
+
+ 
+
+
+\subsection{Contributions}
+
+We make several contributions:
+
+\begin{enumerate}
+
+\item The first  application of the abstracting abstract
+machines (AAM) methodology~\cite{mattmight:VanHorn:2010:Abstract} to create a
+static analyzer for Java.
+
+\item A pushdown flow analysis for precisely co-analyzing data-, control- and
+exception-flow.
+
+
+\item An empirical evaluation demonstrating two orders of magnitude of 
+precision improvement over the current best 
+analysis for exception-flow within reasonable analysis time.
+
+\end{enumerate}
+
+
+
+
+
+
+
+
+
+
+\section{The setting: An object-oriented bytecode} \label{sec:syntax}
+
+In this section, we define an object-oriented bytecode
+language 
+closely modeled on the Dalvik virtual machine
+to which Java applications for Android are compiled.
+Subsequent sections develop our analysis for this language.
+
+\subsection{Syntax}
+
+The syntax of the bytecode language is given in Figure~\ref{fig:oo-syntax}.
+Statements encode individual actions for the machine;
+atomic expressions encode atomically computable values;
+and complex expressions encode expressions with possible 
+non-termination or side effects.
+There are four kinds of names:
+ for registers,  for class names
+ for field names
+and  for method names.
+There are two special register names:
+, which holds the return value of the last function called,
+and , which holds the most recently thrown exception.
+
+The syntax is largely usual for an Java-like bytecode, but let us
+explain the statements related to exceptions in
+ in more detail:
+
+\begin{itemize}
+\item 
+indicates that a  method makes a
+\texttt{throws} declaration.
+
+
+
+
+\item   pushes a handler frame on the stack.
+The frame will catch exceptions of type  
+and divert execution to .
+
+\item
+
+pops the top-most handler frame off the stack.
+
+
+\end{itemize}
+
+
+
+
+\begin{figure}
+ 
+\caption{An object-oriented bytecode adapted from the Android specification~\cite{local:androidbytecode:url}.}
+
+
+
+\label{fig:oo-syntax}
+\end{figure}
+ 
+With respect to a given program, we assume a syntactic metafunction
+, which maps a label to the
+sequence of statements that start with that label.
+
+
+
+\subsection{Concrete semantics} \label{sec:conc-sem}
+
+Interpretation of bytecode programs is defined in terms of a
+CESK-style machine model.  States of this machine consist of a series
+of statements, a frame pointer, a heap, and a stack.  The evaluation
+of a program is defined as the set of machine configurations reachable
+by machine transitions from the initial program.  Formally, the
+evaluation function,
+,
+is defined as:
+  
+This function injects, using , an
+initial program sequence into an initial machine configuration.  From
+this initial configuration, evaluation is defined by the set of
+configurations reached by the reflexive, transitive closure of the
+machine transition relation, .  The next section describes the details of machine
+configurations; the subsequent section defines the machine
+transition relation, .
+
+\subsection{Concrete configuration-space} \label{subsec:conc-ss}
+
+Figure \ref{fig:conc-conf-space} presents the machine's concrete
+configuration-space.  The machine has an explicit stack, which under
+structural abstraction will become the stack component of a pushdown
+system.  The stack contains not only call frames, but also mini-frames
+for exception handlers.
+The  is the environmental
+component of the machine: by pairing the frame pointer with a
+register name, it forms the address of its value in the store.
+
+ \begin{figure}
+
+\caption{The concrete configuration-space.}
+\label{fig:conc-conf-space}
+ \end{figure}
+ 
+The initial configuration consists of the program, the initial frame
+pointer, an empty heap, and an empty stack:
+
+
+
+
+\subsection{Concrete transition relation} \label{subsec:conc-tr}
+
+
+In this section, we describe the essential cases of the 
+relation, which deal with objects and exceptions.  The remaining cases
+are in Appendix~\ref{appendix:simple-conc-rules}.
+
+The machine relies on helper functions for evaluating atomic
+expressions, looking up field values, and allocating memory:
+ \begin{itemize}
+
+
+  \item  evaluates atomic expressions:
+  
+
+\item
+  looks up fields:
+  
+
+
+
+\end{itemize}
+
+\paragraph{Allocation}
+ and  
+determine 
+  addresses for  and 
+  respectively.
+We need to specify how to allocate these pointers:
+\begin{itemize}
+
+\item
+   
+  chooses a fresh frame pointer for newly invoked method. 
+
+\item
+,
+ allocates a  fresh object pointer in the instantiation site.
+
+\end{itemize}
+For the sake of defining a concrete semantics,
+these could allocate increasingly larger natural numbers.
+Under abstraction, these parameters provide the knob to tune the
+  polyvariance, context-sensitivity and object-sensitivity 
+  of the resulting analysis.
+
+
+\subsubsection{New object creation}
+
+Creating an object allocates a new object pointer,
+creates a fresh address for the register 
+and initializes the fields:
+
+The  helper function,     ,  
+  initializes the field addresses in the provided store.
+
+\subsubsection{Instance field reference/update}
+Referencing a field gets the object pointer
+and then grabs the field value as an offset:
+
+Updating a field grabs the object, extracts the object pointer
+and updates the associated field in the store:
+
+
+
+\subsubsection{Method invocation}
+
+Method invocation involves all four components of the
+machine.
+Since the language supports inheritance, method resolution requires a traversal
+of the class hierarchy.  This traversal
+is not of interest, so we focus on the
+helper function that performs method application:
+. The function  takes a method definition,
+arguments,
+a frame pointer,
+a store and a continuation and produces the next configuration:
+
+It looks up the values of the arguments, binds them to the formal parameters of the method, creates a new frame pointer and  a new continuation:
+
+Finally, the transition looks up the method
+ and then passes it to :
+
+
+\subsubsection{Procedure return}
+Returning a value restores the caller's context and puts the return value in
+the dedicated return register,  .
+
+If a  is on top of the stack, 
+the transition will pop it
+without changing any other part of the state:
+ 
+  
+
+\subsubsection{Pushing and popping exception handlers} 
+Pushing and popping exception handlers is straightforward:
+
+ 
+
+
+\subsubsection{Throwing and catching exceptions}
+The {\tt{throw}} statement peels away layers of the stack until it finds a matching exception handler:
+
+where the function 
+.
+does the peeling.
+If  a matching handler is found, that is,  is a subclass of  ,
+where  
+and  is from the top ,
+the execution flow jumps to code block of the handler:
+
+The last thrown exception object value will be put in 
+ the dedicated exception register .
+ 
+If the exception type does not match or it's a call frame, 
+then  transits to a configuration 
+with the control state unchanged but with the
+ top frame popped:
+  
+The abstraction of these ``multi-pop'' transition relations
+will require modification of the 
+algorithm used for control-state reachability
+(Section~\ref{subsec: dcg-exn}).
+
+
+
+
+
+\section{Pushdown abstract semantics}
+\label{sec:pdexflowoo}
+
+With the concrete semantics in place,
+it is time to abstract them into an analysis.
+To achieve a pushdown analysis, we abstract less than we normally would. 
+Specifically, we
+conduct a structural abstraction of the concrete state-space
+and leave the stack height unbounded
+rather that thread frames through the heap.
+
+\subsection{Abstract semantics}
+
+Abstract interpretation is defined in terms of a structural
+abstraction of the machine model of Section~\ref{sec:syntax}.  The
+evaluation of a program is defined as the set of \emph{abstract}
+machine configurations reachable by an abstraction of the machine
+transitions relation. Largely, abstract evaluation, , mimics its concrete counterpart:
+
+Abstract evaluation is defined by the set of configurations reached by
+the reflexive, transitive closure of the  relation, which
+abstracts the  relation.
+
+
+\subsection{Abstract configuration-space}
+
+Figure~\ref{fig:abs-conf-space} details the abstract configuration-space. 
+We assume the natural element-wise, point-wise and member-wise
+lifting of a partial order across this state-space.
+
+
+
+ \begin{figure}
+
+\caption{The abstract configuration-space.}
+\label{fig:abs-conf-space}
+ \end{figure}
+ 
+ 
+ 
+To synthesize the abstract state-space,
+we force frame pointers and object pointers (and thus addresses) to be a finite set, 
+but crucially, we leave the stack untouched. 
+When we compact the set of addresses into a finite set, 
+the machine may run out of addresses to allocate, and when it does, 
+the pigeon-hole principle will force multiple abstract values to reside at the same address. 
+As a result, we have no choice but to force the range of the  to become a power set 
+in the abstract configuration-space. 
+
+
+\subsection{Abstract transition relation} \label{sec:abs-transition-rules}
+
+The abstract transition relation has components analogous to those from the concrete semantics:
+
+
+
+\begin{itemize}
+
+\item
+ injects an sequence of instructions into
+                                              a configuration:
+ 
+
+
+\item
+ evaluates atomic expressions:
+  
+
+\item
+
+looks up fields:
+  
+
+
+\end{itemize}
+      Because there are an infinite number of abstract configurations, a
+      na\"ive implementation of the  function may not terminate.
+
+Appendix~\ref{sec:polyvariance} discusses abstractions of  and
+ that allow the selection of different analyses such as -CFA or
+polymorphic splitting.
+
+ The rules for the abstract transition relation  
+    largely mimic the structure of the concrete relation .
+The biggest difference is that the structural abstraction 
+forces the abstract transition to become nondeterministic.
+We detail these rules below and illustrate the 
+ differences from its concrete counterpart. 
+ Again, we only cover rules involving objects and exceptions. 
+ Appendix~\ref{appendix-simple-abs-trs} contains the remaining rules.
+
+
+
+
+
+
+\subsubsection{\textbf{New object creation}} 
+Creating an object allocates a potentially non-fresh object pointer
+and joins the newly initialized object into that store location:
+
+where the  helper 
+ initializes fields. 
+  
+  \subsubsection{\textbf{Instance field reference/update}}
+Referencing a field uses  to evaluate the field values and join the store for destination register:
+ 
+   Updating a field first finds the abstract object values from the
+   store, extracts its object pointer from each of all the
+   possible values, then pairs this object pointer with the field name
+   to get the field addresses, and finally \textit{joins} the extensions
+   to the store:
+ 
+   
+
+
+\subsubsection{\textbf{Method invocation}}
+Like the concrete semantics, method invocation also involves all four components of the machine.
+The main difference is that, for non-static methods invocation, there can be a \emph{set} of possible objects that are invoked, 
+rather than only one as in its concrete counterpart. 
+This also means that there could be multiple method definitions resolved for each object.
+For each such method : 
+where,
+
+
+
+
+\subsubsection{\textbf{Procedure return}}
+Procedure return pops off the top-most  frame:
+
+If the top frame is a  frame, 
+the abstract interpreter pops until the top-most frame is 
+a  frame:
+ 
+  
+  
+  \subsubsection{\textbf{Pushing and popping handlers}}
+  Handlers push and pop as expected:
+   
+   
+\subsubsection{\textbf{Throwing and catching exceptions}}
+  The throw statement peels away layers of the stack until it finds a matching exception handler:
+
+  where the function 
+  
+  
+  behaves like its concrete counterpart when the top-most frame is a
+  compatible handler:
+
+Otherwise, it pops a frame:
+
+  
+          
+\section{The shift: From abstract CESK to pushdown systems} 
+
+  In the previous section, we constructed an infinite-state abstract
+    interpretation of the CESK-like machine to analyze exception flows 
+    for object-oriented languages.
+The infinite-state nature of the abstraction makes it difficult 
+    to answer static analysis questions:
+How do you compute the reachable states if there are an infinite number of them?
+Fortunately,   a shift in perspective reveals that the machine 
+is in fact a pushdown system for which control-state reachability is decidable.
+
+
+     If we take 
+     as the finite set of control states and
+      is the set of stacks,
+     then it is immediately apparent that 
+     the abstract semantics that we have created is a pushdown
+     system.
+This is the object-oriented analog of Earl \etal's observation
+     for the -calculus~\cite{Earl:2012:IPDCFA}.
+This shift permits the use of a control-state reachability
+       algorithm in place of exhaustive search of the
+       configuration-space.
+[Appendix Figure~\ref{fig:acesk-to-pds} defines the program-to-RPDS conversion function
+                  in detail.]
+
+\subsection{Mini-evaluation}
+
+In Table~\ref{tbl:result}, when we compare the resulting analysis to 
+Bravenboer and Smaragdakis's 
+finite-state analysis of exceptions~\cite{mattmight:Bravenboer:2009:Exceptions},
+we find a solid improvement in precision, but a substantial slowdown in time.
+This is not surprising: 
+computing the reachable states in a pushdown system 
+is cubic in the number of states.
+In the next section, we improve the running time
+by porting another powerful technique from abstract interpretation of the -calculus:
+abstract garbage collection.
+
+
+\section{Abstract garbage collection for objects} \label{sec:agc-oo1}
+
+Abstract garbage collection is known to yield order-of-magnitude improvements
+in precision, even as it drops run-times by cutting away false positives.
+Adapting abstract garbage collection seemed like the right tool to fix 
+the performance problem of the previous section.
+We directly benefit from that line of work on the -calculus, which 
+developed a class of
+\emph{introspective} pushdown machines as a means of combining
+pushdown analysis with abstract garbage collection~\cite{Earl:2012:IPDCFA}.
+Introspective pushdown systems are pushdown systems that have read access
+to the \emph{entire} stack during a transition.
+Since the root set for garbage collection depends on the entire stack,
+we need an introspective pushdown systems to use abstract garbage collection.
+[Appendix~\ref{subsubsec: gc-ipds} formalizes
+the injection into an introspective pushdown system.]
+  
+
+It's natural to think that the combined technique will benefit 
+exception-flow analysis for object-oriented languages.
+However, as we shall demonstrate, 
+    we must conduct a careful and subtle
+    redesign of the abstract garbage collection machinery 
+    for object-oriented languages
+     to gain the promised analysis precision and performance.
+    
+  
+
+
+
+
+ In the following, we present  how to adapt abstract garbage collection to work under 
+abstract semantics defined in Section~\ref{sec:pdexflowoo}.
+Abstract garbage collection discards unreachable elements from the
+store.
+It modifies the transition relation
+to conduct a ``stop-and-copy'' garbage collection before each
+transition.
+To do so, we define a garbage collection function 
+
+on
+configurations:
+
+  where the pipe operation  yields the function , but with
+  inputs not in the set  mapped to bottom---the empty set.
+The reachability function 
+  first computes the root set, and then the transitive closure of an
+  address-to-address adjacency relation: 
+
+where the function  
+  finds the root addresses:
+  
+  
+ 
+  The  function
+  finds roots down the stack. 
+However,  only  has the component to construct addresses, so we define a 
+helper function  
+to extract only  out from the stack and skip over all the handle frames.
+Now  is defined as
+ 
+  and the relation:
+  
+  connects adjacent addresses: 
+ 
+ \text{ such that }
+  .
+
+  
+\subsubsection{Example runs with abstract garbage collection}
+
+
+
+Table~\ref{tbl:to-lead-lra} presents the example results of running pushdown analysis with and without abstract garbage collection,
+as described.
+It shows that abstract garbage collection further improves the precision, but the effect  is not as large as we had predicted,
+especially with respect of analysis time, where on functional programs, abstract garbage collection can bring order-of-magnitude 
+reductions in both  imprecision and time.
+The next section teases out the problem and develops a solution: combining abstract garbage collection 
+with live range analysis.
+
+
+\begin{table}
+    \begin{tabular}{ c | c | c | c | c | c | c }
+    \textbf{Benchmark} & \textbf{Opts} & \textbf{Nodes} & \textbf{Edges} &  \textbf{VarPointsTo} & \textbf{E-C links} & \textbf{Time(sec)} \\ \hline 
+          \multirow{2}{*}{lusearch} & pdcfa & 91574  & 105154  &  (1423, 3) &  76  &  5520 
+          \\ & +gc  & 26365  & 30426  &  (1086, 2) &  63 & 4800 
+         \\
+     \hline
+    \end{tabular}    
+     \caption{Example analysis result by (introspective) pushdown system.
+     {\tt{VarPointsTo}} measures how many objects can a variable possibly points to; 
+     it is   presented as a tuple , where  is the total entries,  is the average 
+         objects being invoked on;
+     {\tt{E-C links}} is the number of pairs of  an instruction that can throw exceptions and a handler that can possibly handle the exception.
+     These metrics are used by Fu, \etal~\cite{Fu:2005:rubust-java-server-apps}, and Bravenboer and
+     Smaragdakis~\cite{Bravenboer:2009:Exceptions}.
+     }
+     \label{tbl:to-lead-lra}
+\end{table}
+
+
+
+
+\subsection{Live register analysis (LRA) for AGC} \label{subsec:lra}
+
+Even though pushdown analysis with/without garbage collection
+promises to increase analysis precision, 
+the analysis time is not satisfying, 
+as shown in Table~\ref{tbl:to-lead-lra}.
+The benchmark  with abstract garbage collection still takes more than an hour.
+By manual inspection on some other benchmarks we have run, 
+we find that 
+in the register-based byte code, 
+there are cases that the same register is reassigned multiple 
+    times at different sites within a method. 
+    Therefore, abstract object values are unnecessarily  ``merged'' together.
+    The result is that unnecessary state space is explored and analysis time is prolonged.
+    
+     
+    The direct adaptation of AGC to an object-oriented setting in Section~\ref{sec:agc-oo1}
+    cannot collect these registers between uses.
+For object-oriented programs, we want to collect registers that are reachable, but not without
+    an intervening assignment.
+
+    
+   
+    As it turns out, the fix for this problem 
+    is a classic data-flow analysis:
+    live-register analysis (LRA).
+LRA can compute the set of registers that are \textit{alive} at each statement within a method.
+The garbage collector can then more precisely collect each frame.
+
+
+  Since LRA is well-defined in the literature~\cite{local:new-dragon}, we skip the formalization here, 
+  but   
+   the   is now modified to collect
+      only \textit{living}  registers of the current statement :
+      
+ 
+Section~\ref{sec:evaluation} presents the complete results 
+running on the suite of the benchmarks based on 
+the joint analysis (denoted as {\tt{+gc+lra}} in Table~\ref{tbl:result}).
+
+
+
+
+   
+
+\section{Extending pushdown reachability to exceptions} \label{sec:impl}
+With the formalism in previous sections, 
+it is not hard to translate the abstract semantics into working code.
+We use the Dyck State Graph synthesis algorithm---a purely functional 
+version of the Summarization algorithm---for 
+computing reachable pushdown control states~\cite{Earl:2012:IPDCFA}.
+
+
+
+
+
+\subsection{Synthesizing a Dyck State Graph with exceptional flow} \label{subsec: dcg-exn}
+
+The Dyck State Graph (DSG) of a pushdown system is the subset of a pushdown system
+reachable over legal paths.
+(A path is \emph{legal} if it never tries to pop  when a frame other than  is on top of the stack.)
+To synthesize a Dyck State Graph (DSG) from an 
+(introspective) a pushdown system, 
+Earl~\etal{} present an efficient, functional modification of the pushdown summarization algorithm~\cite{Earl:2012:IPDCFA}.
+The algorithm iteratively constructs the reachable portion of the pushdown
+transition relation by inserting -summary edges whenever it finds empty-stack 
+(\eg, push a, push b, pop b, pop a)
+paths between control states.
+
+For pushdown analysis  \emph{without exception handling}, only two kinds of transitions
+can cause a change to the set of -:
+an intraprocedural empty-stack transition
+and a frame-popping procedure return.
+With the addition of  frames to the stack, 
+there are several new cases to consider for popping frames (and hence adding -edges).
+
+The following subsections highlight how to
+handle exceptional flow during DSG synthesis, particularly as it relates
+to maintaining -summary edges.
+The figures in these section use a graphical scheme
+for describing the cases for -edge insertion.
+Existing edges are solid lines, while the -summary edges 
+to be added
+are dotted lines.
+
+
+\subsubsection{Intraprocedural push/pop of handle frames}
+
+
+The simplest case is entering a {\tt try} block (a \textsf{push-handler}) 
+and leaving a {\tt try} block (a \textsf{pop-handler}) entirely 
+intraprocedurally---without throwing an exception.
+Figure~\ref{fig:case1} shows such a case: if there is a handler push followed by a handler pop, 
+the synthesized (dotted) edge must be added.
+
+
+
+\subsubsection{Locally caught exceptions}
+Figure~\ref{fig:case2} presents a case where 
+a local handler catches an exception, popping it off the stack
+and continuing.
+
+
+
+
+\subsubsection{Exception propagation along the stack}
+
+Figure~\ref{fig:case3} illustrates a case where 
+an exception is not handled locally, and must pop off a 
+call frame to reach the next handler on the stack.
+In this case,
+a popping self-edge from control state  to  
+lets the control state  see frames beneath the top.
+Using popping self-edges, a single state can pop off as many frames as necessary 
+to reach the handle---one at a time.
+
+
+
+
+\subsubsection{Control transfers mixed in try/catch}
+
+Figure~\ref{fig:case4} illustrates the situation where a procedure tries to
+return while a  frame is on the top of the stack.
+It uses popping self-edges as well to find the top-most  frame.
+
+
+
+\subsubsection{Uncaught exceptions}
+The case in Figure~\ref{fig:case5} 
+shows popping all frames back to  
+the bottom of the stack---indicating an uncaught exception.
+
+
+
+
+
+\begin{figure*}
+\centering
+\begin{minipage}{0.4\linewidth}
+
+\caption{Intraprocedural handler push/pop}
+\label{fig:case1}
+\end{minipage}\begin{minipage}{0.5\linewidth}
+
+\caption{Locally caught exceptions}
+\label{fig:case2}
+\end{minipage}
+\begin{minipage}{0.5\linewidth}
+
+\caption{Exception propagation}
+\label{fig:case3}
+\end{minipage}\begin{minipage}{0.5\linewidth}
+
+\caption{Control transfers mixed in try/catch}
+\label{fig:case4}
+\end{minipage}
+\begin{minipage}{0.5\linewidth}
+
+\caption{Uncaught exceptions}
+\label{fig:case5}
+\end{minipage}
+\end{figure*}
+
+
+
+\section{Evaluation} \label{sec:evaluation} \label{sec:eval}
+
+We evaluated our pushdown exception flow analysis on standard Java
+benchmarks from the DaCapo suite~\cite{local:DaCapo:paper} that we
+were able to port to Android; we have also used some native Android
+applications.
+We ran these benchmarks on  
+OS X 10.8.2 with a 64GB DDR3 memory,
+2 Six-Core Intel Xeon X5675 CPUs, 3.07GHz machine.
+Table~\ref{tbl:result} lists the results
+for all applications.
+To compare, we adopt metrics (and implementations) used by previous work~\cite{Fu:2005:rubust-java-server-apps,Bravenboer:2009:Exceptions}
+for object-oriented programs: 
+\begin{itemize}
+\item VarPointsTo: Given a variable, to how many types may it point?
+Smaller sets indicate higher data-flow precision.
+
+\item ThrowPointsTo: At a throw, how many types of exceptions could be thrown?
+Smaller sets indicate higher data-flow precision.
+
+
+\item Exception-Catch-Link (E-C Link): A pair of instructions in which second catches the first.
+Fewer E-C links indicate higher exception-flow precision.
+
+\end{itemize}
+
+The analysis result on running on Android applications of different size
+have already demonstrated the promise of our analytic techniques, 
+with the average one to three on VarPointsTo and ThrowPointsTo, and small 
+number of E-C links.
+
+The evaluation conducted on standard Java benchmarks
+helps us compare results between our techniques and prior work.
+We use the same version of benchmark suite, 
+the DaCapo benchmark programs, v.2006-10.MR2,
+which is used in~\cite{Bravenboer:2009:Exceptions}.
+However, only {\tt{antlr, lucene, and pmd}}
+run on Dalvik bytecode,
+due to the Android SDK having class/interface naming clashes 
+with the ones that are originally defined in Java SDK.
+
+We contacted the authors for access to the original tool {\tt{Doop}}~\cite{Bravenboer:2009:Exceptions} 
+to  run  the above benchmarks
+and recompute the relative metrics.
+Specifically, we ran {\tt{Doop}} Revision 958, on JRE 1.5 and Xubuntu 12.10
+inside VirtualBox 4.2.2.
+The metrics we compute are VarPointsTo, E-C Links and analysis run time.
+with the option of context-sensitivity {\tt{1-Call+H}} and object-sensitivity{\tt{1-Obj+H}} 
+respectively.
+These options are the closest to the allocation strategy 
+in our analysis: 1-call-site sensitivity for calls, and 1-object-sensitivity for object allocation.
+In order to eliminate differences 
+between the Dalvik and Java byte code,
+the VarPointsTo metric computes 
+how many types can be invoked on 
+at each call site.
+
+The comparison result is shown in the first three rows in Table~\ref{tbl:result}---the DaCapo benchmarks.
+We could not get {\tt{Doop}} to operate properly on Android programs.
+
+
+As we can see that
+the pushdown exception-flow analysis produces 
+almost two orders of magnitude improvement to the precision of points-to information 
+and E-C Links for all three benchmarks over {\tt{Doop}}.
+We have reported running times for completeness, but 
+these numbers can't be compared as directly as precision.
+\texttt{Doop} used a high-performance Datalog engine to solve
+flow constraints; our implementation in Scala is asymptotically efficient,
+but it is not optimized; it incurs a significant constant-factor overhead.
+
+
+The effect of analysis time varies from different benchmarks.
+But take into consideration of the difference of running environment,
+{\tt{Doop}} demonstrated less analysis than our analysis does.
+However, the co-analysis of pushdown system and augmented abstract garbage collection 
+has demonstrated the best precision/performance trade-offs.
+
+In Table~\ref{tbl:result}, 
+adding garbage collection and live-range analysis restriction ({\tt{+gc+lra}}) 
+improves analysis time  more significantly for Android application than Java applications.
+The reason is that Android applications are more sensitive to the LRA due to Android's multi-entry points structure.
+However, the results on the DaCapo benchmarks clearly indicate improvements over \texttt{Doop} in precision.
+
+
+\begin{table}
+{\footnotesize
+    \begin{tabular}{| c| c | c| c | c | c | c | c | c |}
+\hline
+\textbf{Benchmark} & \textbf{LOC} & \textbf{Opts} & \textbf{Nodes} & \textbf{Edges} &  \textbf{VarPointsTo} & \textbf{Throws} & \textbf{E-Cs} & \textbf{Time} \\ \hline 
+   antlr &   \multirow{4}{*}{35000} &pdcfa &   &    &   &     &    &   
+     \\ & & +gc+lra & 1212  & 1251  &   (681, 2)& (78,2) &  65 & 4135 \\
+      & & 1-Call+H & -  & -  &   (40503, 614)& - &  2277 & \textgreater4h \\
+      & & 1-Obj+H & -  & -  &   (41339,626) & - &  2203 & \textgreater3h \\
+     \hline
+lusearch &  \multirow{4}{*}{ 87000}& pdcfa & 91574  & 105154  &  (916, 3) &  (309, 3)  & 76 & 5520 
+          \\ && +gc+lra & 14646  & 16045  &   (709, 2)& (213,2) & 59 & 2785 \\
+            & & 1-Call+H & -  & -  &   (22970, 348)& - &  2378 &  2796 \\
+                & & 1-Obj+H & -  & -  &   (24225,367) & - &  2304 & 1548 \\
+          \hline
+pmd & \multirow{4}{*}{55000} &pdcfa & 59173  & 61162  &  (1432, 3) &  (103, 3)  & 51  & 4351
+         \\ && +gc+lra & 3537  & 4035  &   (1017, 2)& (61,2) & 38& 1323 \\
+          & & 1-Call+H & -  & -  &   (25286, 383)& - &  2284 &  3375 \\
+          & & 1-Obj+H & -  & -  &   (26049,395) & - &  2212 & 3413 \\
+         \hline
+          \hline
+Butane &  \multirow{2}{*}{2506}&pdcfa & 20140  & 20334 &  (463,3) &  (2,1)  &  2 &   920
+                     \\ &&+gc+lra & 724  & 740  &   (322, 2)& (2,1) & 2 & 676 \\
+                     \hline
+UltraCoolMap & \multirow{2}{*}{2605} &pdcfa & 17044  & 17047  &  (552, 2) &  (2, 1)  & 2  & 1056 
+                                \\ &&+gc+lra & 948  & 951  &   (465, 2)& (2,1) & 2 & 28 \\
+                                \hline
+        
+               Sysmon & \multirow{2}{*}{4429}& pdcfa &   &  &  &    &   & 
+                                               \\ && +gc+lra & 3191  & 3431  &   (864, 2)& (10,1) &10& 1534 \\ \hline
+               TodoList & \multirow{2}{*}{6092}& pdcfa & 6020  & 6406  &  (387,2) & (0,0)  & 0  & 1766
+                \\ && +gc+lra & 1348  & 1434  &   (280, 1)& (0,0) & 0& 224 \\
+                \hline
+SwiFTP & \multirow{2}{*}{6521}& pdcfa & 147785  & 155656  &  (634,2) &  (3, 1)  &  3 & 4277
+                                                         \\ && +gc+lra & 4711  & 5053  &   (564, 2)& (1,1) & 1 & 1871 \\
+                                                         \hline
+MediaFun&  \multirow{2}{*}{7815}& pdcfa &   & &  &   &   &  
+                                    \\ && +gc+lra & 9894  & 10298  &   (674, 2)& (13,1) & 10 & 3032 \\
+                                    \hline                                      
+               AndroidGame  &\multirow{2}{*}{63755} &pdcfa & 3831  & 4001  &  (405, 3) &  (2, 1)  &  2 & 989 
+                                                                    \\  && +gc+lra & 1111  & 1180  &   (363, 2)& (2,1) & 2& 246 \\
+                                                                    \hline
+                                                         
+                     ConnectBot &\multirow{2}{*}{68382}& pdcfa & 14484  & 15147  &  (543, 3) &  (5, 1)  & 5  & 3012 
+                     \\ && +gc+lra & 3739  & 4063  &   (368, 1)& (5,1) & 5& 1896 \\
+                     \hline
+
+
+     \hline
+    \end{tabular}    
+    }
+    \caption{Benchmark results: {\tt{VarPointsTo}} and {\tt{Throws}} is 
+    presented as tuples , where  is the total entries,  is the average 
+    types being invoked on in {\tt{VarPointsTo}} case,
+     and average exception objects thrown in {\tt{Throws}} case. 
+     All times are in seconds.
+      denotes the analysis did not finish within 6000 seconds.}
+     \label{tbl:result}
+\end{table} 
+ 
+
+\section{Related Work} \label{sec: related}
+
+Precise and scalable context-sensitive points-to analysis 
+has been an open problem for decades.
+Progress in general has been gradual,
+with results like object-sensitivity~\cite{local:Milanova:2007:LCP,local:Milanova:2005:parameterizedobject} intermittently providing a leap for most programs.
+Most results target improvements for individual classes of programs.
+The techniques we present here broadly target at all programs, and it is orthogonal to and compatible with
+results like object-sensitivity.
+
+
+Much work in pointer analysis exploits methods to improve performance
+by strategically reducing precision. 
+Lattener~\etal~show that an analysis with a context-sensitive
+heap abstraction can be efficient by sacrificing precision 
+under unification constraints~\cite{local:Lattner:2007:MCP}.
+
+
+In full-context-sensitive pointer analysis, the literature has sought
+ context abstractions that provide precise pointer information
+while not sacrificing performance.
+Milanova found that an object-sensitive analysis~\cite{local:Milanova:2005:parameterizedobject}
+ is an effective context abstraction for object-oriented programs. 
+ This is confirmed by the extensive evaluation by Lhotak~\cite{local:Lhotak:2008:EBC}.
+He and other researchers have also argued for using context-sensitive heap abstraction 
+to improve precision\cite{local:Nystrom:2004:IHS}.
+
+BDDs have been used to compactly represent the large  amount of redundant  data in context-sensitive pointer analysis 
+efficiently~\cite{local:Berndl:2003:PAU,Whaley:2004:CCP,local:Xu:2008:MEC}. 
+Specifically, Xu and Routev's work~\cite{local:Xu:2008:MEC} reduces the redundancy by choosing the right context abstractions.
+Such advancements could be applied to our pushdown framework, as they are orthogonal to its central thesis.
+
+
+\paragraph{\textbf{Finite-state analysis of exceptions}}
+
+The main contribution of the paper is significantly improved analysis precision
+via pushdown systems that analyze the exceptional control-flow of object-oriented programs.
+
+The bulk of the previous literature has focused on finite-state abstractions for Java programs, \ie,
+-CFA and its variants.
+Specifically, for the work that handles exception flows, the analysis is based on 
+context-insensitivity or a limited form of context-sensitivity, which makes them unable to differentiate the contexts 
+of where an exception is thrown  and what handlers precisely can handle the exception.
+Robillard~\etal~\cite{Robillard:2003:evolution-exception} 
+presents a truly interprocedural exception-flow analysis, but exceptions propagate
+via imprecise control flows by using class hierarchy analysis.
+The same is true for Jo~\etal{}~\cite{local:Jo:2002:UncaughtException},
+and its extension for concurrent Java programs~\cite{Ryu:2001:MultiThreadExceptions}.
+Leroy and Pessaux~\cite{Leroy:2004:TypeBasedUncaughtExceptions} use
+type systems to model exceptions, specifically to analyze uncaught
+exceptions. Limited context-sensitivity is employed for the purpose of
+more precise results on polymorphic functions.
+Fu~\etal{}~\cite{Fu:2005:rubust-java-server-apps} proposed the E-C link metric to evaluate 
+ exception-flow precision. They also documented the exception handler matching problem caused 
+ by an imprecise control flow graph. They approach the problem by employing  points-to information to refine
+ control-flow reachability.
+Bravendoer and Smaragdakis ~\cite{Bravenboer:2009:Exceptions}
+ propose to join points-to analysis and exception flow analysis to improve 
+ precision and analysis run time in their Doop framework, 
+ based on the optimized analysis engine using Datalog~\cite{Bravebboer:2009:declare-pointsto}.
+ They have conducted extensive comparison of different options for polyvariance.
+ It is the most precise and efficient exception-flow analysis compared to other work, with respect of points-to 
+and E-C links. We conduct our comparison with respect to their work, and found the 
+pushdown approach can yield significant improvement in precision, but the run-time is not comparable 
+to their work, partly due to their mature optimization methodology for Datalog.
+
+
+\paragraph{\textbf{Pushdown analysis for the -calculus}}
+
+
+
+Vardoulakis and Shivers's CFA2~\cite{mattmight:Vardoulakis:2010:CFA2}
+is the precursor to the pushdown control-flow
+analysis~\cite{local:Earl:2010:PDCFA}.
+CFA2 is a table-driven summarization algorithm that exploits the
+balanced nature of calls and returns to improve return-flow precision
+in a control-flow analysis.
+While CFA2 uses a concept called ``summarization,'' it is a
+summarization of execution paths of the analysis, roughly equivalent
+to Dyck state graphs.
+
+In terms of recovering precision, pushdown control-flow
+analysis~\cite{local:Earl:2010:PDCFA} is the dual to abstract garbage
+collection:
+it focuses on the global interactions of configurations via
+transitions to precisely match push-pop/call-return, thereby
+eliminating all return-flow merging.
+However, pushdown control-flow analysis does nothing to improve
+argument merging.
+
+This work directly draws on our previous work 
+on pushdown analysis for higher-order programs~\cite{local:Earl:2010:PDCFA} and
+ introspective pushdown system (IPDS) for higher-order programs~\cite{Earl:2012:IPDCFA}.
+IPDS  has tackled the challenge of incorporating abstract garbage collection~\cite{mattmight:Might:2006:GammaCFA}
+into pushdown system and improving the summarization algorithm  for efficiency.
+That work shows significant  improvements in precision and analysis time for the -calculus.
+We extend the introspective work in two dimensions: (1)  we generalize the framework (including abstract garbage collection) to an object-oriented language,
+and (2) we adapt the Dyck state graph synthesis algorithm to handle the new stack change behavior
+introduced by exceptions.
+
+
+\paragraph{\textbf{CFL- and pushdown-reachability techniques}}
+In previous work, Earl~\etal~\cite{Earl:2012:IPDCFA}
+develop a pushdown reachability algorithm
+suitable for the pushdown systems that we generate.
+It essentially draws on CFL- and pushdown-reachability
+analysis~\cite{mattmight:Bouajjani:1997:PDA-Reachability,mattmight:Kodumal:2004:CFL,mattmight:Reps:1998:CFL,mattmight:Reps:2005:Weighted-PDA}.
+For instance, \ecg s, or equivalent variants thereof, appear in many
+context-free-language and pushdown reachability algorithms.
+Dyck state graph synthesis is an attractive perspective
+on pushdown reachability because it is purely functional,
+and it allows targeted modifications to the algorithm.
+
+
+CFL-reachability techniques have also been used to compute classical
+finite-state abstraction CFAs~\cite{mattmight:Melski:2000:CFL} and
+type-based polymorphic control-flow
+analysis~\cite{mattmight:Rehof:2001:TypeBased}.
+These analyses should not be confused with pushdown control-flow
+analysis, which is computing a fundamentally different kind of CFA.
+
+\paragraph{\textbf{Pushdown exception-flow analysis}}
+There is little work on pushdown analysis for object-oriented langages as a whole.
+Sridharan and Bodik proposed demand-driven analysis for Java that
+matches reads with writes to object fields selectively, by using
+refinement~\cite{Manu:2006:RefinementJava}.  They employ a
+refinement-based CFL-reachability technique that refines calls and
+returns to valid matching pairs, but approximates for recursive calls.
+They do not consider specific applications of CFL-reachability to
+exception-flow.
+ 
+
+\section{Conclusion} \label{sec:conclusion}
+
+Poor analysis of exceptions pollutes the interprocedural control-flow analysis
+of a program.
+In order to model exceptional control-flow precisely, we abandoned traditional
+finite-state approaches (e.g. -CFA and its variants).
+In its place, we generalized pushdown control-flow analysis from the
+-calculus~\cite{Earl:2012:IPDCFA} to object-oriented programs, and
+made it capable of handling exceptions in the process.
+Pushdown control-flow analysis models the program stack (precisely) with the
+pushdown stack.
+Computing the reachable control states of the pushdown system (its Dyck state
+graph) yields combined data- and control-flow analysis of a program.
+Comparing this approach to the
+state-of-the-art~\cite{mattmight:Bravenboer:2009:Exceptions}, shows
+substantially improved precision.
+To improve time, we adapted abstract garbage collection to object-oriented
+program analysis.
+The end result is an improvement in data- and control-flow precision of roughly
+two orders of magnitude when soundly reasoning  in the presence of exceptions.
+
+
+
+
