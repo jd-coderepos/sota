@@ -29,7 +29,7 @@ This repository hosts the official [SimpleText Task4 @ CLEF'24](https://simplete
 	     |--- [article-counter-folder]/
 		 |    |--- [article-id].tei.xml
 	     |___ ...
-     |--- [test1-few-shot-annotations]/	   		# hidden during the competition
+     |--- [test1-few-shot-annotations]/	   	# hidden during the competition
 	     |--- [article-counter-folder]/
 		 |    |--- annotations.txt		
 		 |    |--- code-link.txt	   # optional	
