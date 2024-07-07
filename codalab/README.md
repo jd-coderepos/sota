@@ -34,9 +34,7 @@ Note: Submitting the `sample-submission.zip` provided in this repository, during
 
 The **official SOTA? evaluation script** is publicly released [here](https://github.com/Kabongosalomon/scoring_program/blob/main/evaluation.py).
 
-## Other
+## How to organize a challenge on CodaLab Competitions
 
-### How to organize a challenge on CodaLab Competitions
-
-To host your own competitions, follow the [step-by-step guide](https://github.com/codalab/competition-examples/blob/master/TUTORIAL.md) provided by the developers at Codalab. The competition configuration `.yaml` for SOTA? is publicly released in this folder within the `online-competition-site` subfolder.
+To host your own competitions, you can follow the [step-by-step guide](https://github.com/codalab/competition-examples/blob/master/TUTORIAL.md) provided by the developers at Codalab. The competition configuration file (`.yaml`) for SOTA? is publicly available in the `online-competition-site` subfolder within this repository.
 
