@@ -11,7 +11,7 @@ In this Shared Task, we hope to go beyond the community curation of leaderboards
 
 ### What this repository contains?
  
-This repository hosts the official SimpleText Task4 @ CLEF'24, i.e. the [SOTA? Tracking the State-of-the-Art in Scholarly Publications](https://sites.google.com/view/simpletext-sota/) task corpus. The full corpus is released in the dataset repository organized as follows:
+This repository hosts the official [SimpleText Task4 @ CLEF'24](https://simpletext-project.com/2024/en/), i.e. the [SOTA? Tracking the State-of-the-Art in Scholarly Publications](https://sites.google.com/view/simpletext-sota/) task corpus. The full corpus is released in the dataset repository organized as follows:
 
 ```
 [dataset]/	

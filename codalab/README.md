@@ -32,7 +32,7 @@ During the practice phase we have uploaded the validation dataset annotations on
 
 Note: Submitting the `sample-submission.zip` provided in this repository, during the practice phase until the end of April 22nd, as it is will result in an evaluation score of 100%, as this file is an exact replica of the validation set, merely copying over the `annotations.json` files.
 
-The official evaluation script used for ``SOTA?'' is also publicly released [here](https://github.com/Kabongosalomon/scoring_program/blob/main/evaluation.py).
+The **official SOTA? evaluation script** is publicly released [here](https://github.com/Kabongosalomon/scoring_program/blob/main/evaluation.py).
 
 ## Other
 
